@@ -59,6 +59,12 @@ class LoadedArtwork:
     _pdf_doc: Optional[fitz.Document] = None
     _pil_image: Optional[Image.Image] = None
 
+    def pdf_page(self, page: int = 0) -> fitz.Page:
+        if self.kind != "pdf":
+            raise ValueError("pdf_page() is only valid for PDF artwork")
+        assert self._pdf_doc is not None
+        return self._pdf_doc[page]
+
     def page_size_px(self, dpi: float = WORKING_DPI, page: int = 0) -> tuple[int, int]:
         """(width, height) in pixels a render() at this DPI/page would produce."""
         if self.kind == "pdf":
