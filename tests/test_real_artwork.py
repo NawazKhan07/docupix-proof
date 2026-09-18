@@ -14,9 +14,13 @@ are listed in `sample test files/pairs.json`, and the expected answer is
   finding per object, each pointing at it tightly, and nothing pointing at
   anything else.
 
-Other kinds of pair (a scan, a mode that ignores colour, ...) can be listed
-too; they are skipped until a truth definition exists for them, rather than
-being checked against a made-up one.
+The same pair is also put through the Scan-vs-Digital path: the suspect is
+degraded like a flatbed scan (tests/scan_simulator.py -- generic damage, nothing
+tuned to a file) and the answer is still the digital pixel difference.
+
+Other kinds of pair (a mode that ignores colour, ...) can be listed too; they
+are skipped until a truth definition exists for them, rather than being checked
+against a made-up one.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
+
+from scan_simulator import TYPICAL, simulate_scan
 
 from app.config import AppConfig
 from app.engine.file_loader import load_artwork
@@ -87,7 +93,7 @@ def _coverage(truth, finding) -> float:
 
 
 @pytest.fixture(scope="module", params=PAIRS, ids=[entry["name"] for entry in PAIRS])
-def compared(request):
+def images(request):
     entry = request.param
     original_path, suspect_path = FOLDER / entry["original"], FOLDER / entry["suspect"]
     if not (original_path.is_file() and suspect_path.is_file()):
@@ -97,16 +103,34 @@ def compared(request):
 
     original, suspect = load_artwork(original_path), load_artwork(suspect_path)
     original_image, suspect_image = original.render(), suspect.render()
+    original.close()
+    suspect.close()
+    return entry, original_image, suspect_image
 
+
+@pytest.fixture(scope="module")
+def compared(images):
+    entry, original_image, suspect_image = images
     started = time.perf_counter()
     outcome = run_comparison(
         original_image, suspect_image, ComparisonMode(entry.get("mode", "automatic")), AppConfig()
     )
     elapsed = time.perf_counter() - started
-    truth = _true_boxes(original_image, suspect_image)
-    original.close()
-    suspect.close()
-    return outcome, truth, elapsed
+    return outcome, _true_boxes(original_image, suspect_image), elapsed
+
+
+@pytest.fixture(scope="module")
+def scanned(images):
+    """(outcome on a scan of the changed file, outcome on a scan of identical content, truth)."""
+    _entry, original_image, suspect_image = images
+    config = AppConfig()
+    changed = run_comparison(
+        original_image, simulate_scan(suspect_image, TYPICAL), ComparisonMode.SCAN_VS_DIGITAL, config
+    )
+    identical = run_comparison(
+        original_image, simulate_scan(original_image, TYPICAL), ComparisonMode.SCAN_VS_DIGITAL, config
+    )
+    return changed, identical, _true_boxes(original_image, suspect_image)
 
 
 def _finding_boxes(outcome):
@@ -152,3 +176,25 @@ def test_the_comparison_meets_the_time_budget(compared):
     """NFR-1: 3-5 s. Measured ~1.1 s on an 18 MP carton (it was 2.8 s)."""
     _outcome, _truth, elapsed = compared
     assert elapsed < 3.0
+
+
+# ---- the same pair, scanned ------------------------------------------------------------
+
+
+def test_a_scan_of_identical_artwork_reports_nothing(scanned):
+    """The sanity check that matters most for a scan path: no differences in, none out."""
+    _changed, identical, _truth = scanned
+    assert identical.clusters == []
+
+
+def test_a_scan_of_the_changed_artwork_points_at_real_changes_and_only_those(scanned):
+    """A scan cannot show everything a digital file does (a faint 2 mm mark is below its
+    noise), so this asks for most changes to be found, not all -- and no false alarms."""
+    changed, _identical, truth = scanned
+    findings = _finding_boxes(changed)
+
+    found = sum(1 for box in truth if max((_iou(box, finding) for finding in findings), default=0) >= 0.3)
+    assert found >= 0.5 * len(truth), f"only {found} of {len(truth)} real changes were pointed at"
+
+    for finding in findings:
+        assert any(_coverage(box, finding) > 0 for box in truth), f"spurious finding at {finding}"

@@ -121,6 +121,74 @@ class DetectionConfig:
     # genuinely changed frame or rule is also outline-shaped.
     min_fill_ratio: float = 0.10
 
+    # Structural comparison of "ink" (Scan-vs-Digital, SRS FR-6.3). Ink is anything
+    # that departs from its LOCAL background, so orange text on grey counts exactly
+    # like black text on white (a global black/white threshold loses it).
+    #
+    # Two levels give hysteresis: a difference must be STRONG ink in one file and
+    # not even WEAK ink in the other, so faint content flickering across a single
+    # threshold between two files is never reported. Each is a share of the local
+    # tone with a floor in grey levels. Measured on a scan of identical content,
+    # a single 12% threshold flagged up to 104k stray pixels; these leave ~0 on a
+    # light scan and a small fraction of that on a harsh one.
+    ink_strong_relative: float = 0.22
+    ink_strong_floor: float = 36.0
+    ink_weak_relative: float = 0.06
+    ink_weak_floor: float = 10.0
+    # Each image's own measured noise (standard deviation, grey levels) raises
+    # the floors to this many sigmas, so a noisy scan is judged against its own
+    # noise floor while a clean digital file keeps the sensitive defaults above.
+    ink_noise_strong_sigmas: float = 7.0
+    ink_noise_weak_sigmas: float = 2.5
+    # The local background is a median over each of these window sizes, in
+    # pixels at 300 DPI (~3.7 mm and ~17 mm), and the differences found at each
+    # scale are unioned. ~4 stroke-widths keeps text a minority of any window yet
+    # small enough to follow a small coloured box the text sits in; the larger
+    # scale sees whole panels and boxes as ink. One scale alone fails one way or
+    # the other (see structure_diff.py).
+    structure_background_windows_px: tuple[int, ...] = (44, 200)
+    # A scan is softer than the file it was made from, and a soft edge reads as ink
+    # a few pixels wider than a sharp one, which registration slack cannot absorb.
+    # So the sharper image is blurred to the softness of the other (measured from
+    # the pixels, up to this many pixels of Gaussian blur) before they are compared.
+    # A match must beat "no blur" by this much correlation to be believed.
+    structure_softness_max_px: float = 3.5
+    # A scan this much softer than the original (Gaussian sigma, px at 300 DPI) can no
+    # longer hold the finest print, so the reviewer is told fine print is unverified.
+    structure_soft_warning_sigma_px: float = 2.0
+    structure_softness_min_gain: float = 0.01
+    # Where one image is much softer than the other -- fine detail below this share
+    # of the sharper one's, per ~6 mm cell -- while the coarse LAYOUT (word and line
+    # structure) still correlates at least this strongly, the detail was lost to the
+    # scan rather than removed from the artwork: the cell is skipped and reported as
+    # unverifiable. Blur keeps layout; a real change alters it, so it is never
+    # skipped. (An earlier test on ink mass alone mistook a box added around
+    # identical text for blur, and skipped a real change.)
+    structure_detail_ratio: float = 0.4
+    structure_layout_correlation: float = 0.85
+    structure_layout_variance_floor: float = 0.5
+    # Below this much fine detail in the sharper image there is nothing to lose.
+    structure_detail_floor: float = 2.5
+    # The scan's own boundary is kept clear by this many slack-widths.
+    structure_edge_margin_factor: int = 3
+    # Report the skipped area to the reviewer once it reaches this share of the artwork.
+    unverifiable_warning_fraction: float = 0.02
+    # A stroke is only a difference if the OTHER file has no ink within this
+    # radius, so registration error of up to this much cannot flag it. The
+    # radius is the alignment residual times this factor, within the bounds below.
+    structure_slack_factor: float = 1.5
+    structure_min_slack_px: int = 1
+    structure_max_slack_px: int = 4
+    # Differing ink this close together is one object (~1 mm at 300 DPI); the
+    # aggregator then joins words into a sentence.
+    structure_group_px: int = 12
+    # Fewest differing ink pixels worth reporting (~0.4 mm across at 300 DPI).
+    structure_min_area_px: int = 25
+    # ...and never less than the footprint of the blur the two files were matched at
+    # (a disc this many sigmas in radius): a mark smaller than the softness of the
+    # scan cannot be told from JPEG ringing or noise at a corner.
+    structure_footprint_sigmas: float = 2.0
+
     # Colour (CIEDE2000 in Lab). 2.3 is the classic "just noticeable
     # difference" figure; print tolerances are usually looser, so this is a
     # sensitive default QA will likely want to raise.

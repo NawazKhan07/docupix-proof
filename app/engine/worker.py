@@ -24,7 +24,14 @@ from app.config import AppConfig, DetectionConfig
 from app.engine.alignment.aligner import align
 from app.engine.aggregation.aggregator import build_clusters
 from app.engine.alignment.homography import warp_to_reference, warp_validity_mask
-from app.engine.detectors import barcode_diff, braille_diff, color_diff, graphics_diff, text_diff
+from app.engine.detectors import (
+    barcode_diff,
+    braille_diff,
+    color_diff,
+    graphics_diff,
+    structure_diff,
+    text_diff,
+)
 from app.engine.detectors.change_regions import ChangeRegion, find_change_regions
 from app.engine.detectors.text_diff import OcrUnavailableError
 from app.engine.isolation.boundary_mask import apply_mask, resolve_keep_mask
@@ -96,6 +103,29 @@ def run_comparison(
     braille_comparison: BrailleComparison | None = None
 
     used_regions = False
+    if options.normalize_scan and options.compare_graphics:
+        # Scan-vs-Digital (FR-6.3): colour is ignored, so compare where INK is,
+        # at full resolution, tolerating the registration error we measured.
+        structure = structure_diff.detect(
+            masked_original,
+            masked_suspect,
+            detection_config,
+            structure_diff.slack_for(alignment.residual_error_px, detection_config),
+            compare_mask,
+        )
+        candidates += structure.candidates
+        if structure.matched_softness_px >= detection_config.structure_soft_warning_sigma_px:
+            warnings.append(
+                f"The scan is much softer than the original (about {structure.matched_softness_px:.1f} px of "
+                "blur at 300 DPI), so the finest print cannot be verified. Rescan at 300 DPI or higher."
+            )
+        if structure.unverifiable_fraction >= detection_config.unverifiable_warning_fraction:
+            warnings.append(
+                f"About {structure.unverifiable_fraction:.0%} of the artwork has fine detail (small "
+                "text) that one file is too soft to show, so those areas could not be compared. "
+                "Rescan at a higher resolution to check them."
+            )
+
     pixel_detectors = options.compare_color or options.compare_graphics
     regions = None
     if pixel_detectors and not options.normalize_scan:
@@ -116,7 +146,7 @@ def run_comparison(
         )
 
     if options.compare_color or options.compare_graphics or options.compare_text:
-        needs_pixels = regions is None and pixel_detectors
+        needs_pixels = regions is None and pixel_detectors and not options.normalize_scan
         if needs_pixels or options.compare_text:
             small_original, small_suspect, small_mask, scale = _to_working_resolution(
                 masked_original, masked_suspect, compare_mask, detection_config

@@ -21,7 +21,7 @@ _ILLUMINATION_LONG_EDGE_PX = 256
 _ILLUMINATION_RADIUS_DIVISOR = 8
 
 
-def _illumination_field(gray: np.ndarray) -> np.ndarray:
+def illumination_field(gray: np.ndarray) -> np.ndarray:
     """A smooth estimate of the page's lighting, ignoring artwork detail."""
     height, width = gray.shape
     scale = _ILLUMINATION_LONG_EDGE_PX / max(height, width)
@@ -46,7 +46,7 @@ def normalize_for_scan(image: np.ndarray) -> np.ndarray:
     corners or keep grey ones.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    flattened = cv2.divide(gray, _illumination_field(gray), scale=255)
+    flattened = cv2.divide(gray, illumination_field(gray), scale=255)
     _, binary = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return cv2.cvtColor(binary, cv2.COLOR_GRAY2RGB)
 
