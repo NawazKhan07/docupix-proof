@@ -1,12 +1,19 @@
-"""Main application window (Build Prompt Phase 1)."""
+"""Main application window."""
 
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
+from app.config import load_config
+from app.engine.alignment.aligner import AlignmentError, align
+from app.logging_config import job_log_file
 from app.ui.mode_selector import ModeSelector
+from app.ui.theme import set_variant
 from app.ui.upload_panel import UploadPanel
 
 logger = logging.getLogger(__name__)
@@ -16,7 +23,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Artwork Comparison")
-        self.resize(1000, 650)
+        self.resize(1000, 700)
+        self.config = load_config()
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -39,6 +47,11 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.mode_selector)
         layout.addLayout(top_row, stretch=1)
 
+        self.status_label = QLabel("Load an original and a suspect file to compare.")
+        self.status_label.setProperty("status", "idle")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
         self.compare_button = QPushButton("Compare")
         self.compare_button.setProperty("variant", "primary")
         self.compare_button.setEnabled(False)
@@ -51,12 +64,56 @@ class MainWindow(QMainWindow):
     def _update_compare_enabled(self) -> None:
         self.compare_button.setEnabled(self.upload_panel.both_loaded)
 
+    def _set_status(self, text: str, state: str) -> None:
+        self.status_label.setText(text)
+        set_variant(self.status_label, "status", state)
+
     def _on_compare(self) -> None:
-        # The comparison pipeline (isolation -> alignment -> detectors ->
-        # aggregation) lands in Phases 3-5; Phase 1 only wires this button up.
-        logger.info(
-            "Compare requested (pipeline not yet implemented)",
-            extra={"mode": self.mode_selector.mode.value},
+        """Run the pipeline as far as it currently goes: isolate, then align.
+
+        Detectors and diff reporting join this in Phases 4-5. The work runs
+        on the UI thread for now; Phase 7 moves it into a worker process.
+        """
+        original, suspect = self.upload_panel.original, self.upload_panel.suspect
+        assert original is not None and suspect is not None
+
+        job_id = uuid4().hex[:8]
+        self.compare_button.setEnabled(False)
+        self._set_status("Comparing…", "idle")
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QGuiApplication.processEvents()  # paint the busy state before blocking
+        try:
+            with job_log_file(job_id):
+                logger.info(
+                    "comparison job started",
+                    extra={
+                        "job_id": job_id,
+                        "mode": self.mode_selector.mode.value,
+                        "original": str(original.path),
+                        "suspect": str(suspect.path),
+                    },
+                )
+                result = align(
+                    original.render(),
+                    suspect.render(),
+                    self.config.alignment,
+                    original_geometry=self.upload_panel.original_slot.geometry,
+                    suspect_geometry=self.upload_panel.suspect_slot.geometry,
+                )
+        except AlignmentError as exc:
+            self._set_status(str(exc), "error")
+            return
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+            self.compare_button.setEnabled(self.upload_panel.both_loaded)
+
+        state = "warn" if result.low_confidence else "ok"
+        prefix = "Low-confidence alignment" if result.low_confidence else "Aligned"
+        self._set_status(
+            f"{prefix} — {result.residual_error_px:.2f} px registration error "
+            f"(threshold {result.threshold_px:.2f} px, {result.residual_basis} basis, "
+            f"method: {result.method}). Difference detection arrives in Phase 4.",
+            state,
         )
 
     def closeEvent(self, event) -> None:

@@ -155,6 +155,34 @@ QLabel[role="statusbar"] {{
     padding: 8px 12px;
     font-weight: 500;
 }}
+
+QLabel[status="idle"] {{
+    background: {NEUTRAL_PILL_BG};
+    color: {TEXT_SECONDARY};
+    border-radius: 6px;
+    padding: 10px 12px;
+}}
+QLabel[status="ok"] {{
+    background: {SUCCESS_BG};
+    color: {SUCCESS_TEXT};
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-weight: 600;
+}}
+QLabel[status="warn"] {{
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-weight: 600;
+}}
+QLabel[status="error"] {{
+    background: #fee2e2;
+    color: #b91c1c;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-weight: 600;
+}}
 """
 
 
