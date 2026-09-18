@@ -10,6 +10,26 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from app.models.diff import BoundingBox
+
+PHARMACODE_TYPE = "Pharmacode"
+_QR_FAMILY = ("qr", "datamatrix", "aztec", "pdf417", "maxicode")
+
+
+def symbol_group(symbol_type: str) -> str:
+    """The group a symbol is listed under (FR-10.2): Barcode, Pharmacode or QR code.
+
+    Decoders name formats their own way ("QRCode", "QRCODE", "EAN13", "CODE128");
+    two-dimensional matrix codes are listed with QR codes, everything else read
+    as bars is a barcode.
+    """
+    lowered = symbol_type.lower()
+    if lowered == PHARMACODE_TYPE.lower():
+        return "Pharmacode"
+    if any(family in lowered for family in _QR_FAMILY):
+        return "QR code"
+    return "Barcode"
+
 
 @dataclass
 class SymbolComparison:
@@ -18,6 +38,12 @@ class SymbolComparison:
     symbol_type: str
     original_value: str | None  # None when the symbol only exists in the suspect
     suspect_value: str | None  # None when the symbol is missing from the suspect
+    # Where it is, in the shared aligned space, so a result can be shown in place.
+    bbox: BoundingBox | None = None
+
+    @property
+    def group(self) -> str:
+        return symbol_group(self.symbol_type)
 
     @property
     def passed(self) -> bool:

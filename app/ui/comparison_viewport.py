@@ -358,7 +358,10 @@ class ComparisonViewport(QWidget):
     def focus_cluster(self, cluster: DiffCluster) -> None:
         """Select a finding and bring it into view in every visible pane."""
         self.set_selected(cluster.id)
-        box = cluster.bbox_in_original
+        self.focus_box(cluster.bbox_in_original)
+
+    def focus_box(self, box: BoundingBox) -> None:
+        """Bring a region (a finding, a decoded symbol) into view in every visible pane."""
         pane = self.original_pane
         viewport = pane.viewport()
         if box.width > 0 and box.height > 0 and viewport.width() > 0:

@@ -5,12 +5,10 @@ because each reads symbologies and print qualities the other misses.
 Decoding only happens in Barcode mode; in every other mode these regions are
 compared as pixels like any other artwork (FR-12.1).
 
-KNOWN GAP -- Pharmacode (Laetus) is NOT decodable here. The Architecture
+Pharmacode (Laetus) is read by our own decoder (pharmacode.py). The Architecture
 Document expected zxing-cpp to cover "some pharmacode variants", but neither
 library implements it (zxing-cpp's `PZN` is a Pharmazentralnummer carried in
-Code39, which is a different thing). Pharmacode symbols therefore read as
-"not decodable" rather than being silently skipped, and FR-10.1 is not fully
-met until a validated decoder is sourced or written.
+Code39, which is a different thing).
 """
 
 from __future__ import annotations
@@ -26,7 +24,8 @@ from pyzbar import pyzbar
 from app.config import DetectionConfig
 from app.logging_config import StageTimer
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
-from app.models.result import SymbolComparison
+from app.engine.detectors import pharmacode
+from app.models.result import PHARMACODE_TYPE, SymbolComparison
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +74,8 @@ def _zbar_readings(image: np.ndarray) -> list[SymbolReading]:
     return readings
 
 
-def decode_symbols(image: np.ndarray) -> list[SymbolReading]:
-    """All symbols either decoder can read, de-duplicated."""
+def decode_symbols(image: np.ndarray, config: DetectionConfig | None = None) -> list[SymbolReading]:
+    """All symbols any decoder can read, de-duplicated."""
     readings = _zxing_readings(image)
     for reading in _zbar_readings(image):
         already_found = any(
@@ -85,6 +84,11 @@ def decode_symbols(image: np.ndarray) -> list[SymbolReading]:
         )
         if not already_found:
             readings.append(reading)
+
+    # Pharmacode last: a bar symbol another decoder already read is not also a Pharmacode.
+    for code in pharmacode.find_pharmacodes(image, config or DetectionConfig()):
+        if not any(existing.bbox.iou(code.bbox) > 0.05 for existing in readings):
+            readings.append(SymbolReading(PHARMACODE_TYPE, str(code.value), code.bbox))
     return readings
 
 
@@ -130,8 +134,8 @@ def compare(
 ) -> tuple[list[DiffCandidate], list[SymbolComparison]]:
     """Decode both files' symbols and compare their values (FR-10.1/10.2)."""
     with StageTimer(logger, "detector_barcode"):
-        original_readings = decode_symbols(original)
-        suspect_readings = decode_symbols(suspect)
+        original_readings = decode_symbols(original, config)
+        suspect_readings = decode_symbols(suspect, config)
 
         candidates: list[DiffCandidate] = []
         comparisons: list[SymbolComparison] = []
@@ -140,6 +144,11 @@ def compare(
                 symbol_type=(original_reading or suspect_reading).symbol_type,
                 original_value=original_reading.value if original_reading else None,
                 suspect_value=suspect_reading.value if suspect_reading else None,
+                bbox=(
+                    original_reading.bbox.union(suspect_reading.bbox)
+                    if original_reading and suspect_reading
+                    else (original_reading or suspect_reading).bbox
+                ),
             )
             comparisons.append(comparison)
             if comparison.passed:

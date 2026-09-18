@@ -189,6 +189,16 @@ class DetectionConfig:
     # scan cannot be told from JPEG ringing or noise at a corner.
     structure_footprint_sigmas: float = 2.0
 
+    # Pharmacode (see pharmacode.py): bars of one length, at least this long and this
+    # many times longer than thick (px at 300 DPI: ~1.4 mm up to ~50 mm), in a row of
+    # 4 to 16 (the symbology's own limit is 2 to 16; 2-3 bars are indistinguishable
+    # from ordinary marks).
+    pharmacode_min_bars: int = 4
+    pharmacode_max_bars: int = 16
+    pharmacode_min_bar_length_px: int = 16
+    pharmacode_max_bar_length_px: int = 600
+    pharmacode_min_aspect: float = 3.0
+
     # Colour (CIEDE2000 in Lab). 2.3 is the classic "just noticeable
     # difference" figure; print tolerances are usually looser, so this is a
     # sensitive default QA will likely want to raise.

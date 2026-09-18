@@ -149,6 +149,18 @@ QComboBox QAbstractItemView {{
 
 QCheckBox {{ spacing: 8px; }}
 
+QTabWidget::pane {{ border: none; background: transparent; }}
+QTabBar::tab {{
+    background: transparent;
+    color: {TEXT_SECONDARY};
+    padding: 8px 16px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-weight: 600;
+}}
+QTabBar::tab:selected {{ color: {ACCENT}; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover:!selected {{ color: {TEXT_PRIMARY}; }}
+
 QScrollArea {{ background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
 

@@ -120,12 +120,26 @@ def test_scan_mode_still_sees_a_structural_change():
 def test_barcode_mode_compares_only_symbols():
     """FR-10.1: no other artwork content is compared in this mode."""
     original = _artwork()
-    suspect = _recolour_block(original)  # a blatant colour change, and no symbols
+    suspect = _recolour_block(original)  # a blatant colour change; the symbol is untouched
 
     outcome = run_comparison(original, suspect, ComparisonMode.BARCODE, CONFIG)
 
-    assert all(c.type is DiffType.BARCODE for c in outcome.candidates)
-    assert outcome.warnings  # told the reviewer nothing was decodable
+    assert outcome.candidates == []  # the colour change is not this mode's business
+    # The artwork's twelve equal bars are, by the symbology's definition, a Pharmacode (2^12 - 1).
+    assert [(c.symbol_type, c.original_value, c.passed) for c in outcome.symbol_comparisons] == [
+        ("Pharmacode", "4095", True)
+    ]
+    assert outcome.mode is ComparisonMode.BARCODE
+
+
+def test_barcode_mode_says_so_when_nothing_could_be_decoded():
+    blank = np.full((400, 600, 3), 255, dtype=np.uint8)
+    cv2.putText(blank, "PARACETAMOL", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (10, 10, 10), 2)
+
+    outcome = run_comparison(blank, blank.copy(), ComparisonMode.BARCODE, CONFIG)
+
+    assert outcome.symbol_comparisons == []
+    assert any("No barcode" in warning for warning in outcome.warnings)  # told the reviewer nothing was read
 
 
 def test_braille_mode_compares_only_dots():

@@ -65,6 +65,8 @@ class ComparisonOutcome:
     # "tolerant"; and whether detection ran only inside the changed regions.
     detection_profile: str = "tolerant"
     used_change_regions: bool = False
+    # Which mode produced this, so the results view can show the panels that mode calls for.
+    mode: ComparisonMode | None = None
 
 
 def run_comparison(
@@ -184,8 +186,9 @@ def run_comparison(
         candidates += symbol_candidates
         if not symbol_comparisons:
             warnings.append(
-                "No decodable symbols were found in either file. Note that Pharmacode "
-                "is not supported by the bundled decoders."
+                "No barcode, Pharmacode or QR code could be read in either file, so nothing "
+                "was compared. If the artwork has one, it may be too small or low-contrast "
+                "to decode."
             )
 
     if options.compare_braille_dots:
@@ -223,6 +226,7 @@ def run_comparison(
         warnings=warnings,
         detection_profile=profile,
         used_change_regions=used_regions,
+        mode=mode,
     )
 
 
