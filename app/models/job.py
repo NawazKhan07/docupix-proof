@@ -29,6 +29,68 @@ MODE_DISPLAY_NAMES: dict[ComparisonMode, str] = {
 }
 
 
+@dataclass(frozen=True)
+class DetectorOptions:
+    """What a given mode actually compares (SRS §2.3, FR-6.3, FR-10.1-12.1).
+
+    The mode is turned into this parameter object once, here, rather than
+    being re-interpreted by each detector (Architecture §3.1).
+    """
+
+    compare_color: bool
+    compare_text: bool
+    compare_graphics: bool
+    decode_symbols: bool
+    compare_braille_dots: bool
+    normalize_scan: bool
+
+
+_MODE_OPTIONS = {
+    # Everything, but barcode/Braille regions are only compared as pixels
+    # here -- decoding happens solely in their own modes (FR-12.1).
+    ComparisonMode.AUTOMATIC: DetectorOptions(
+        compare_color=True,
+        compare_text=True,
+        compare_graphics=True,
+        decode_symbols=False,
+        compare_braille_dots=False,
+        normalize_scan=False,
+    ),
+    # FR-6.3: colour is excluded outright (scanning shifts colour), and both
+    # files are flattened to black-on-white first.
+    ComparisonMode.SCAN_VS_DIGITAL: DetectorOptions(
+        compare_color=False,
+        compare_text=True,
+        compare_graphics=True,
+        decode_symbols=False,
+        compare_braille_dots=False,
+        normalize_scan=True,
+    ),
+    # FR-10.1: no other artwork content is compared in this mode.
+    ComparisonMode.BARCODE: DetectorOptions(
+        compare_color=False,
+        compare_text=False,
+        compare_graphics=False,
+        decode_symbols=True,
+        compare_braille_dots=False,
+        normalize_scan=False,
+    ),
+    # FR-11.1: restricted to the coloured dot matrix.
+    ComparisonMode.BRAILLE: DetectorOptions(
+        compare_color=False,
+        compare_text=False,
+        compare_graphics=False,
+        decode_symbols=False,
+        compare_braille_dots=True,
+        normalize_scan=False,
+    ),
+}
+
+
+def options_for_mode(mode: ComparisonMode) -> DetectorOptions:
+    return _MODE_OPTIONS[mode]
+
+
 @dataclass
 class ComparisonJob:
     """A single original-vs-suspect comparison request.

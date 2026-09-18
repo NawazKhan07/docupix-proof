@@ -43,7 +43,7 @@ def test_compare_reports_alignment_result_in_the_status_strip(qapp, tmp_path: Pa
         window._on_compare()
 
         text = window.status_label.text()
-        assert "px registration error" in text
+        assert "alignment" in text and "px" in text  # NFR-3 residual is surfaced
         assert window.status_label.property("status") in {"ok", "warn"}
         assert window.compare_button.isEnabled() is True  # re-enabled afterwards
     finally:

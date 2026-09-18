@@ -10,7 +10,8 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
 from app.config import load_config
-from app.engine.alignment.aligner import AlignmentError, align
+from app.engine.alignment.aligner import AlignmentError
+from app.engine.worker import run_comparison
 from app.logging_config import job_log_file
 from app.ui.mode_selector import ModeSelector
 from app.ui.theme import set_variant
@@ -69,10 +70,11 @@ class MainWindow(QMainWindow):
         set_variant(self.status_label, "status", state)
 
     def _on_compare(self) -> None:
-        """Run the pipeline as far as it currently goes: isolate, then align.
+        """Run the pipeline as far as it currently goes: isolate, align, detect.
 
-        Detectors and diff reporting join this in Phases 4-5. The work runs
-        on the UI thread for now; Phase 7 moves it into a worker process.
+        Clustering, severity and the diff list panel join this in Phase 5.
+        The work runs on the UI thread for now; Phase 7 moves it into a
+        worker process.
         """
         original, suspect = self.upload_panel.original, self.upload_panel.suspect
         assert original is not None and suspect is not None
@@ -93,10 +95,11 @@ class MainWindow(QMainWindow):
                         "suspect": str(suspect.path),
                     },
                 )
-                result = align(
+                outcome = run_comparison(
                     original.render(),
                     suspect.render(),
-                    self.config.alignment,
+                    self.mode_selector.mode,
+                    self.config,
                     original_geometry=self.upload_panel.original_slot.geometry,
                     suspect_geometry=self.upload_panel.suspect_slot.geometry,
                 )
@@ -107,16 +110,47 @@ class MainWindow(QMainWindow):
             QGuiApplication.restoreOverrideCursor()
             self.compare_button.setEnabled(self.upload_panel.both_loaded)
 
-        state = "warn" if result.low_confidence else "ok"
-        prefix = "Low-confidence alignment" if result.low_confidence else "Aligned"
-        self._set_status(
-            f"{prefix} — {result.residual_error_px:.2f} px registration error "
-            f"(threshold {result.threshold_px:.2f} px, {result.residual_basis} basis, "
-            f"method: {result.method}). Difference detection arrives in Phase 4.",
-            state,
-        )
+        self._set_status(*_describe(outcome))
 
     def closeEvent(self, event) -> None:
         self.upload_panel.original_slot.clear()
         self.upload_panel.suspect_slot.clear()
         super().closeEvent(event)
+
+
+def _describe(outcome) -> tuple[str, str]:
+    """Summarise a comparison for the status strip: (text, severity state).
+
+    Anything that was *not* checked (OCR unavailable, no decodable symbols)
+    is stated alongside the result, so "0 differences" is never mistaken for
+    "everything was verified".
+    """
+    alignment = outcome.alignment
+    parts = [
+        f"{len(outcome.candidates)} difference(s) found"
+        if outcome.candidates
+        else "No differences found"
+    ]
+
+    for comparison in outcome.symbol_comparisons:
+        parts.append(f"{comparison.symbol_type}: {comparison.status}")
+    if outcome.braille is not None:
+        braille = outcome.braille
+        parts.append(
+            f"Braille {braille.matched} matched / {braille.missing} missing / "
+            f"{braille.added} added / {braille.moved} moved"
+        )
+
+    parts.append(
+        f"alignment {alignment.residual_error_px:.2f} px"
+        + (" (LOW CONFIDENCE)" if alignment.low_confidence else "")
+    )
+    parts.extend(outcome.warnings)
+
+    if alignment.low_confidence or outcome.warnings:
+        state = "warn"
+    elif outcome.candidates:
+        state = "warn"
+    else:
+        state = "ok"
+    return " · ".join(parts), state

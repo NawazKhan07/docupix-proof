@@ -46,8 +46,85 @@ class AlignmentConfig:
 
 
 @dataclass(frozen=True)
+class DetectionConfig:
+    # Architecture §6.1: run detection at a working resolution rather than
+    # full print resolution. Measured on an A4 300 DPI pair, dropping from
+    # 3508 to 2000 px took the SSIM pass from 1.48s to 0.54s. Symbol and
+    # Braille detection deliberately ignore this and use full resolution,
+    # since small symbols and dots do not survive downscaling.
+    detection_working_long_edge_px: int = 2000
+
+    # Registration tolerance, in detection-resolution pixels. Any rotation
+    # between the two files means the suspect is resampled, so thin strokes
+    # land a fraction of a pixel off and every edge becomes a hairline
+    # mismatch -- measured on a 1.5-degree rotation, that traced the whole
+    # dieline as one page-sized "difference", with 57% of the differing
+    # pixels lying on that 3 px border line.
+    #
+    # A difference is only kept where no similar value exists within this
+    # radius in the other image, which tolerates a sub-pixel shift without
+    # blurring away genuinely changed content.
+    #
+    # THESE THREE ARE NOT YET VALIDATED AGAINST REAL ARTWORK. They trade
+    # false positives against sensitivity, and the trade is sharp: measured
+    # on synthetic pairs, a 3 px radius silenced a genuine 500mg -> 250mg
+    # change (only 8 of its 270 differing pixels survived) because the slack
+    # spans the gaps between glyph strokes. Tolerance must stay smaller than
+    # the finest feature that has to be told apart. Tune against real
+    # original/suspect pairs in tests/golden_pairs/ before trusting them.
+    #
+    # Defaults to no positional slack, biasing towards sensitivity: even 1 px
+    # measurably hid a genuine text change in testing, and for artwork review
+    # a false positive costs a reviewer a glance whereas a miss ships. Raise
+    # it only if misregistration noise proves worse than that on real files.
+    registration_tolerance_px: int = 0
+    # How different two values must be to count as different at all, on a
+    # 0-255 scale, once position has been tolerated. Above roughly 20 this
+    # starts swallowing whole-page colour casts.
+    registration_intensity_tolerance: int = 12
+    # A second, smaller pass that drops any stragglers thinner than this.
+    edge_tolerance_px: int = 2
+    # Drop regions whose pixels fill less than this share of their own
+    # bounding box: a hairline tracing a shape's outline has a box the size
+    # of the shape and almost nothing in it. Set low deliberately, since a
+    # genuinely changed frame or rule is also outline-shaped.
+    min_fill_ratio: float = 0.10
+
+    # Colour (CIEDE2000 in Lab). 2.3 is the classic "just noticeable
+    # difference" figure; print tolerances are usually looser, so this is a
+    # sensitive default QA will likely want to raise.
+    color_delta_e_threshold: float = 2.3
+    color_min_area_px: int = 40
+    # CIEDE2000 over a full 300 DPI page is far too slow for NFR-1, so the
+    # colour pass runs on a long edge no larger than this and its boxes are
+    # scaled back up (Architecture §6 allows a per-superpixel colour delta).
+    color_working_long_edge_px: int = 1200
+
+    # Graphics (SSIM).
+    ssim_threshold: float = 0.80
+    ssim_min_area_px: int = 40
+
+    # Text (OCR).
+    ocr_min_confidence: float = 40.0
+    text_move_tolerance_px: float = 6.0
+
+    # Symbols (barcode / pharmacode / QR).
+    symbol_match_tolerance_px: float = 60.0
+
+    # Braille. PENDING SIGN-OFF (SRS §7): the dot colour convention used in
+    # our source artwork is an open item. These HSV bounds cover the
+    # magenta/pink spot colour dots are commonly marked in; they must be
+    # confirmed against real files before this detector is trusted.
+    braille_hsv_lower: tuple[int, int, int] = (140, 80, 80)
+    braille_hsv_upper: tuple[int, int, int] = (175, 255, 255)
+    braille_dot_min_area_px: int = 6
+    braille_match_tolerance_px: float = 10.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -61,7 +138,10 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         logger.warning("ignoring unreadable config %s: %s", config_path, exc)
         return AppConfig()
 
-    return AppConfig(alignment=_merge(AlignmentConfig(), raw.get("alignment", {})))
+    return AppConfig(
+        alignment=_merge(AlignmentConfig(), raw.get("alignment", {})),
+        detection=_merge(DetectionConfig(), raw.get("detection", {})),
+    )
 
 
 def _merge(defaults, overrides: dict):

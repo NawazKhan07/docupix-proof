@@ -141,6 +141,39 @@ def polygon_correspondence(
     return best_fit
 
 
+def warp_to_reference(
+    image: np.ndarray,
+    transform: np.ndarray,
+    output_shape: tuple[int, int],
+    border_value: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    """Project an image into the reference (original) frame."""
+    height, width = output_shape
+    return cv2.warpPerspective(
+        image, transform, (width, height), flags=cv2.INTER_LINEAR, borderValue=border_value
+    )
+
+
+def warp_validity_mask(
+    source_shape: tuple[int, int], transform: np.ndarray, output_shape: tuple[int, int]
+) -> np.ndarray:
+    """Which reference pixels the warped source actually covers.
+
+    Without this, everywhere the suspect has no data becomes border fill and
+    then differs from the original's content -- a band of false differences
+    around every edge, growing with the rotation between the two files.
+    """
+    height, width = output_shape
+    covered = cv2.warpPerspective(
+        np.full(source_shape, 255, dtype=np.uint8),
+        transform,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderValue=0,
+    )
+    return covered > 0
+
+
 def estimate_homography(
     matches: FeatureMatches, config: AlignmentConfig
 ) -> tuple[np.ndarray, np.ndarray] | None:
