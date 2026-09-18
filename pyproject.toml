@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "artwork-compare"
+version = "0.1.0"
+description = "Offline desktop application for comparing pharmaceutical packaging artwork files"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "PySide6>=6.6",
+    "PyMuPDF>=1.24",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "pyzbar>=0.1.9",
+    "zxing-cpp>=2.2",
+    "pytesseract>=0.3.10",
+    "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyinstaller>=6.3",
+]
+
+[project.scripts]
+artwork-compare = "app.main:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
