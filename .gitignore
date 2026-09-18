@@ -10,3 +10,6 @@ logs/
 .mypy_cache/
 tests/golden_pairs/*
 !tests/golden_pairs/.gitkeep
+
+# Confidential real artwork used for local testing: never commit
+sample test files/

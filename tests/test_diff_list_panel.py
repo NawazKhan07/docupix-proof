@@ -150,9 +150,14 @@ def test_filtering_by_category(panel, outcome):
 
 
 def test_filtering_by_severity(panel, outcome):
-    panel.severity_combo.setCurrentIndex(panel.severity_combo.findData(Severity.MAJOR))
+    panel.severity_combo.setCurrentIndex(panel.severity_combo.findData(Severity.CRITICAL))
     shown = panel.visible_clusters()
-    assert shown and all(c.severity is Severity.MAJOR for c in shown)
+    assert shown and all(c.severity is Severity.CRITICAL for c in shown)
+
+    panel.severity_combo.setCurrentIndex(panel.severity_combo.findData(Severity.MINOR))
+    assert panel.visible_clusters() == []  # nothing in the fixture is Minor
+    labels = [label.text() for label in panel.findChildren(type(panel.title_label))]
+    assert "No findings match the current filters." in labels
 
 
 def test_filters_change_what_the_viewer_draws(panel, outcome):

@@ -179,17 +179,17 @@ def test_alignment_result_is_carried_through_to_the_outcome():
     assert outcome.alignment.low_confidence is False
 
 
-def test_small_text_edges_do_not_produce_critical_colour_findings(review_pair):
+def test_small_text_edges_do_not_produce_spurious_findings(review_pair):
     """Regression: on a 1.2 degree pair, anti-aliased glyph edges read as
-    ~dE 25 and produced three tiny colour findings on small text, each rated
-    CRITICAL. Only the two genuine changes may be reported as colour."""
+    ~dE 25 and produced tiny colour findings on small text, each rated
+    CRITICAL. Exactly the two genuine changes may be reported -- and each once,
+    with its colour and graphics evidence merged into a single finding."""
     original, suspect = review_pair
 
     outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, CONFIG)
 
-    colour = [c for c in outcome.clusters if c.type is DiffType.COLOUR]
-    assert len(colour) == 2
-    assert all(c.bbox_in_original.area > 5000 for c in colour)  # the block and the roundel
+    assert len(outcome.clusters) == 2  # the recoloured block and the removed roundel
+    assert all(c.bbox_in_original.area > 5000 for c in outcome.clusters)
 
 
 def test_the_outcome_carries_the_aligned_pair_the_viewer_draws_from():

@@ -55,13 +55,65 @@ def test_clustering_is_transitive_through_a_chain():
     assert len(cluster_candidates(chain, distance_px=30)) == 1
 
 
-def test_different_types_are_never_merged_even_when_overlapping():
-    """Same-type clustering keeps the text / colour / graphics categories meaningful."""
+def test_different_types_that_overlap_are_one_finding():
+    """A new logo is both a colour and a graphics difference: report it once.
+
+    On a real carton pair, keeping them apart gave a colour box nested inside a
+    graphics box for every change.
+    """
     overlapping = [
         _candidate(0, 0, 100, 100, DiffType.COLOUR, DiffSubtype.CHANGED),
         _candidate(10, 10, 90, 90, DiffType.GRAPHICS, DiffSubtype.CHANGED),
     ]
-    assert len(cluster_candidates(overlapping, distance_px=30)) == 2
+    (group,) = cluster_candidates(overlapping, distance_px=30)
+    assert {c.type for c in group} == {DiffType.COLOUR, DiffType.GRAPHICS}
+
+
+def test_different_types_that_are_merely_near_each_other_stay_separate():
+    """Proximity joins only like with like; only real overlap joins different kinds."""
+    near = [
+        _candidate(0, 0, 100, 100, DiffType.COLOUR, DiffSubtype.CHANGED),
+        _candidate(110, 0, 200, 100, DiffType.GRAPHICS, DiffSubtype.CHANGED),  # 10 px away
+    ]
+    assert len(cluster_candidates(near, distance_px=30)) == 2
+
+
+def test_a_barely_overlapping_pair_is_not_merged():
+    """Overlap is measured against the smaller box: a 5% sliver is not the same change."""
+    sliver = [
+        _candidate(0, 0, 100, 100, DiffType.COLOUR, DiffSubtype.CHANGED),
+        _candidate(95, 0, 195, 100, DiffType.GRAPHICS, DiffSubtype.CHANGED),  # 5% of the smaller
+    ]
+    assert len(cluster_candidates(sliver, distance_px=30, overlap_ratio=0.2)) == 2
+    assert len(cluster_candidates(sliver, distance_px=30, overlap_ratio=0.04)) == 1
+
+
+def test_a_small_finding_nested_in_a_larger_one_is_the_same_finding():
+    nested = [
+        _candidate(0, 0, 120, 40, DiffType.GRAPHICS, DiffSubtype.CHANGED),
+        _candidate(40, 10, 70, 30, DiffType.COLOUR, DiffSubtype.CHANGED),  # fully inside
+    ]
+    assert len(cluster_candidates(nested, distance_px=30)) == 1
+
+
+def test_a_huge_outline_artefact_does_not_swallow_the_findings_it_touches():
+    """A page-sized ring around genuine findings must not fuse them into one blob."""
+    ring = _candidate(0, 0, 3000, 3000, DiffType.GRAPHICS, DiffSubtype.CHANGED)
+    inside = [
+        _candidate(100, 100, 140, 120, DiffType.COLOUR, DiffSubtype.CHANGED),
+        _candidate(2000, 2000, 2040, 2020, DiffType.COLOUR, DiffSubtype.CHANGED),
+    ]
+    groups = cluster_candidates([ring, *inside], distance_px=30, max_area_ratio=60.0)
+    assert len(groups) == 3
+
+
+def test_overlap_merging_is_transitive():
+    chain = [
+        _candidate(0, 0, 100, 100, DiffType.COLOUR, DiffSubtype.CHANGED),
+        _candidate(60, 0, 160, 100, DiffType.GRAPHICS, DiffSubtype.CHANGED),
+        _candidate(120, 0, 220, 100, DiffType.TEXT, DiffSubtype.CHANGED),
+    ]
+    assert len(cluster_candidates(chain, distance_px=5)) == 1
 
 
 def test_the_distance_is_a_tunable_parameter():

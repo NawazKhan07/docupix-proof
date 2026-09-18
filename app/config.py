@@ -54,6 +54,37 @@ class DetectionConfig:
     # since small symbols and dots do not survive downscaling.
     detection_working_long_edge_px: int = 2000
 
+    # Coarse-to-fine (Architecture §6.3). Most of two artwork files is usually
+    # identical, so a cheap full-resolution pixel diff finds where they differ
+    # at all, and the expensive detectors (CIEDE2000, SSIM) then run only inside
+    # those regions -- at full resolution, so thin text strokes survive instead
+    # of being averaged away by a downscale. Measured on a real 310 x 420 mm
+    # carton pair: colour detection alone was 1.1 s of a 2.2 s comparison.
+    #
+    # Per-channel difference (0-255) at which a pixel counts as changed.
+    region_diff_threshold: int = 16
+    # Context kept around each changed area, in working pixels (~4 mm at 300 DPI).
+    region_margin_px: int = 48
+    # Changed pixels are grouped on a grid this coarse, which keeps grouping cheap.
+    region_block_px: int = 8
+    # If the regions cover more than this share of the page (a scan, or a pair
+    # that is not registered), region-limited work stops paying off and the
+    # whole-page pass is used instead.
+    region_max_area_fraction: float = 0.30
+
+    # When alignment is exact (both files digital and already registered) there
+    # is no misregistration noise to filter, so every noise filter is switched
+    # off and sensitivity is at its maximum. The filters below exist for
+    # rotated/scanned pairs; on an exact pair they only erase real, thin
+    # differences -- the opening removed every stroke under ~5 px, which turned
+    # a missing sentence into four tiny boxes on stray letters.
+    exact_alignment_residual_px: float = 0.25
+    # Smallest difference reported when alignment is exact, in raw pixels
+    # (~0.5 mm across at 300 DPI): small enough to catch a decimal point.
+    exact_min_area_px: int = 6
+    # Smallest per-channel change worth reporting when alignment is exact.
+    exact_intensity_tolerance: int = 3
+
     # Registration tolerance, in detection-resolution pixels. Any rotation
     # between the two files means the suspect is resampled, so thin strokes
     # land a fraction of a pixel off and every edge becomes a hairline
@@ -141,6 +172,13 @@ class ClusteringConfig:
     # the words of a moved line and the lines of a paragraph, small enough
     # not to fuse unrelated changes on opposite sides of a carton panel.
     distance_px: float = 30.0
+    # Two findings whose boxes overlap by at least this share of the SMALLER
+    # one are the same physical change seen by different detectors (a new logo
+    # is both a colour and a graphics difference) and are reported once.
+    merge_overlap_ratio: float = 0.2
+    # ...unless one box is vastly larger than the other, which is a stray
+    # outline artefact swallowing genuine findings rather than a duplicate.
+    merge_max_area_ratio: float = 60.0
 
 
 @dataclass(frozen=True)

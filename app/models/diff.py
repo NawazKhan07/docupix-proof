@@ -150,6 +150,11 @@ class DiffCluster:
         return _CATEGORIES[self.type]
 
     @property
+    def types(self) -> set[DiffType]:
+        """Every kind of difference merged into this finding (usually just one)."""
+        return {member.type for member in self.members} or {self.type}
+
+    @property
     def is_ignored(self) -> bool:
         return self.status is DiffStatus.IGNORED
 

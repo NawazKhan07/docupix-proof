@@ -70,10 +70,10 @@ def test_ids_follow_reading_order_starting_at_one():
     assert [c.bbox_in_original.x0 for c in clusters] == [0, 300, 500]
 
 
-def test_a_multi_member_cluster_summarises_itself():
+def test_a_multi_member_cluster_summarises_itself_with_a_count():
     words = [_candidate(x, 0, x + 40, 20, subtype=DiffSubtype.MOVED) for x in (0, 50, 100)]
     (cluster,) = build_clusters(words, IDENTITY, CONFIG)
-    assert "3 text differences" in cluster.detail
+    assert cluster.detail.endswith("\u00d73")  # "x3": three members, one finding
 
 
 def test_a_custom_rule_table_is_honoured():
