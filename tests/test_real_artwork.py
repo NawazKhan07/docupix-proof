@@ -14,7 +14,9 @@ are listed in `sample test files/pairs.json`, and the expected answer is
   finding per object, each pointing at it tightly, and nothing pointing at
   anything else.
 
-The same pair is also put through the Scan-vs-Digital path: the suspect is
+The same pair is also put through the path for files that do not register exactly (the
+suspect rotated, shifted and rescaled a little, as a re-exported file may be) and through
+the Scan-vs-Digital path: the suspect is
 degraded like a flatbed scan (tests/scan_simulator.py -- generic damage, nothing
 tuned to a file) and the answer is still the digital pixel difference.
 
@@ -119,6 +121,25 @@ def compared(images):
     return outcome, _true_boxes(original_image, suspect_image), elapsed
 
 
+def _placed_differently(image: np.ndarray) -> np.ndarray:
+    """The same artwork rotated, shifted and rescaled slightly -- generic, not tuned to a file."""
+    height, width = image.shape[:2]
+    matrix = cv2.getRotationMatrix2D((width / 2, height / 2), 0.6, 1.005)
+    matrix[0, 2] += 12
+    matrix[1, 2] -= 7
+    return cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
+
+
+@pytest.fixture(scope="module")
+def misregistered(images):
+    """(outcome on the moved changed file, outcome on the moved identical file, truth)."""
+    _entry, original_image, suspect_image = images
+    config = AppConfig()
+    changed = run_comparison(original_image, _placed_differently(suspect_image), ComparisonMode.AUTOMATIC, config)
+    identical = run_comparison(original_image, _placed_differently(original_image), ComparisonMode.AUTOMATIC, config)
+    return changed, identical, _true_boxes(original_image, suspect_image)
+
+
 @pytest.fixture(scope="module")
 def scanned(images):
     """(outcome on a scan of the changed file, outcome on a scan of identical content, truth)."""
@@ -198,3 +219,25 @@ def test_a_scan_of_the_changed_artwork_points_at_real_changes_and_only_those(sca
 
     for finding in findings:
         assert any(_coverage(box, finding) > 0 for box in truth), f"spurious finding at {finding}"
+
+
+# ---- the same pair, placed slightly differently ----------------------------------------
+
+
+def test_identical_artwork_placed_differently_reports_nothing(misregistered):
+    _changed, identical, _truth = misregistered
+    assert identical.detection_profile == "tolerant"  # it really was not an exact registration
+    assert identical.clusters == []
+
+
+def test_changes_are_still_found_when_the_files_do_not_register_exactly(misregistered):
+    """Not every change survives a misregistration (a 2 mm mark is at the noise floor), so most
+    of them are asked for -- with no false alarms, and a missing line of print as one finding."""
+    changed, _identical, truth = misregistered
+    findings = _finding_boxes(changed)
+
+    found = sum(1 for box in truth if max((_iou(box, finding) for finding in findings), default=0) >= 0.3)
+    assert found >= 0.7 * len(truth), f"only {found} of {len(truth)} real changes were pointed at"
+    for finding in findings:
+        assert any(_coverage(box, finding) > 0 for box in truth), f"spurious finding at {finding}"
+    assert len(findings) <= len(truth)  # one finding per change, not a scatter

@@ -155,6 +155,15 @@ class DetectionConfig:
     # the pixels, up to this many pixels of Gaussian blur) before they are compared.
     # A match must beat "no blur" by this much correlation to be believed.
     structure_softness_max_px: float = 3.5
+    # How graphics are compared when the two files are NOT exactly registered
+    # (a digital pair placed slightly differently, or a scan): "structure" asks where
+    # ink is, within the measured registration error; "ssim" is the similarity map;
+    # "both" runs the two and lets overlapping findings merge. Measured on the
+    # real carton pair placed differently: ssim alone found a missing line of small
+    # print with 0.07 IoU, structure 0.96, and both together also framed a
+    # shifted-lettering change best (0.78 vs 0.31-0.58) for ~0.4 s more.
+    # (Scans always use "structure": the similarity map cannot follow a scan.)
+    graphics_when_misregistered: str = "both"
     # A scan this much softer than the original (Gaussian sigma, px at 300 DPI) can no
     # longer hold the finest print, so the reviewer is told fine print is unverified.
     structure_soft_warning_sigma_px: float = 2.0

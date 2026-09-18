@@ -92,7 +92,10 @@ def test_the_old_behaviour_was_fragmentary_which_is_why_the_profile_exists():
     original, suspect = _big_page(True), _big_page(False)
     (text_width, _), _ = cv2.getTextSize(SENTENCE, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
     old_behaviour = dataclasses.replace(
-        DetectionConfig(), exact_alignment_residual_px=-1.0, region_max_area_fraction=0.0
+        DetectionConfig(),
+        exact_alignment_residual_px=-1.0,
+        region_max_area_fraction=0.0,
+        graphics_when_misregistered="ssim",  # the similarity map, which is what erased thin print
     )
 
     outcome = run_comparison(
@@ -101,6 +104,23 @@ def test_the_old_behaviour_was_fragmentary_which_is_why_the_profile_exists():
 
     assert not outcome.used_change_regions
     assert all(c.bbox_in_original.width < 0.2 * text_width for c in outcome.clusters)
+
+
+def test_a_missing_sentence_is_one_finding_even_when_the_files_do_not_register_exactly():
+    """The same complaint on the path used for rotated or shifted files: asking where ink is
+    (rather than the similarity map's noise-filtered result) keeps the whole sentence."""
+    original, suspect = _big_page(True), _big_page(False)
+    (text_width, _), _ = cv2.getTextSize(SENTENCE, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    misregistered = dataclasses.replace(
+        DetectionConfig(), exact_alignment_residual_px=-1.0, region_max_area_fraction=0.0
+    )
+
+    outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(detection=misregistered))
+
+    assert outcome.detection_profile == "tolerant" and not outcome.used_change_regions
+    assert len(outcome.clusters) == 1
+    box = outcome.clusters[0].bbox_in_original
+    assert box.x0 <= 700 + 10 and box.x1 >= 700 + text_width - 10
 
 
 def test_a_tiny_difference_is_still_found_when_alignment_is_exact():

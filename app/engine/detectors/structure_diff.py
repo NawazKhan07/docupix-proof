@@ -145,8 +145,12 @@ class InkField:
 
     def _above(self, relative: float, floor: float) -> np.ndarray:
         # The bar scales with the local tone: a fixed number of grey levels means
-        # far more on a dark panel than on white paper.
-        threshold = np.maximum(floor, self.background.astype(np.float32) * relative).astype(np.uint8)
+        # far more on a dark panel than on white paper. The bar is a function of
+        # the background's grey level alone, so it is looked up in a 256-entry
+        # table rather than computed per pixel in floating point (which built
+        # several 70 MB temporaries per call on a full sheet).
+        table = np.maximum(floor, np.arange(256, dtype=np.float32) * relative).astype(np.uint8)
+        threshold = cv2.LUT(self.background, table)
         return cv2.compare(self.contrast, threshold, cv2.CMP_GT).astype(bool)
 
     def strong(self, config: DetectionConfig) -> np.ndarray:

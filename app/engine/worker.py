@@ -111,9 +111,16 @@ def run_comparison(
     braille_comparison: BrailleComparison | None = None
 
     used_regions = False
-    if options.normalize_scan and options.compare_graphics:
-        # Scan-vs-Digital (FR-6.3): colour is ignored, so compare where INK is,
-        # at full resolution, tolerating the registration error we measured.
+    # Graphics of files that do not register exactly are compared by where INK is, within
+    # the measured registration error: the similarity map's noise filters, needed there,
+    # erase thin real changes (a missing line of small print scored 0.07 IoU).
+    misregistered = options.normalize_scan or profile != "exact"
+    graphics_mode = detection_config.graphics_when_misregistered if misregistered else "ssim"
+    use_structure = options.compare_graphics and graphics_mode in ("structure", "both")
+    use_ssim = options.compare_graphics and graphics_mode in ("ssim", "both") and not options.normalize_scan
+    if use_structure:
+        # Compare where INK is, at full resolution, tolerating the registration error
+        # we measured (FR-6.3 for scans: colour is ignored there).
         structure = structure_diff.detect(
             masked_original,
             masked_suspect,
@@ -150,7 +157,12 @@ def run_comparison(
     if regions is not None:
         used_regions = True
         candidates += _detect_in_regions(
-            masked_original, masked_suspect, compare_mask, regions, options, detection_config
+            masked_original,
+            masked_suspect,
+            compare_mask,
+            regions,
+            replace(options, compare_graphics=use_ssim),
+            detection_config,
         )
 
     if options.compare_color or options.compare_graphics or options.compare_text:
@@ -168,7 +180,7 @@ def run_comparison(
                 working_candidates += color_diff.detect(
                     small_original, small_suspect, detection_config, small_mask
                 )
-            if needs_pixels and options.compare_graphics:
+            if needs_pixels and use_ssim:
                 working_candidates += graphics_diff.detect(
                     small_original, small_suspect, detection_config, small_mask
                 )
