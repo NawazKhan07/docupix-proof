@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -20,7 +22,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.engine.file_loader import LoadedArtwork
+from app.engine.file_loader import WORKING_DPI, LoadedArtwork
 from app.engine.isolation import crop_tool, polygon_tracer
 from app.engine.isolation.polygon_tracer import NoDielineFoundError
 from app.models.isolation import (
@@ -33,10 +35,13 @@ from app.ui.interactive_canvas import InteractiveCanvas
 from app.ui.theme import set_variant
 
 _STATUS_TEXT = {
-    IsolationTool.CROP: "Drag to draw a crop rectangle, then Save.",
+    IsolationTool.CROP: "Drag on the page to draw a crop. Drag its edges or corners to resize it, or its inside to move it.",
     IsolationTool.POLYGON_TRACE: "Click a point on the dieline to trace it.",
     IsolationTool.ERASE: "Drag to paint regions to exclude from comparison.",
 }
+_NAVIGATION_HINT = "Pinch or Ctrl + wheel to zoom  ·  two-finger scroll, Space + drag or middle-drag to pan"
+_SCREEN_SHARE = 0.85  # how much of the screen the dialog may take, so the whole page can be seen
+_MM_PER_INCH = 25.4
 
 
 class IsolationDialog(QDialog):
@@ -45,7 +50,7 @@ class IsolationDialog(QDialog):
     def __init__(self, artwork: LoadedArtwork, title: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Isolate Artwork — {title}")
-        self.resize(800, 650)
+        self._size_to_screen()
         self._artwork = artwork
         self._rendered = artwork.render()
         self._result: Optional[IsolationGeometry] = None
@@ -67,28 +72,119 @@ class IsolationDialog(QDialog):
         tool_row.addWidget(self.trace_button)
         tool_row.addWidget(self.erase_button)
         tool_row.addStretch(1)
+
+        # Zoom controls: the page opens fitted, and these (or a pinch / Ctrl + wheel) change that.
+        self.zoom_out_button = QPushButton("−")
+        self.zoom_label = QLabel("100%")
+        self.zoom_in_button = QPushButton("+")
+        self.fit_button = QPushButton("Fit")
+        self.actual_button = QPushButton("100%")
+        for button in (self.zoom_out_button, self.zoom_in_button):
+            button.setProperty("variant", "icon")
+        for button in (self.fit_button, self.actual_button):
+            button.setProperty("variant", "segment")
+        self.zoom_label.setMinimumWidth(48)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for widget in (self.zoom_out_button, self.zoom_label, self.zoom_in_button, self.fit_button, self.actual_button):
+            tool_row.addWidget(widget)
         layout.addLayout(tool_row)
 
         self.canvas = InteractiveCanvas(self)
         self.canvas.set_image(self._rendered)
         layout.addWidget(self.canvas, stretch=1)
 
+        info_row = QHBoxLayout()
         self.status_label = QLabel(_STATUS_TEXT[IsolationTool.CROP])
         self.status_label.setProperty("role", "statusbar")
-        layout.addWidget(self.status_label)
+        self.crop_readout = QLabel("")
+        self.crop_readout.setProperty("role", "statusbar")
+        info_row.addWidget(self.status_label, stretch=1)
+        info_row.addWidget(self.crop_readout)
+        layout.addLayout(info_row)
+
+        hint = QLabel(_NAVIGATION_HINT)
+        hint.setProperty("secondary", "true")
+        layout.addWidget(hint)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
-        self.buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("variant", "primary")
+        save_button = self.buttons.button(QDialogButtonBox.StandardButton.Save)
+        save_button.setText("Apply && Save")
+        save_button.setProperty("variant", "primary")
+        self.reset_button = self.buttons.addButton("Reset selection", QDialogButtonBox.ButtonRole.ResetRole)
         layout.addWidget(self.buttons)
 
         self.crop_button.clicked.connect(lambda: self._select_tool(IsolationTool.CROP))
         self.trace_button.clicked.connect(lambda: self._select_tool(IsolationTool.POLYGON_TRACE))
         self.erase_button.clicked.connect(lambda: self._select_tool(IsolationTool.ERASE))
         self.canvas.pointClicked.connect(self._on_point_clicked)
-        self.buttons.accepted.connect(self._on_save)
+        self.canvas.cropRectAdjusting.connect(self._show_crop_readout)
+        self.canvas.cropRectChanged.connect(self._show_crop_readout)
+        self.canvas.zoomChanged.connect(self._show_zoom)
+        self.zoom_in_button.clicked.connect(self.canvas.zoom_in)
+        self.zoom_out_button.clicked.connect(self.canvas.zoom_out)
+        self.fit_button.clicked.connect(self.canvas.fit_to_view)
+        self.actual_button.clicked.connect(self.canvas.zoom_actual)
+        self.reset_button.clicked.connect(self._on_reset)
+        self.buttons.accepted.connect(self._on_save_clicked)
         self.buttons.rejected.connect(self.reject)
+        self._show_zoom(self.canvas.zoom)
+
+    def _size_to_screen(self) -> None:
+        """Open large enough that the whole page can be seen, whatever the screen."""
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1000, 750)
+            return
+        available = screen.availableGeometry()
+        self.resize(
+            max(900, int(available.width() * _SCREEN_SHARE)), max(650, int(available.height() * _SCREEN_SHARE))
+        )
+
+    def _show_zoom(self, zoom: float) -> None:
+        self.zoom_label.setText(f"{round(zoom * 100)}%")
+
+    def _show_crop_readout(self, rect: NormalizedRect | None) -> None:
+        """Live size of the selection, so it can be judged without saving."""
+        size = self.canvas.crop_size_px()
+        if rect is None or size is None:
+            self.crop_readout.setText("")
+            return
+        width_px, height_px = size
+        page_height, page_width = self._rendered.shape[:2]
+        share = 100 * width_px * height_px / (page_width * page_height)
+        text = f"Crop {width_px:,} × {height_px:,} px"
+        if self._artwork.kind == "pdf":  # a PDF is rendered at a known DPI, so real size is known
+            to_mm = _MM_PER_INCH / WORKING_DPI
+            text += f" ({width_px * to_mm:.1f} × {height_px * to_mm:.1f} mm)"
+        self.crop_readout.setText(f"{text} · {share:.0f}% of the page")
+
+    def _on_reset(self) -> None:
+        """Clear whatever the current tool has drawn, to start that selection again."""
+        tool = self.canvas.tool
+        if tool == IsolationTool.CROP:
+            self.canvas.clear_crop()
+            self._show_crop_readout(None)
+        elif tool == IsolationTool.POLYGON_TRACE:
+            self.canvas.clear_polygon()
+        else:
+            self.canvas.clear_erase_strokes()
+        self.status_label.setText(_STATUS_TEXT[tool])
+
+    def _on_save_clicked(self) -> None:
+        """Save button: confirm a crop first, since it discards the rest of the page."""
+        if self.canvas.polygon() is None and self.canvas.crop_rect() is not None:
+            answer = QMessageBox.question(
+                self,
+                "Apply this crop?",
+                f"{self.crop_readout.text()}\n\nOnly this area will be compared; the rest of the page is ignored.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._on_save()
 
     def _select_tool(self, tool: IsolationTool) -> None:
         self.canvas.set_tool(tool)

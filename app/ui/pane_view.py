@@ -11,7 +11,7 @@ import math
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from app.engine.aggregation.severity import SEVERITY_COLOURS
 from app.models.diff import BoundingBox, DiffCluster
+from app.ui.gestures import enable_zoom_gestures, zoom_from_viewport_event, zoom_from_wheel
 
 _MIN_LEVEL_EDGE_PX = 64  # never reduce an image below this on its long edge
 _CLICK_SLOP_PX = 5  # a press-release within this distance is a click, not a drag
@@ -81,7 +82,8 @@ class ImageStack:
 
 class PaneView(QGraphicsView):
     markerClicked = Signal(int)  # cluster id
-    zoomStepRequested = Signal(int)  # +1 / -1, from Ctrl + wheel
+    zoomStepRequested = Signal(int)  # +1 / -1, a fixed step (keyboard / buttons)
+    zoomRequested = Signal(float, QPointF)  # scale factor about a viewport point (pinch, Ctrl + wheel)
     resized = Signal()
 
     def __init__(self, parent=None):
@@ -100,6 +102,7 @@ class PaneView(QGraphicsView):
         self._marker_items: dict[int, QGraphicsRectItem] = {}
         self._halo_items: list[QGraphicsRectItem] = []
         self._press_pos = None
+        enable_zoom_gestures(self)
 
         # A screen-resolution tile drawn over the base image once zoomed in
         # (FR-9.1). See `set_detail`.
@@ -154,9 +157,19 @@ class PaneView(QGraphicsView):
     def zoom(self) -> float:
         return self._zoom
 
-    def set_zoom(self, zoom: float) -> None:
+    def set_zoom(self, zoom: float, anchor: QPointF | None = None) -> None:
+        """Zoom to `zoom`, keeping the image point under `anchor` (a viewport position) still.
+
+        Without an anchor the view keeps its centre, which is right for the zoom
+        buttons; a pinch or wheel zooms about the fingers / cursor instead.
+        """
+        scene_point = self.mapToScene(anchor.toPoint()) if anchor is not None else None
         self._zoom = zoom
         self.setTransform(QTransform.fromScale(zoom, zoom))
+        if scene_point is not None:
+            drift = self.mapFromScene(scene_point) - anchor.toPoint()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + drift.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() + drift.y())
         self._render_shown()  # a different reduced level may now be the right one
         self._refresh_detail_item()  # a tile made for another zoom is now the wrong size
 
@@ -222,11 +235,20 @@ class PaneView(QGraphicsView):
         )
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.zoomStepRequested.emit(1 if event.angleDelta().y() > 0 else -1)
+        request = zoom_from_wheel(event)
+        if request is not None:
+            self.zoomRequested.emit(*request)
             event.accept()
             return
         super().wheelEvent(event)
+
+    def viewportEvent(self, event: QEvent) -> bool:
+        request = zoom_from_viewport_event(self, event)
+        if request is not None:
+            self.zoomRequested.emit(*request)
+            event.accept()
+            return True
+        return super().viewportEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

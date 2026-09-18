@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
 
 from app.ui.comparison_viewport import (
@@ -99,6 +99,36 @@ def test_ctrl_wheel_zooms(viewport):
     assert viewport.zoom > 1.0
     viewport.original_pane.zoomStepRequested.emit(-1)
     assert viewport.zoom == pytest.approx(1.0)
+
+
+def test_a_pinch_zooms_by_the_amount_the_fingers_moved(viewport):
+    """Reported: pinching only scrolled. A pinch is many small factors, not fixed steps."""
+    viewport.set_zoom(1.0)
+    for _ in range(4):
+        viewport.original_pane.zoomRequested.emit(1.1, QPointF(200, 150))
+    assert viewport.zoom == pytest.approx(1.1**4)
+
+    viewport.original_pane.zoomRequested.emit(1 / 1.1**4, QPointF(200, 150))
+    assert viewport.zoom == pytest.approx(1.0)
+
+
+def test_a_pinch_zooms_about_the_fingers_not_the_page_centre(viewport):
+    viewport.set_zoom(3.0)  # scrollable, so there is somewhere to keep the point
+    pane = viewport.original_pane
+    anchor = QPointF(220, 160)
+    before = pane.mapToScene(anchor.toPoint())
+
+    pane.zoomRequested.emit(1.5, anchor)
+
+    after = pane.mapToScene(anchor.toPoint())
+    assert (after - before).manhattanLength() < 2.0
+
+
+def test_a_pinch_moves_both_panes_together(viewport):
+    viewport.set_zoom(1.0)
+    viewport.original_pane.zoomRequested.emit(2.0, QPointF(100, 100))
+    assert viewport.original_pane.zoom == pytest.approx(2.0)
+    assert viewport.suspect_pane.zoom == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import logging
 import math
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -128,6 +128,7 @@ class ComparisonViewport(QWidget):
         for pane in (self.original_pane, self.suspect_pane):
             pane.markerClicked.connect(self.markerClicked)
             pane.zoomStepRequested.connect(self._on_wheel_zoom)
+            pane.zoomRequested.connect(self._on_zoom_requested)
         self.original_pane.resized.connect(self._on_pane_resized)
         self._connect_scroll_sync()
         for pane in (self.original_pane, self.suspect_pane):
@@ -378,13 +379,31 @@ class ComparisonViewport(QWidget):
     def zoom_percent(self) -> int:
         return round(self._zoom * 100)
 
-    def set_zoom(self, zoom: float, from_fit: bool = False) -> None:
-        """Zoom both panes together, and show the resulting percentage."""
+    def set_zoom(self, zoom: float, from_fit: bool = False, anchor: QPointF | None = None) -> None:
+        """Zoom both panes together, and show the resulting percentage.
+
+        `anchor` is a position in a pane's viewport that stays put (a pinch's
+        centre, the cursor); both panes are the same size, so it applies to both.
+        """
         self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
         if not from_fit:
             self._fit_mode = False
-        self.original_pane.set_zoom(self._zoom)
-        self.suspect_pane.set_zoom(self._zoom)
+        if anchor is None:
+            self.original_pane.set_zoom(self._zoom)
+            self.suspect_pane.set_zoom(self._zoom)
+        else:
+            # Each pane repositions itself about the anchor. The scroll lock must
+            # stay out of it meanwhile: one pane's move, mirrored onto the other
+            # before that one has zoomed, would be clamped to its old range.
+            self._syncing_scroll = True
+            try:
+                self.original_pane.set_zoom(self._zoom, anchor)
+                self.suspect_pane.set_zoom(self._zoom, anchor)
+            finally:
+                self._syncing_scroll = False
+            if self._scroll_lock:
+                self._sync_scroll(self.suspect_pane.horizontalScrollBar(), self.original_pane.horizontalScrollBar().value())
+                self._sync_scroll(self.suspect_pane.verticalScrollBar(), self.original_pane.verticalScrollBar().value())
         self.zoom_label.setText(f"{self.zoom_percent}%")
         self.zoom_in_button.setEnabled(self._zoom < MAX_ZOOM)
         self.zoom_out_button.setEnabled(self._zoom > MIN_ZOOM)
@@ -419,6 +438,10 @@ class ComparisonViewport(QWidget):
 
     def _on_wheel_zoom(self, direction: int) -> None:
         self.zoom_in() if direction > 0 else self.zoom_out()
+
+    def _on_zoom_requested(self, factor: float, anchor: QPointF) -> None:
+        """A pinch or Ctrl + wheel: scale continuously about the fingers / cursor."""
+        self.set_zoom(self._zoom * factor, anchor=anchor)
 
     # -- full-quality detail when zoomed in (FR-9.1) ---------------------------
     def _schedule_detail(self, *_args) -> None:
