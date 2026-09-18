@@ -61,7 +61,8 @@ def detect(
                     type=DiffType.GRAPHICS,
                     subtype=DiffSubtype.CHANGED,
                     confidence=float(np.clip(1.0 - worst_similarity, 0.0, 1.0)),
-                    detail=f"SSIM {worst_similarity:.2f}",
+                    magnitude=float(np.clip(1.0 - worst_similarity, 0.0, 2.0)),
+                    detail=f"Graphic changed (similarity {worst_similarity:.2f})",
                 )
             )
 

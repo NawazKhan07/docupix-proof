@@ -7,13 +7,23 @@ from uuid import uuid4
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config import load_config
 from app.engine.alignment.aligner import AlignmentError
 from app.engine.worker import run_comparison
 from app.logging_config import job_log_file
+from app.models.job import MODE_DISPLAY_NAMES
 from app.ui.mode_selector import ModeSelector
+from app.ui.results_view import ResultsView
 from app.ui.theme import set_variant
 from app.ui.upload_panel import UploadPanel
 
@@ -24,11 +34,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Artwork Comparison")
-        self.resize(1000, 700)
+        self.resize(1320, 840)
         self.config = load_config()
 
-        central = QWidget(self)
-        self.setCentralWidget(central)
+        # Two pages: setting up a comparison, and reviewing its results.
+        self.stack = QStackedWidget(self)
+        self.setCentralWidget(self.stack)
+        central = QWidget(self.stack)
+        self.stack.addWidget(central)
+        self.results_view = ResultsView(self.stack)
+        self.stack.addWidget(self.results_view)
+        self.results_view.backRequested.connect(lambda: self.stack.setCurrentWidget(central))
+        self._setup_page = central
+
         layout = QVBoxLayout(central)
         layout.setContentsMargins(24, 20, 24, 24)
         layout.setSpacing(16)
@@ -70,9 +88,8 @@ class MainWindow(QMainWindow):
         set_variant(self.status_label, "status", state)
 
     def _on_compare(self) -> None:
-        """Run the pipeline as far as it currently goes: isolate, align, detect.
+        """Run the pipeline (isolate, align, detect, aggregate) and show the results.
 
-        Clustering, severity and the diff list panel join this in Phase 5.
         The work runs on the UI thread for now; Phase 7 moves it into a
         worker process.
         """
@@ -111,6 +128,12 @@ class MainWindow(QMainWindow):
             self.compare_button.setEnabled(self.upload_panel.both_loaded)
 
         self._set_status(*_describe(outcome))
+        self.results_view.show_outcome(
+            outcome,
+            f"{original.path.name}  vs  {suspect.path.name}  ·  "
+            f"{MODE_DISPLAY_NAMES[self.mode_selector.mode]}",
+        )
+        self.stack.setCurrentWidget(self.results_view)
 
     def closeEvent(self, event) -> None:
         self.upload_panel.original_slot.clear()
@@ -127,9 +150,7 @@ def _describe(outcome) -> tuple[str, str]:
     """
     alignment = outcome.alignment
     parts = [
-        f"{len(outcome.candidates)} difference(s) found"
-        if outcome.candidates
-        else "No differences found"
+        f"{len(outcome.clusters)} finding(s)" if outcome.clusters else "No differences found"
     ]
 
     for comparison in outcome.symbol_comparisons:
@@ -149,7 +170,7 @@ def _describe(outcome) -> tuple[str, str]:
 
     if alignment.low_confidence or outcome.warnings:
         state = "warn"
-    elif outcome.candidates:
+    elif outcome.clusters:
         state = "warn"
     else:
         state = "ok"

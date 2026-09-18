@@ -22,13 +22,14 @@ import numpy as np
 
 from app.config import AppConfig
 from app.engine.alignment.aligner import align
+from app.engine.aggregation.aggregator import build_clusters
 from app.engine.alignment.homography import warp_to_reference, warp_validity_mask
 from app.engine.detectors import barcode_diff, braille_diff, color_diff, graphics_diff, text_diff
 from app.engine.detectors.text_diff import OcrUnavailableError
 from app.engine.isolation.boundary_mask import apply_mask, resolve_keep_mask
 from app.engine.preprocessing.scan_normalizer import normalize_for_scan
 from app.logging_config import StageTimer
-from app.models.diff import DiffCandidate
+from app.models.diff import DiffCandidate, DiffCluster
 from app.models.isolation import IsolationGeometry
 from app.models.job import ComparisonMode, options_for_mode
 from app.models.result import AlignmentResult, BrailleComparison, SymbolComparison
@@ -40,6 +41,14 @@ logger = logging.getLogger(__name__)
 class ComparisonOutcome:
     alignment: AlignmentResult
     candidates: list[DiffCandidate]
+    # The findings shown to the reviewer: `candidates` clustered, rated and
+    # bound to both files' coordinates.
+    clusters: list[DiffCluster]
+    # The one aligned pair every viewer mode is drawn from (FR-7.4): the
+    # original as-is and the suspect warped into the original's frame. Kept
+    # unmasked so the reviewer sees the whole page, not just what was compared.
+    aligned_original: np.ndarray
+    aligned_suspect: np.ndarray
     symbol_comparisons: list[SymbolComparison] = field(default_factory=list)
     braille: BrailleComparison | None = None
     # Things the reviewer must know were *not* checked, e.g. OCR unavailable.
@@ -133,17 +142,23 @@ def run_comparison(
                 "configurable assumption pending sign-off, so check it matches this artwork."
             )
 
+    clusters = build_clusters(candidates, alignment.transform, config.clustering)
+
     logger.info(
         "comparison finished",
         extra={
             "mode": mode.value,
             "candidates": len(candidates),
+            "clusters": len(clusters),
             "warnings": len(warnings),
         },
     )
     return ComparisonOutcome(
         alignment=alignment,
         candidates=candidates,
+        clusters=clusters,
+        aligned_original=original_image,
+        aligned_suspect=warped_suspect,
         symbol_comparisons=symbol_comparisons,
         braille=braille_comparison,
         warnings=warnings,
@@ -204,4 +219,5 @@ def _rescaled(candidate: DiffCandidate, factor: float) -> DiffCandidate:
         subtype=candidate.subtype,
         confidence=candidate.confidence,
         detail=candidate.detail,
+        magnitude=candidate.magnitude,
     )

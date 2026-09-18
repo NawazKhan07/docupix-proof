@@ -7,7 +7,7 @@ aligned space (the original image's pixel frame), which is what lets Phase
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 
@@ -94,7 +94,68 @@ class DiffCandidate:
     subtype: DiffSubtype
     confidence: float
     detail: str = ""
+    # Detector-specific strength, kept numeric so severity rules never have
+    # to parse `detail`: peak delta-E for colour, 1 - SSIM for graphics, and
+    # 0 where a detector has no meaningful scale (text, symbols, Braille).
+    magnitude: float = 0.0
 
     @property
     def category(self) -> str:
         return _CATEGORIES[self.type]
+
+
+class Severity(Enum):
+    """FR-7.2 tiers. PENDING SIGN-OFF: the SRS says "Critical and others"
+    without finalising the list (SRS §7). The rules that assign these, and
+    the colour for each, live together in `engine/aggregation/severity.py`."""
+
+    CRITICAL = "critical"
+    MAJOR = "major"
+    MINOR = "minor"
+
+    @property
+    def rank(self) -> int:
+        """Lower is more severe, so sorting by rank puts Critical first."""
+        return _SEVERITY_RANK[self]
+
+
+_SEVERITY_RANK = {Severity.CRITICAL: 0, Severity.MAJOR: 1, Severity.MINOR: 2}
+
+
+class DiffStatus(Enum):
+    ACTIVE = "active"
+    IGNORED = "ignored"
+
+
+@dataclass
+class DiffCluster:
+    """A group of related candidates reported as one finding (FR-7.3).
+
+    Carries its box in *both* files' coordinates (FR-7.4), so the two
+    viewers mark the same difference in the corresponding place rather than
+    each deriving a position of its own.
+    """
+
+    id: int
+    bbox_in_original: BoundingBox
+    bbox_in_suspect: BoundingBox
+    type: DiffType
+    severity: Severity
+    members: list[DiffCandidate] = field(default_factory=list)
+    status: DiffStatus = DiffStatus.ACTIVE
+    detail: str = ""
+
+    @property
+    def category(self) -> str:
+        return _CATEGORIES[self.type]
+
+    @property
+    def is_ignored(self) -> bool:
+        return self.status is DiffStatus.IGNORED
+
+    def ignore(self) -> None:
+        """Soft-dismiss (FR-7.5). Never deletes, so the finding stays auditable."""
+        self.status = DiffStatus.IGNORED
+
+    def restore(self) -> None:
+        self.status = DiffStatus.ACTIVE

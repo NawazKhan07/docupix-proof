@@ -95,6 +95,16 @@ class DetectionConfig:
     # sensitive default QA will likely want to raise.
     color_delta_e_threshold: float = 2.3
     color_min_area_px: int = 40
+    # Colour gets its own positional slack, separate from the graphics
+    # channel's (which must stay at 0). Anti-aliased glyph edges shift by a
+    # fraction of a pixel under any rotation, and on a 1.2 degree pair that
+    # made three tiny colour findings appear on small text, each ~dE 25 and so
+    # rated CRITICAL -- noise in the most severe tier. 1 px removed all three
+    # while both real changes and a genuine black->red recolour of a thin
+    # text line were still found (2 px gave the same result). Unlike the
+    # graphics channel, colour has no need to catch a text *edit* (the text
+    # detector and SSIM do), so it can afford the slack.
+    color_registration_tolerance_px: int = 1
     # CIEDE2000 over a full 300 DPI page is far too slow for NFR-1, so the
     # colour pass runs on a long edge no larger than this and its boxes are
     # scaled back up (Architecture §6 allows a per-superpixel colour delta).
@@ -122,9 +132,22 @@ class DetectionConfig:
 
 
 @dataclass(frozen=True)
+class ClusteringConfig:
+    # PENDING QA SIGN-OFF (SRS §7): the proximity rule for merging individual
+    # word / number / barcode-line differences into one cluster is not
+    # numerically defined. Two same-type differences whose boxes are within
+    # this many pixels of each other (in the original's render resolution,
+    # 300 DPI for a PDF) become one finding. 30 px is ~2.5 mm: enough to join
+    # the words of a moved line and the lines of a paragraph, small enough
+    # not to fuse unrelated changes on opposite sides of a carton panel.
+    distance_px: float = 30.0
+
+
+@dataclass(frozen=True)
 class AppConfig:
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -141,6 +164,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
     return AppConfig(
         alignment=_merge(AlignmentConfig(), raw.get("alignment", {})),
         detection=_merge(DetectionConfig(), raw.get("detection", {})),
+        clustering=_merge(ClusteringConfig(), raw.get("clustering", {})),
     )
 
 

@@ -48,7 +48,7 @@ def _colour_unmatched_nearby(
         unmatched |= unmatched_within_tolerance(
             original_lab[:, :, channel],
             suspect_lab[:, :, channel],
-            config.registration_tolerance_px,
+            config.color_registration_tolerance_px,
             config.registration_intensity_tolerance,
         )
     return unmatched
@@ -103,10 +103,11 @@ def detect(
                     type=DiffType.COLOUR,
                     subtype=DiffSubtype.CHANGED,
                     confidence=min(1.0, peak_delta / (config.color_delta_e_threshold * 4)),
+                    magnitude=peak_delta,
                     # ASCII label deliberately: this string reaches a Windows
                     # console log handler, which is cp1252 and cannot encode a
                     # literal delta.
-                    detail=f"dE {peak_delta:.1f}",
+                    detail=f"Colour changed (dE {peak_delta:.1f})",
                 )
             )
 

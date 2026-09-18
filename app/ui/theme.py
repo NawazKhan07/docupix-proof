@@ -6,6 +6,8 @@ the dynamic-property "variant" pattern used to style widgets differently
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
 BACKGROUND = "#f5f6f8"
@@ -85,6 +87,12 @@ QPushButton[variant="primary"]:disabled {{
     background: #c7d3f7; border-color: #c7d3f7; color: #eef2fd;
 }}
 
+QPushButton[variant="icon"] {{
+    padding: 4px 0px;
+    font-size: 17px;
+    font-weight: 600;
+}}
+
 QPushButton[variant="segment"] {{
     border-radius: 6px;
     padding: 8px 18px;
@@ -115,6 +123,34 @@ QLabel[pill="empty"] {{
     font-size: 11px;
     font-weight: 600;
 }}
+
+QLabel[pill="warn"] {{
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 9px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QComboBox {{
+    background: {SURFACE};
+    border: 1px solid #d7dae0;
+    border-radius: 6px;
+    padding: 6px 10px;
+}}
+QComboBox:hover {{ background: #f0f2f5; }}
+QComboBox QAbstractItemView {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    selection-background-color: {ACCENT_SOFT};
+    selection-color: {TEXT_PRIMARY};
+}}
+
+QCheckBox {{ spacing: 8px; }}
+
+QScrollArea {{ background: transparent; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
 
 QFrame[role="card"] {{
     border: 1px solid {BORDER};
@@ -186,11 +222,45 @@ QLabel[status="error"] {{
 """
 
 
+def _light_palette() -> QPalette:
+    """An explicit light palette.
+
+    The stylesheet sets colours for the widgets it names, but checkbox
+    indicators, scrollbars and combo-box popups draw from the *palette* --
+    which follows the operating system. On a dark-mode Windows machine that
+    meant near-black checkboxes and scrollbars on an otherwise light window,
+    so the palette is pinned rather than inherited.
+    """
+    palette = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: BACKGROUND,
+        QPalette.ColorRole.WindowText: TEXT_PRIMARY,
+        QPalette.ColorRole.Base: SURFACE,
+        QPalette.ColorRole.AlternateBase: "#fafbfc",
+        QPalette.ColorRole.Text: TEXT_PRIMARY,
+        QPalette.ColorRole.Button: SURFACE,
+        QPalette.ColorRole.ButtonText: TEXT_PRIMARY,
+        QPalette.ColorRole.ToolTipBase: SURFACE,
+        QPalette.ColorRole.ToolTipText: TEXT_PRIMARY,
+        QPalette.ColorRole.PlaceholderText: TEXT_SECONDARY,
+        QPalette.ColorRole.Highlight: ACCENT,
+        QPalette.ColorRole.HighlightedText: "#ffffff",
+        QPalette.ColorRole.Link: ACCENT,
+    }
+    for role, colour in roles.items():
+        palette.setColor(role, QColor(colour))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#a3a8b3"))
+    return palette
+
+
 def apply_theme(app: QApplication) -> None:
     # Windows' native style ignores border-radius on QSS-styled indicator
     # subcontrols (checkboxes/radio buttons render as plain squares); Fusion
     # paints custom QSS shapes correctly everywhere.
     app.setStyle("Fusion")
+    app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    app.setPalette(_light_palette())
     app.setStyleSheet(STYLESHEET)
 
 
