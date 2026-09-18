@@ -17,7 +17,10 @@ def qapp():
     """A single QApplication instance shared by all UI tests in the session."""
     from PySide6.QtWidgets import QApplication
 
+    from app.ui.theme import apply_theme
+
     app = QApplication.instance() or QApplication([])
+    apply_theme(app)
     yield app
 
 

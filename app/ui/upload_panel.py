@@ -5,14 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -20,12 +22,13 @@ from PySide6.QtWidgets import (
 from app.engine.file_loader import ArtworkLoadError, LoadedArtwork, SUPPORTED_EXTENSIONS, load_artwork
 from app.models.isolation import IsolationGeometry
 from app.ui.isolation_dialog import IsolationDialog
+from app.ui.theme import set_variant
 
 _FILE_DIALOG_FILTER = "Artwork files (*" + " *".join(sorted(SUPPORTED_EXTENSIONS)) + ")"
 
 
 class UploadSlot(QWidget):
-    """One file slot (Original or Suspect): browse button + status + loaded state."""
+    """One file slot (Original or Suspect): title + status pill, buttons, detail line."""
 
     changed = Signal()
 
@@ -35,16 +38,35 @@ class UploadSlot(QWidget):
         self.loaded: Optional[LoadedArtwork] = None
         self.geometry: Optional[IsolationGeometry] = None
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: 700; color: #1f2430; font-size: 13px;")
+        self.status_pill = QLabel("Not loaded")
+        self.status_pill.setProperty("pill", "empty")
+        self.status_pill.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        header_row.addWidget(title_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header_row.addStretch(1)
+        header_row.addWidget(self.status_pill, alignment=Qt.AlignmentFlag.AlignVCenter)
+        outer.addLayout(header_row)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
         self.browse_button = QPushButton(f"Browse {title}…")
         self.isolate_button = QPushButton("Edit Artwork Area…")
         self.isolate_button.setEnabled(False)
-        self.status_label = QLabel("No file selected")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.browse_button)
-        layout.addWidget(self.isolate_button)
-        layout.addWidget(self.status_label, stretch=1)
+        button_row.addWidget(self.browse_button)
+        button_row.addWidget(self.isolate_button)
+        button_row.addStretch(1)
+        outer.addLayout(button_row)
+
+        self.detail_label = QLabel("No file selected")
+        self.detail_label.setProperty("secondary", "true")
+        self.detail_label.setWordWrap(True)
+        outer.addWidget(self.detail_label)
 
         self.browse_button.clicked.connect(self._on_browse)
         self.isolate_button.clicked.connect(self._on_edit_artwork_area)
@@ -68,8 +90,9 @@ class UploadSlot(QWidget):
         self.loaded = artwork
         self.geometry = None
         self.isolate_button.setEnabled(True)
-        pages = f", {artwork.page_count} page(s)" if artwork.kind == "pdf" else ""
-        self.status_label.setText(f"{path.name} ({artwork.kind}{pages})")
+        set_variant(self.status_pill, "pill", "loaded")
+        self.status_pill.setText("Loaded")
+        self._refresh_status()
         self.changed.emit()
 
     def _on_edit_artwork_area(self) -> None:
@@ -86,8 +109,10 @@ class UploadSlot(QWidget):
         geometry_note = ""
         if self.geometry is not None and self.geometry.boundary is not None:
             kind = "polygon" if hasattr(self.geometry.boundary, "points") else "crop"
-            geometry_note = f", {kind} area set"
-        self.status_label.setText(f"{self.loaded.path.name} ({self.loaded.kind}{pages}{geometry_note})")
+            geometry_note = f" · {kind} area set"
+        self.detail_label.setText(
+            f"{self.loaded.path.name} ({self.loaded.kind}{pages}){geometry_note}"
+        )
 
     def clear(self) -> None:
         if self.loaded is not None:
@@ -95,22 +120,31 @@ class UploadSlot(QWidget):
         self.loaded = None
         self.geometry = None
         self.isolate_button.setEnabled(False)
-        self.status_label.setText("No file selected")
+        set_variant(self.status_pill, "pill", "empty")
+        self.status_pill.setText("Not loaded")
+        self.detail_label.setText("No file selected")
         self.changed.emit()
 
 
 class UploadPanel(QGroupBox):
-    """Holds the Original and Suspect upload slots side by side."""
+    """Holds the Original and Suspect upload slots, stacked with a divider."""
 
     filesChanged = Signal()
 
     def __init__(self, parent=None):
         super().__init__("Upload", parent)
         layout = QVBoxLayout(self)
+        layout.setSpacing(14)
 
         self.original_slot = UploadSlot("Original", self)
         self.suspect_slot = UploadSlot("Suspect", self)
+
+        divider = QFrame(self)
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet("color: #e3e5ea;")
+
         layout.addWidget(self.original_slot)
+        layout.addWidget(divider)
         layout.addWidget(self.suspect_slot)
 
         self.original_slot.changed.connect(self.filesChanged)

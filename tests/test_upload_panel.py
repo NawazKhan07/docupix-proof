@@ -44,7 +44,8 @@ def test_edit_artwork_area_stores_geometry_on_accept(qapp, synthetic_png: Path, 
 
     assert slot.geometry is not None
     assert slot.geometry.boundary is not None
-    assert "crop area set" in slot.status_label.text()
+    assert "crop area set" in slot.detail_label.text()
+    assert slot.status_pill.text() == "Loaded"
 
 
 def test_edit_artwork_area_discards_geometry_on_cancel(qapp, synthetic_png: Path, monkeypatch):

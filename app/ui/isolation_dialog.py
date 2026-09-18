@@ -30,6 +30,7 @@ from app.models.isolation import (
     NormalizedRect,
 )
 from app.ui.interactive_canvas import InteractiveCanvas
+from app.ui.theme import set_variant
 
 _STATUS_TEXT = {
     IsolationTool.CROP: "Drag to draw a crop rectangle, then Save.",
@@ -50,17 +51,22 @@ class IsolationDialog(QDialog):
         self._result: Optional[IsolationGeometry] = None
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
         tool_row = QHBoxLayout()
+        tool_row.setSpacing(6)
         self.crop_button = QPushButton("Crop")
         self.trace_button = QPushButton("Trace Dieline")
         self.erase_button = QPushButton("Erase")
         for button in (self.crop_button, self.trace_button, self.erase_button):
             button.setCheckable(True)
+            button.setProperty("variant", "segment")
         self.crop_button.setChecked(True)
         tool_row.addWidget(self.crop_button)
         tool_row.addWidget(self.trace_button)
         tool_row.addWidget(self.erase_button)
+        tool_row.addStretch(1)
         layout.addLayout(tool_row)
 
         self.canvas = InteractiveCanvas(self)
@@ -68,11 +74,13 @@ class IsolationDialog(QDialog):
         layout.addWidget(self.canvas, stretch=1)
 
         self.status_label = QLabel(_STATUS_TEXT[IsolationTool.CROP])
+        self.status_label.setProperty("role", "statusbar")
         layout.addWidget(self.status_label)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        self.buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("variant", "primary")
         layout.addWidget(self.buttons)
 
         self.crop_button.clicked.connect(lambda: self._select_tool(IsolationTool.CROP))

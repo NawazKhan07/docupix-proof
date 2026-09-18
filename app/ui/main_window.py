@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtWidgets import QHBoxLayout, QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
 
 from app.ui.mode_selector import ModeSelector
 from app.ui.upload_panel import UploadPanel
@@ -16,21 +16,33 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Artwork Comparison")
-        self.resize(900, 600)
+        self.resize(1000, 650)
 
         central = QWidget(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(24, 20, 24, 24)
+        layout.setSpacing(16)
+
+        heading = QLabel("Artwork Comparison")
+        heading.setProperty("role", "heading")
+        subheading = QLabel("Compare pharmaceutical packaging artwork files, offline.")
+        subheading.setProperty("role", "subheading")
+        layout.addWidget(heading)
+        layout.addWidget(subheading)
 
         top_row = QHBoxLayout()
+        top_row.setSpacing(16)
         self.upload_panel = UploadPanel(central)
         self.mode_selector = ModeSelector(central)
         top_row.addWidget(self.upload_panel, stretch=1)
         top_row.addWidget(self.mode_selector)
-        layout.addLayout(top_row)
+        layout.addLayout(top_row, stretch=1)
 
         self.compare_button = QPushButton("Compare")
+        self.compare_button.setProperty("variant", "primary")
         self.compare_button.setEnabled(False)
+        self.compare_button.setMinimumHeight(40)
         layout.addWidget(self.compare_button)
 
         self.upload_panel.filesChanged.connect(self._update_compare_enabled)
@@ -41,7 +53,7 @@ class MainWindow(QMainWindow):
 
     def _on_compare(self) -> None:
         # The comparison pipeline (isolation -> alignment -> detectors ->
-        # aggregation) lands in Phases 2-5; Phase 1 only wires this button up.
+        # aggregation) lands in Phases 3-5; Phase 1 only wires this button up.
         logger.info(
             "Compare requested (pipeline not yet implemented)",
             extra={"mode": self.mode_selector.mode.value},

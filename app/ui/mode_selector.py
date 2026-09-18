@@ -3,10 +3,25 @@ the job, never a UI-level code fork (Architecture §3.1)."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QButtonGroup, QGroupBox, QRadioButton, QVBoxLayout
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QFrame,
+    QGroupBox,
+    QLabel,
+    QRadioButton,
+    QVBoxLayout,
+)
 
 from app.models.job import MODE_DISPLAY_NAMES, ComparisonMode
+from app.ui.theme import set_variant
+
+_MODE_DESCRIPTIONS = {
+    ComparisonMode.AUTOMATIC: "Auto-detects the artwork area and compares every difference category.",
+    ComparisonMode.SCAN_VS_DIGITAL: "Ignores colour differences; compares text, numbers, graphics, and barcodes only.",
+    ComparisonMode.BARCODE: "Restricts comparison to detected barcode/pharmacode/QR symbols, decoded and compared.",
+    ComparisonMode.BRAILLE: "Restricts comparison to the coloured dot-matrix representing Braille content.",
+}
 
 _MODE_ORDER = [
     ComparisonMode.AUTOMATIC,
@@ -16,8 +31,44 @@ _MODE_ORDER = [
 ]
 
 
+class _ModeCard(QFrame):
+    """One selectable mode row: a radio button, title, and short description.
+
+    Clicking anywhere in the card selects it, not just the radio dot.
+    """
+
+    def __init__(self, mode: ComparisonMode, group: QButtonGroup, parent=None):
+        super().__init__(parent)
+        self.mode = mode
+        self.setProperty("role", "card")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.radio = QRadioButton(MODE_DISPLAY_NAMES[mode])
+        group.addButton(self.radio)
+
+        description = QLabel(_MODE_DESCRIPTIONS[mode])
+        description.setProperty("secondary", "true")
+        description.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(3)
+        layout.addWidget(self.radio)
+        layout.addWidget(description)
+
+        self.radio.toggled.connect(self._refresh_selected_style)
+        self._refresh_selected_style()
+
+    def _refresh_selected_style(self) -> None:
+        set_variant(self, "selected", "true" if self.radio.isChecked() else "false")
+
+    def mousePressEvent(self, event) -> None:
+        self.radio.setChecked(True)
+        super().mousePressEvent(event)
+
+
 class ModeSelector(QGroupBox):
-    """Radio-button group for the four comparison modes. Automatic is default."""
+    """Selectable cards for the four comparison modes. Automatic is default."""
 
     modeChanged = Signal(ComparisonMode)
 
@@ -25,16 +76,16 @@ class ModeSelector(QGroupBox):
         super().__init__("Comparison Mode", parent)
         self._button_group = QButtonGroup(self)
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
 
-        self._buttons: dict[ComparisonMode, QRadioButton] = {}
+        self._cards: dict[ComparisonMode, _ModeCard] = {}
         for mode in _MODE_ORDER:
-            button = QRadioButton(MODE_DISPLAY_NAMES[mode])
-            self._button_group.addButton(button)
-            layout.addWidget(button)
-            self._buttons[mode] = button
-            button.toggled.connect(self._on_toggled(mode))
+            card = _ModeCard(mode, self._button_group, self)
+            layout.addWidget(card)
+            self._cards[mode] = card
+            card.radio.toggled.connect(self._on_toggled(mode))
 
-        self._buttons[ComparisonMode.AUTOMATIC].setChecked(True)
+        self._cards[ComparisonMode.AUTOMATIC].radio.setChecked(True)
 
     def _on_toggled(self, mode: ComparisonMode):
         def handler(checked: bool) -> None:
@@ -45,10 +96,10 @@ class ModeSelector(QGroupBox):
 
     @property
     def mode(self) -> ComparisonMode:
-        for mode, button in self._buttons.items():
-            if button.isChecked():
+        for mode, card in self._cards.items():
+            if card.radio.isChecked():
                 return mode
         return ComparisonMode.AUTOMATIC  # unreachable: the group always has one checked
 
     def set_mode(self, mode: ComparisonMode) -> None:
-        self._buttons[mode].setChecked(True)
+        self._cards[mode].radio.setChecked(True)
