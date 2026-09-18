@@ -245,15 +245,15 @@ def test_loading_a_new_result_discards_the_old_tile(viewport, pdf_case):
 # ---------------------------------------------------------------------------
 
 
-def test_the_window_hands_the_pdfs_to_the_viewer(qapp, tmp_path):
+def test_the_window_hands_the_pdfs_to_the_viewer(qapp, tmp_path, shared_jobs, run_comparison_in_window):
     original_path = make_carton_pdf(tmp_path / "o.pdf")
     suspect_path = make_carton_pdf(tmp_path / "s.pdf", dx=6, dy=4, rotation=1.2, recolour=True)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(original_path)
         window.upload_panel.suspect_slot.load_path(suspect_path)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         viewport = window.results_view.viewport
         assert viewport._original_artwork is window.upload_panel.original
@@ -263,16 +263,16 @@ def test_the_window_hands_the_pdfs_to_the_viewer(qapp, tmp_path):
         window.close()
 
 
-def test_replacing_a_file_releases_it_from_the_viewer(qapp, tmp_path):
+def test_replacing_a_file_releases_it_from_the_viewer(qapp, tmp_path, shared_jobs, run_comparison_in_window):
     """A replaced file is closed; the viewer must not keep rendering from it."""
     original_path = make_carton_pdf(tmp_path / "o.pdf")
     suspect_path = make_carton_pdf(tmp_path / "s.pdf", dx=6, dy=4, rotation=1.2, recolour=True)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(original_path)
         window.upload_panel.suspect_slot.load_path(suspect_path)
-        window._on_compare()
+        run_comparison_in_window(window)
         assert window.results_view.viewport._original_artwork is not None
 
         window.upload_panel.original_slot.load_path(original_path)  # replaces (closes) the old one

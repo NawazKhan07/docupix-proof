@@ -26,7 +26,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Iterator
 
-LOG_DIR = Path("logs")
+from app import paths
+
+LOG_DIR = paths.log_dir()
 JOB_LOG_DIR = LOG_DIR / "jobs"
 
 _STANDARD_LOG_RECORD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {

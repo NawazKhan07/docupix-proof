@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cv2
-import fitz
+import pymupdf as fitz
 import numpy as np
 
 from app.engine.file_loader import WORKING_DPI, LoadedArtwork

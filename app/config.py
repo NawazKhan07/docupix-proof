@@ -13,6 +13,8 @@ import logging
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
+from app import paths
+
 logger = logging.getLogger(__name__)
 
 CONFIG_FILENAME = "config.json"
@@ -260,15 +262,44 @@ class ClusteringConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    """Guard rails and worker settings (Architecture §5 and §7).
+
+    Files are checked against these BEFORE anything is allocated for them, so an
+    oversized input produces a clear message instead of an out-of-memory crash.
+    """
+
+    # Real packaging artwork is tens of MB; a file far beyond this is not artwork.
+    max_file_size_mb: int = 250
+    # A carton or leaflet file is a handful of pages; hundreds is a catalogue or a mistake.
+    max_pdf_pages: int = 100
+    # The largest page compared, in millions of pixels at the working resolution. A
+    # 1 m x 1 m sheet at 300 DPI is ~140 MP (about 420 MB as RGB, and several
+    # times that while detecting), so this is the point past which memory, not
+    # the artwork, decides the outcome. The 310 x 420 mm sample carton is 18 MP.
+    max_render_megapixels: int = 160
+
+    # One comparison at a time in a separate process (Architecture §5).
+    # Recycled after this many jobs so native-library memory cannot creep.
+    worker_recycle_after_jobs: int = 20
+    # A comparison still running after this long is stopped and reported.
+    job_timeout_s: int = 600
+
+
+@dataclass(frozen=True)
 class AppConfig:
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
     """Load config from JSON, falling back to defaults for anything absent."""
-    config_path = Path(path or CONFIG_FILENAME)
+    if path is not None:
+        config_path = Path(path)
+    else:  # beside the application, or in the user's folder
+        config_path = next((c for c in paths.config_candidates(CONFIG_FILENAME) if c.is_file()), Path(CONFIG_FILENAME))
     if not config_path.is_file():
         return AppConfig()
     try:
@@ -281,6 +312,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         alignment=_merge(AlignmentConfig(), raw.get("alignment", {})),
         detection=_merge(DetectionConfig(), raw.get("detection", {})),
         clustering=_merge(ClusteringConfig(), raw.get("clustering", {})),
+        runtime=_merge(RuntimeConfig(), raw.get("runtime", {})),
     )
 
 

@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import fitz  # PyMuPDF
+import pymupdf as fitz  # PyMuPDF (the "fitz" name is a deprecated alias)
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
+from app.config import RuntimeConfig
 from app.logging_config import StageTimer
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,18 @@ class UnsupportedFileFormatError(ArtworkLoadError):
 
 class CorruptFileError(ArtworkLoadError):
     pass
+
+
+class InputTooLargeError(ArtworkLoadError):
+    """The file is bigger than the app will take on (Architecture §7).
+
+    Raised before any large allocation, with a message that says what is too big
+    and what to do about it -- the alternative is running out of memory partway
+    through a comparison.
+    """
+
+
+_BYTES_PER_MB = 1024 * 1024
 
 
 @dataclass
@@ -121,26 +134,36 @@ class LoadedArtwork:
         self.close()
 
 
-def load_artwork(path: Path | str) -> LoadedArtwork:
-    """Load a PDF or raster image, validating format and readability.
+def load_artwork(path: Path | str, limits: RuntimeConfig | None = None) -> LoadedArtwork:
+    """Load a PDF or raster image, validating format, readability and size.
 
     Raises `UnsupportedFileFormatError` for an unrecognized extension and
     `CorruptFileError` if the file matches a supported extension but can't
     actually be parsed (rather than letting PyMuPDF/Pillow's raw exception,
-    or a native-library crash, take down the caller — NFR-2).
+    or a native-library crash, take down the caller — NFR-2). Raises
+    `InputTooLargeError` for a file, page count or page size beyond `limits`,
+    before anything large is allocated (Architecture §7).
     """
+    limits = limits or RuntimeConfig()
     path = Path(path)
     if not path.is_file():
         raise CorruptFileError(f"File not found: {path}")
-    if path.stat().st_size == 0:
+    size_bytes = path.stat().st_size
+    if size_bytes == 0:
         raise CorruptFileError(f"File is empty: {path}")
+    if size_bytes > limits.max_file_size_mb * _BYTES_PER_MB:
+        raise InputTooLargeError(
+            f"'{path.name}' is {size_bytes / _BYTES_PER_MB:.0f} MB, above the "
+            f"{limits.max_file_size_mb} MB limit. Export a smaller version of the artwork, "
+            "or raise \"runtime.max_file_size_mb\" in config.json if this file is genuine."
+        )
 
     ext = path.suffix.lower()
     with StageTimer(logger, "load_artwork"):
         if ext in SUPPORTED_PDF_EXTENSIONS:
-            artwork = _load_pdf(path)
+            artwork = _load_pdf(path, limits)
         elif ext in SUPPORTED_IMAGE_EXTENSIONS:
-            artwork = _load_image(path)
+            artwork = _load_image(path, limits)
         else:
             raise UnsupportedFileFormatError(
                 f"Unsupported file format '{ext}'. Supported: "
@@ -153,15 +176,37 @@ def load_artwork(path: Path | str) -> LoadedArtwork:
     return artwork
 
 
-def _load_pdf(path: Path) -> LoadedArtwork:
+def _check_page_size(name: str, width_px: int, height_px: int, limits: RuntimeConfig, what: str) -> None:
+    megapixels = width_px * height_px / 1e6
+    if megapixels > limits.max_render_megapixels:
+        raise InputTooLargeError(
+            f"{what} of '{name}' is {width_px} x {height_px} px ({megapixels:.0f} megapixels), above the "
+            f"{limits.max_render_megapixels} megapixel limit for a comparison. Export the artwork at a smaller "
+            "page size or resolution, or raise \"runtime.max_render_megapixels\" in config.json "
+            "if this machine has the memory for it."
+        )
+
+
+def _load_pdf(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
     try:
         doc = fitz.open(path)
         if doc.page_count < 1:
             raise CorruptFileError(f"PDF has no pages: {path}")
+        if doc.page_count > limits.max_pdf_pages:
+            raise InputTooLargeError(
+                f"'{path.name}' has {doc.page_count} pages, above the {limits.max_pdf_pages}-page limit. "
+                "A comparison uses one page, so export just the artwork page."
+            )
         # Touching page 0 forces PyMuPDF to parse content now, surfacing a
         # corrupt/truncated PDF here rather than deep inside a later render.
-        _ = doc[0].rect
-    except CorruptFileError:
+        rect = doc[0].rect
+        scale = WORKING_DPI / _PDF_BASE_DPI
+        _check_page_size(
+            path.name, math.ceil(rect.width * scale), math.ceil(rect.height * scale), limits,
+            f"Page 1 at {WORKING_DPI} DPI",
+        )
+    except (CorruptFileError, InputTooLargeError):
+        doc.close()
         raise
     except Exception as exc:  # PyMuPDF raises a range of RuntimeError/ValueError types
         raise CorruptFileError(f"Could not parse PDF '{path}': {exc}") from exc
@@ -175,10 +220,18 @@ def _load_pdf(path: Path) -> LoadedArtwork:
     )
 
 
-def _load_image(path: Path) -> LoadedArtwork:
+def _load_image(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
     try:
-        image = Image.open(path)
+        image = Image.open(path)  # reads the header only; the pixels are decoded below
+        _check_page_size(path.name, *image.size, limits, "The image")
         image.load()  # force full decode now, not lazily on first use
+    except InputTooLargeError:
+        image.close()
+        raise
+    except Image.DecompressionBombError as exc:
+        raise InputTooLargeError(
+            f"'{path.name}' is far larger than an image comparison can take on ({exc})."
+        ) from exc
     except (UnidentifiedImageError, OSError) as exc:
         raise CorruptFileError(f"Could not parse image '{path}': {exc}") from exc
     return LoadedArtwork(

@@ -32,15 +32,15 @@ def test_compare_enables_only_once_both_files_loaded(
         window.close()
 
 
-def test_compare_reports_alignment_result_in_the_status_strip(qapp, tmp_path: Path):
+def test_compare_reports_alignment_result_in_the_status_strip(qapp, tmp_path: Path, shared_jobs, run_comparison_in_window):
     """A registrable pair reports its measured residual to the user (NFR-3)."""
     original_path, suspect_path = _artwork_pair(tmp_path)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(original_path)
         window.upload_panel.suspect_slot.load_path(suspect_path)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         text = window.status_label.text()
         assert "alignment" in text and "px" in text  # NFR-3 residual is surfaced
@@ -50,15 +50,15 @@ def test_compare_reports_alignment_result_in_the_status_strip(qapp, tmp_path: Pa
         window.close()
 
 
-def test_a_successful_compare_opens_the_results_page(qapp, tmp_path: Path):
+def test_a_successful_compare_opens_the_results_page(qapp, tmp_path: Path, shared_jobs, run_comparison_in_window):
     original_path, suspect_path = _artwork_pair(tmp_path)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         assert window.stack.currentWidget() is not window.results_view
         window.upload_panel.original_slot.load_path(original_path)
         window.upload_panel.suspect_slot.load_path(suspect_path)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         assert window.stack.currentWidget() is window.results_view
         assert window.results_view.viewport.has_images
@@ -67,14 +67,14 @@ def test_a_successful_compare_opens_the_results_page(qapp, tmp_path: Path):
         window.close()
 
 
-def test_new_comparison_returns_to_the_setup_page(qapp, tmp_path: Path):
+def test_new_comparison_returns_to_the_setup_page(qapp, tmp_path: Path, shared_jobs, run_comparison_in_window):
     original_path, suspect_path = _artwork_pair(tmp_path)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(original_path)
         window.upload_panel.suspect_slot.load_path(suspect_path)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         window.results_view.back_button.click()
 
@@ -84,33 +84,33 @@ def test_new_comparison_returns_to_the_setup_page(qapp, tmp_path: Path):
         window.close()
 
 
-def test_a_failed_compare_stays_on_the_setup_page(qapp, tmp_path: Path):
+def test_a_failed_compare_stays_on_the_setup_page(qapp, tmp_path: Path, shared_jobs, run_comparison_in_window):
     blank_a, blank_b = tmp_path / "a.png", tmp_path / "b.png"
     for path in (blank_a, blank_b):
         Image.fromarray(np.full((200, 200, 3), 255, dtype=np.uint8)).save(path)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(blank_a)
         window.upload_panel.suspect_slot.load_path(blank_b)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         assert window.stack.currentWidget() is not window.results_view
     finally:
         window.close()
 
 
-def test_compare_surfaces_an_error_when_files_cannot_be_registered(qapp, tmp_path: Path):
+def test_compare_surfaces_an_error_when_files_cannot_be_registered(qapp, tmp_path: Path, shared_jobs, run_comparison_in_window):
     blank_a = tmp_path / "blank_a.png"
     blank_b = tmp_path / "blank_b.png"
     for path in (blank_a, blank_b):
         Image.fromarray(np.full((200, 200, 3), 255, dtype=np.uint8)).save(path)
 
-    window = MainWindow()
+    window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(blank_a)
         window.upload_panel.suspect_slot.load_path(blank_b)
-        window._on_compare()
+        run_comparison_in_window(window)
 
         assert window.status_label.property("status") == "error"
         assert "Could not register" in window.status_label.text()

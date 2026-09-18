@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # headless Qt for tests
+os.environ.setdefault("ARTWORK_COMPARE_NO_WARMUP", "1")  # a window opening must not spawn a worker
 
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 import numpy as np
 import pytest
 from PIL import Image
@@ -22,6 +23,39 @@ def qapp():
     app = QApplication.instance() or QApplication([])
     apply_theme(app)
     yield app
+
+
+@pytest.fixture(scope="session")
+def shared_jobs(qapp):
+    """One real comparison worker for every UI test that runs a comparison.
+
+    Starting a worker costs a few seconds of imports; sharing one keeps the suite
+    fast, and exercises worker reuse the way the application does.
+    """
+    from app.config import AppConfig
+    from app.ui.job_controller import JobController
+
+    controller = JobController(AppConfig().runtime)
+    controller.warm_up()
+    yield controller
+    controller.shutdown()
+
+
+@pytest.fixture
+def run_comparison_in_window(qapp):
+    """Click Compare on a window and wait for the worker to finish (the UI never blocks)."""
+    import time
+
+    def run(window, timeout: float = 90.0) -> None:
+        window._on_compare()
+        deadline = time.monotonic() + timeout
+        while window.jobs.is_busy:
+            assert time.monotonic() < deadline, "the comparison never finished"
+            qapp.processEvents()
+            time.sleep(0.01)
+        qapp.processEvents()
+
+    return run
 
 
 @pytest.fixture

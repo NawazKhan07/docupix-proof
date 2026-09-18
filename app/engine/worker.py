@@ -15,6 +15,7 @@ each decide for themselves:
 from __future__ import annotations
 
 import logging
+from typing import Callable
 from dataclasses import dataclass, field, replace
 
 import cv2
@@ -76,13 +77,18 @@ def run_comparison(
     config: AppConfig,
     original_geometry: IsolationGeometry | None = None,
     suspect_geometry: IsolationGeometry | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> ComparisonOutcome:
+    """Run one comparison. `progress`, if given, is told what stage the job is at."""
     options = options_for_mode(mode)
+    say = progress or (lambda _text: None)
 
+    say("Aligning the files\u2026")
     alignment = align(
         original_image, suspect_image, config.alignment, original_geometry, suspect_geometry
     )
     detection_config, profile = effective_detection_config(config.detection, alignment)
+    say("Comparing the artwork\u2026")
 
     reference_shape = original_image.shape[:2]
     with StageTimer(logger, "warp_to_shared_space"):
@@ -180,6 +186,7 @@ def run_comparison(
     # Symbols and Braille dots run at full resolution: a small barcode or a
     # 1 mm Braille dot does not survive the detection downscale.
     if options.decode_symbols:
+        say("Reading barcodes and QR codes\u2026")
         symbol_candidates, symbol_comparisons = barcode_diff.compare(
             masked_original, masked_suspect, detection_config
         )
@@ -202,6 +209,7 @@ def run_comparison(
                 "configurable assumption pending sign-off, so check it matches this artwork."
             )
 
+    say("Grouping the differences\u2026")
     clusters = build_clusters(candidates, alignment.transform, config.clustering)
 
     logger.info(

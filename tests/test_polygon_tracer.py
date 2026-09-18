@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import cv2
-import fitz
+import pymupdf as fitz
 import numpy as np
 import pytest
 

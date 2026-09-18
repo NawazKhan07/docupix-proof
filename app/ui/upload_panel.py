@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.config import RuntimeConfig
 from app.engine.file_loader import ArtworkLoadError, LoadedArtwork, SUPPORTED_EXTENSIONS, load_artwork
 from app.models.isolation import IsolationGeometry
 from app.ui.isolation_dialog import IsolationDialog
@@ -32,9 +33,10 @@ class UploadSlot(QWidget):
 
     changed = Signal()
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, limits: RuntimeConfig | None = None):
         super().__init__(parent)
         self.title = title
+        self.limits = limits or RuntimeConfig()
         self.loaded: Optional[LoadedArtwork] = None
         self.geometry: Optional[IsolationGeometry] = None
 
@@ -80,7 +82,7 @@ class UploadSlot(QWidget):
 
     def load_path(self, path: Path) -> None:
         try:
-            artwork = load_artwork(path)
+            artwork = load_artwork(path, self.limits)
         except ArtworkLoadError as exc:
             QMessageBox.warning(self, f"Could not load {self.title} file", str(exc))
             return
@@ -105,7 +107,11 @@ class UploadSlot(QWidget):
 
     def _refresh_status(self) -> None:
         assert self.loaded is not None
-        pages = f", {self.loaded.page_count} page(s)" if self.loaded.kind == "pdf" else ""
+        pages = ""
+        if self.loaded.kind == "pdf":
+            pages = f", {self.loaded.page_count} page(s)"
+            if self.loaded.page_count > 1:
+                pages += " \u2014 only page 1 is compared"
         geometry_note = ""
         if self.geometry is not None and self.geometry.boundary is not None:
             kind = "polygon" if hasattr(self.geometry.boundary, "points") else "crop"
@@ -131,13 +137,13 @@ class UploadPanel(QGroupBox):
 
     filesChanged = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, limits: RuntimeConfig | None = None):
         super().__init__("Upload", parent)
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
 
-        self.original_slot = UploadSlot("Original", self)
-        self.suspect_slot = UploadSlot("Suspect", self)
+        self.original_slot = UploadSlot("Original", self, limits)
+        self.suspect_slot = UploadSlot("Suspect", self, limits)
 
         divider = QFrame(self)
         divider.setFrameShape(QFrame.Shape.HLine)
