@@ -169,6 +169,21 @@ def test_a_normal_comparison_shows_only_the_findings(qapp, outcome):
     view.close()
 
 
+def test_the_unused_panels_are_not_left_drawn_over_the_page(qapp, outcome):
+    """Regression: created as children of the page and never added to a tab, they showed up at its corner."""
+    view = _shown(qapp, outcome, mode=ComparisonMode.AUTOMATIC, symbol_comparisons=[], braille=None)
+    assert not view.symbol_panel.isVisible() and not view.braille_panel.isVisible()
+
+    view.show_outcome(dataclasses.replace(outcome, mode=ComparisonMode.BARCODE, symbol_comparisons=_symbols()), "x")
+    qapp.processEvents()
+    assert view.symbol_panel.isVisible() and not view.braille_panel.isVisible()
+
+    view.show_outcome(dataclasses.replace(outcome, mode=ComparisonMode.AUTOMATIC, symbol_comparisons=[]), "x")
+    qapp.processEvents()
+    assert not view.symbol_panel.isVisible()  # and gone again once the mode no longer calls for it
+    view.close()
+
+
 def test_barcode_mode_shows_the_symbols_tab_first(qapp, outcome):
     view = _shown(qapp, outcome, mode=ComparisonMode.BARCODE, symbol_comparisons=_symbols())
     assert view.side.currentWidget() is view.symbol_panel

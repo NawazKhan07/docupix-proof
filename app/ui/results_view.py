@@ -48,8 +48,10 @@ class ResultsView(QWidget):
 
         self.viewport = ComparisonViewport(self)
         self.panel = DiffListPanel(self)
-        self.symbol_panel = SymbolResultsPanel(self)  # Barcode mode (FR-10.2)
-        self.braille_panel = BrailleResultsPanel(self)  # Braille mode (FR-11.1)
+        # These two belong to the tab widget below, only when a mode calls for them; created
+        # without a parent so that, until then, they are not stray widgets drawn over this page.
+        self.symbol_panel = SymbolResultsPanel()  # Barcode mode (FR-10.2)
+        self.braille_panel = BrailleResultsPanel()  # Braille mode (FR-11.1)
 
         # The findings list is always there; a mode that decodes something also
         # gets the panel for what it decoded, beside it.
@@ -94,6 +96,7 @@ class ResultsView(QWidget):
             index = self.side.indexOf(panel)
             if index >= 0:
                 self.side.removeTab(index)
+            panel.hide()  # removing a tab does not hide its page
 
         chosen: QWidget = self.panel
         if outcome.mode is ComparisonMode.BARCODE or outcome.symbol_comparisons:
