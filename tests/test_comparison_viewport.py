@@ -291,6 +291,34 @@ def test_only_the_findings_passed_in_are_marked(viewport, outcome):
     assert viewport.suspect_pane.marker_count == len(remaining)
 
 
+def test_every_marker_sits_on_a_halo_so_it_stays_visible_over_its_own_colour(viewport, outcome):
+    """A red marker over a red block vanished; the halo keeps it legible."""
+    for pane in (viewport.original_pane, viewport.suspect_pane):
+        assert len(pane._halo_items) == len(outcome.clusters)
+        for cluster in outcome.clusters:
+            marker = pane._marker_items[cluster.id]
+            halo = next(h for h in pane._halo_items if h.rect() == marker.rect())
+            assert halo.zValue() < marker.zValue()  # underneath it
+            assert halo.pen().color().red() == 255  # white
+
+
+def test_halos_are_removed_along_with_their_markers(viewport, outcome):
+    viewport.set_marker_clusters(outcome.clusters[:1])
+    assert len(viewport.original_pane._halo_items) == 1
+    viewport.set_marker_clusters([])
+    assert viewport.original_pane._halo_items == []
+    assert viewport.original_pane.marker_count == 0
+
+
+def test_a_halo_never_steals_a_click_from_its_marker(viewport, outcome, qapp):
+    cluster = outcome.clusters[0]
+    pane = viewport.original_pane
+    pane.center_on_box(cluster.bbox_in_original)
+    qapp.processEvents()
+    halo = next(h for h in pane._halo_items if h.rect() == pane._marker_items[cluster.id].rect())
+    assert halo.data(0) is None  # only markers carry a finding id
+
+
 def test_the_selected_finding_is_highlighted(viewport, outcome):
     target = outcome.clusters[0]
     viewport.set_selected(target.id)

@@ -98,7 +98,15 @@ class PaneView(QGraphicsView):
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._zoom = 1.0
         self._marker_items: dict[int, QGraphicsRectItem] = {}
+        self._halo_items: list[QGraphicsRectItem] = []
         self._press_pos = None
+
+        # A screen-resolution tile drawn over the base image once zoomed in
+        # (FR-9.1). See `set_detail`.
+        self._detail_item: QGraphicsPixmapItem | None = None
+        self._detail_pixmaps: dict[str, QPixmap] = {}
+        self._detail_origin = (0, 0)
+        self._detail_zoom: float | None = None
 
     # -- images --------------------------------------------------------------
     def set_stacks(self, stacks: dict[str, ImageStack]) -> None:
@@ -112,6 +120,7 @@ class PaneView(QGraphicsView):
         if key != self._shown_key and key in self._stacks:
             self._shown_key = key
             self._render_shown()
+            self._refresh_detail_item()
 
     @property
     def shown_key(self) -> str | None:
@@ -149,6 +158,68 @@ class PaneView(QGraphicsView):
         self._zoom = zoom
         self.setTransform(QTransform.fromScale(zoom, zoom))
         self._render_shown()  # a different reduced level may now be the right one
+        self._refresh_detail_item()  # a tile made for another zoom is now the wrong size
+
+    # -- detail tile (FR-9.1) ------------------------------------------------
+    def set_detail(
+        self, tiles: dict[str, np.ndarray], device_origin: tuple[int, int], zoom: float
+    ) -> None:
+        """Show a screen-resolution render of the visible region over the base image.
+
+        `tiles` holds one RGB array per image key the pane can show, so the
+        flicker and grayscale modes can alternate without re-rendering.
+        `device_origin` is the tile's top-left in device pixels, i.e. its
+        position in the image multiplied by `zoom`.
+
+        The tile ignores the view's scaling and is drawn 1:1, so each of its
+        pixels lands on exactly one screen pixel -- which is the whole point:
+        going through the view's zoom transform again would resample it.
+        """
+        self._detail_pixmaps = {key: _to_pixmap(array) for key, array in tiles.items()}
+        self._detail_origin = device_origin
+        self._detail_zoom = zoom
+        self._refresh_detail_item()
+
+    def clear_detail(self) -> None:
+        self._detail_pixmaps = {}
+        self._detail_zoom = None
+        self._refresh_detail_item()
+
+    @property
+    def has_detail(self) -> bool:
+        return self._detail_item is not None and self._detail_item.isVisible()
+
+    def _refresh_detail_item(self) -> None:
+        pixmap = self._detail_pixmaps.get(self._shown_key or "")
+        current = self._detail_zoom is not None and abs(self._detail_zoom - self._zoom) < 1e-9
+        if pixmap is None or not current:
+            if self._detail_item is not None:
+                self._detail_item.setVisible(False)
+            return
+
+        if self._detail_item is None:
+            self._detail_item = QGraphicsPixmapItem()
+            self._detail_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIgnoresTransformations)
+            self._detail_item.setTransformationMode(Qt.TransformationMode.FastTransformation)
+            self._detail_item.setZValue(1)  # above the base image, below the markers
+            self._scene.addItem(self._detail_item)
+        self._detail_item.setPixmap(pixmap)
+        origin_x, origin_y = self._detail_origin
+        # The item's own size is in device pixels (it ignores the zoom); only
+        # its anchor point is in scene units.
+        self._detail_item.setPos(origin_x / self._zoom, origin_y / self._zoom)
+        self._detail_item.setVisible(True)
+
+    def visible_device_rect(self) -> tuple[int, int, int, int]:
+        """The visible region as (x0, y0, x1, y1) in device pixels, i.e. image position x zoom."""
+        top_left = self.mapToScene(self.viewport().rect().topLeft())
+        bottom_right = self.mapToScene(self.viewport().rect().bottomRight())
+        return (
+            math.floor(top_left.x() * self._zoom),
+            math.floor(top_left.y() * self._zoom),
+            math.ceil(bottom_right.x() * self._zoom),
+            math.ceil(bottom_right.y() * self._zoom),
+        )
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -169,9 +240,10 @@ class PaneView(QGraphicsView):
         the one aligned pair, so a marker cannot land in different places in
         different panes (FR-7.4).
         """
-        for item in self._marker_items.values():
+        for item in [*self._marker_items.values(), *self._halo_items]:
             self._scene.removeItem(item)
         self._marker_items.clear()
+        self._halo_items.clear()
 
         for cluster in clusters:
             box = cluster.bbox_in_original
@@ -190,6 +262,17 @@ class PaneView(QGraphicsView):
             item.setData(0, cluster.id)
             self._scene.addItem(item)
             self._marker_items[cluster.id] = item
+
+            # A severity colour alone vanishes over artwork of the same colour
+            # (a red marker on a red block), so each marker sits on a white halo.
+            halo = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
+            halo_pen = QPen(QColor(255, 255, 255, 230), pen.widthF() + 3)
+            halo_pen.setCosmetic(True)
+            halo.setPen(halo_pen)
+            halo.setZValue(item.zValue() - 0.5)
+            halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._scene.addItem(halo)
+            self._halo_items.append(halo)
 
     @property
     def marker_count(self) -> int:

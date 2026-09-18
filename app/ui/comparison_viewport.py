@@ -9,6 +9,9 @@ nothing here can put a finding in two different places.
 
 from __future__ import annotations
 
+import logging
+import math
+
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -23,7 +26,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.models.diff import DiffCluster
+from app.engine.file_loader import LoadedArtwork
+from app.engine.tile_renderer import (
+    TileRect,
+    is_vector,
+    render_aligned_vector_tile,
+    render_raster_tile,
+    render_vector_tile,
+)
+from app.logging_config import StageTimer
+from app.models.diff import BoundingBox, DiffCluster
 from app.ui.composition import (
     ANIMATED_MODES,
     SINGLE_PANE_MODES,
@@ -34,12 +46,21 @@ from app.ui.composition import (
 )
 from app.ui.pane_view import ImageStack, PaneView
 
+logger = logging.getLogger(__name__)
+
 ZOOM_STEP = 1.25
 MIN_ZOOM = 0.05
 MAX_ZOOM = 8.0
 FOCUS_MAX_ZOOM = 3.0  # how far "jump to finding" will zoom in by itself
 FIT_MARGIN_PX = 4
 FLICKER_INTERVAL_MS = 600
+
+# FR-9.1: above 100% the 300 DPI raster is being magnified, so the visible
+# region is re-rendered at screen resolution instead.
+DETAIL_MIN_ZOOM = 1.0
+DETAIL_MARGIN_PX = 96  # render a little beyond the viewport so short pans stay sharp
+DETAIL_DEBOUNCE_MS = 120  # wait for zoom/scroll to settle before paying for a render
+DETAIL_MAX_TILE_PX = 6000  # bound memory on very large or high-DPI displays
 
 _PANE_CAPTIONS = {
     ViewMode.SIDE_BY_SIDE: ("Original", "Suspect (aligned to original)"),
@@ -67,6 +88,9 @@ class ComparisonViewport(QWidget):
         self._original_rgb: np.ndarray | None = None
         self._suspect_rgb: np.ndarray | None = None
         self._stacks: dict[str, ImageStack] = {}
+        self._original_artwork: LoadedArtwork | None = None
+        self._suspect_artwork: LoadedArtwork | None = None
+        self._alignment_transform: np.ndarray | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -96,11 +120,19 @@ class ComparisonViewport(QWidget):
         self._timer.setInterval(FLICKER_INTERVAL_MS)
         self._timer.timeout.connect(self._on_tick)
 
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.setInterval(DETAIL_DEBOUNCE_MS)
+        self._detail_timer.timeout.connect(self.update_detail_now)
+
         for pane in (self.original_pane, self.suspect_pane):
             pane.markerClicked.connect(self.markerClicked)
             pane.zoomStepRequested.connect(self._on_wheel_zoom)
         self.original_pane.resized.connect(self._on_pane_resized)
         self._connect_scroll_sync()
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.horizontalScrollBar().valueChanged.connect(self._schedule_detail)
+            pane.verticalScrollBar().valueChanged.connect(self._schedule_detail)
         self._apply_mode_layout()
 
     # -- construction --------------------------------------------------------
@@ -174,8 +206,37 @@ class ComparisonViewport(QWidget):
         self._selected_id = None
         self._fit_mode = True
         self._phase = 0
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.clear_detail()
         self._rebuild_for_mode()
         self._apply_fit()
+
+    def set_sources(
+        self,
+        original: LoadedArtwork | None,
+        suspect: LoadedArtwork | None,
+        alignment_transform: np.ndarray | None,
+    ) -> None:
+        """Give the viewer the files themselves, so zoomed-in views can be re-rendered.
+
+        Without these (or for image files, which have no vector data) the
+        viewer still works: it falls back to resampling the 300 DPI pair.
+        """
+        self._original_artwork = original
+        self._suspect_artwork = suspect
+        self._alignment_transform = alignment_transform
+        self._schedule_detail()
+
+    def release_sources(self) -> None:
+        """Drop the file references, e.g. because the files were closed or replaced."""
+        # Set the fields directly: going through `set_sources` would schedule
+        # a render, which is exactly what releasing is meant to prevent.
+        self._detail_timer.stop()
+        self._original_artwork = None
+        self._suspect_artwork = None
+        self._alignment_transform = None
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.clear_detail()
 
     @property
     def has_images(self) -> bool:
@@ -197,6 +258,7 @@ class ComparisonViewport(QWidget):
         self.viewModeChanged.emit(mode)
         if self._fit_mode:
             self._apply_fit()
+        self._schedule_detail()
 
     def _apply_mode_layout(self) -> None:
         single = self._mode in SINGLE_PANE_MODES
@@ -259,10 +321,12 @@ class ComparisonViewport(QWidget):
         super().showEvent(event)
         if self._mode in ANIMATED_MODES:
             self._timer.start()
+        self._schedule_detail()
 
     def hideEvent(self, event) -> None:
         super().hideEvent(event)
         self._timer.stop()  # no point animating a view nobody can see
+        self._detail_timer.stop()
 
     @property
     def is_animating(self) -> bool:
@@ -275,6 +339,7 @@ class ComparisonViewport(QWidget):
         if self._mode is ViewMode.GRAYSCALE and self.has_images:
             self._build_grayscale_stacks()  # the coloured regions follow the findings
         self._refresh_markers()
+        self._schedule_detail()
 
     def set_selected(self, cluster_id: int | None) -> None:
         self._selected_id = cluster_id
@@ -324,6 +389,7 @@ class ComparisonViewport(QWidget):
         self.zoom_in_button.setEnabled(self._zoom < MAX_ZOOM)
         self.zoom_out_button.setEnabled(self._zoom > MIN_ZOOM)
         self.zoomChanged.emit(self._zoom)
+        self._schedule_detail()
 
     def zoom_in(self) -> None:
         self.set_zoom(self._zoom * ZOOM_STEP)
@@ -353,6 +419,87 @@ class ComparisonViewport(QWidget):
 
     def _on_wheel_zoom(self, direction: int) -> None:
         self.zoom_in() if direction > 0 else self.zoom_out()
+
+    # -- full-quality detail when zoomed in (FR-9.1) ---------------------------
+    def _schedule_detail(self, *_args) -> None:
+        if self.has_images and self.isVisible():
+            self._detail_timer.start()  # restarts the wait, so a flurry is one render
+
+    @property
+    def has_detail(self) -> bool:
+        return self.original_pane.has_detail or self.suspect_pane.has_detail
+
+    def update_detail_now(self) -> None:
+        """Render the visible region at screen resolution, or drop it if zoomed out.
+
+        Called after zoom and scrolling settle. A render that fails must not
+        take the viewer down mid-review, so failures are logged and the view
+        simply keeps showing the magnified base image.
+        """
+        if not self.has_images or not self.isVisible():
+            return
+        if self._zoom <= DETAIL_MIN_ZOOM + 1e-9:
+            for pane in (self.original_pane, self.suspect_pane):
+                pane.clear_detail()
+            return
+
+        for pane in self._visible_panes():
+            rect = self._tile_rect_for(pane)
+            if rect is None:
+                pane.clear_detail()
+                continue
+            try:
+                with StageTimer(logger, "viewer_detail_tile"):
+                    tiles = self._tiles_for(pane, rect)
+            except Exception:  # a native PDF renderer at a UI boundary; see docstring
+                logger.exception("could not render a full-quality tile")
+                pane.clear_detail()
+                continue
+            pane.set_detail(tiles, (rect.x, rect.y), self._zoom)
+
+    def _tile_rect_for(self, pane: PaneView) -> TileRect | None:
+        x0, y0, x1, y1 = pane.visible_device_rect()
+        image_width, image_height = pane.image_size
+        x0, y0 = max(0, x0 - DETAIL_MARGIN_PX), max(0, y0 - DETAIL_MARGIN_PX)
+        x1 = min(math.ceil(image_width * self._zoom), x1 + DETAIL_MARGIN_PX)
+        y1 = min(math.ceil(image_height * self._zoom), y1 + DETAIL_MARGIN_PX)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return TileRect(x0, y0, min(x1 - x0, DETAIL_MAX_TILE_PX), min(y1 - y0, DETAIL_MAX_TILE_PX))
+
+    def _original_tile(self, rect: TileRect) -> np.ndarray:
+        if is_vector(self._original_artwork):
+            return render_vector_tile(self._original_artwork, self._zoom, rect)
+        return render_raster_tile(self._original_rgb, self._zoom, rect)
+
+    def _suspect_tile(self, rect: TileRect) -> np.ndarray:
+        if is_vector(self._suspect_artwork) and self._alignment_transform is not None:
+            return render_aligned_vector_tile(
+                self._suspect_artwork, self._alignment_transform, self._zoom, rect
+            )
+        return render_raster_tile(self._suspect_rgb, self._zoom, rect)
+
+    def _tiles_for(self, pane: PaneView, rect: TileRect) -> dict[str, np.ndarray]:
+        """The tile(s) this pane needs, keyed like the pane's own images."""
+        if self._mode is ViewMode.SIDE_BY_SIDE:
+            if pane is self.original_pane:
+                return {"original": self._original_tile(rect)}
+            return {"suspect": self._suspect_tile(rect)}
+
+        original, suspect = self._original_tile(rect), self._suspect_tile(rect)
+        if self._mode is ViewMode.FLICKER:
+            return {"original": original, "suspect": suspect}
+        if self._mode is ViewMode.OVERLAY:
+            return {"overlay": compose_overlay(original, suspect)}
+
+        zoom = self._zoom
+        boxes = [
+            BoundingBox(
+                b.x0 * zoom - rect.x, b.y0 * zoom - rect.y, b.x1 * zoom - rect.x, b.y1 * zoom - rect.y
+            )
+            for b in (cluster.bbox_in_original for cluster in self._marker_clusters)
+        ]
+        return {f"gray{phase}": compose_grayscale(original, suspect, boxes, phase) for phase in (0, 1)}
 
     # -- scroll lock (FR-8.5) --------------------------------------------------
     @property

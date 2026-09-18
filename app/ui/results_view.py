@@ -10,6 +10,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSplitter, QVBoxLayout, QWidget
 
+from app.engine.file_loader import LoadedArtwork
 from app.engine.worker import ComparisonOutcome
 from app.ui.comparison_viewport import ComparisonViewport
 from app.ui.diff_list_panel import DiffListPanel
@@ -59,11 +60,24 @@ class ResultsView(QWidget):
         self.panel.clusterSelected.connect(self._on_finding_selected)
         self.viewport.markerClicked.connect(self._on_marker_clicked)
 
-    def show_outcome(self, outcome: ComparisonOutcome, subtitle: str) -> None:
+    def show_outcome(
+        self,
+        outcome: ComparisonOutcome,
+        subtitle: str,
+        original: LoadedArtwork | None = None,
+        suspect: LoadedArtwork | None = None,
+    ) -> None:
+        """Show a result. Passing the loaded files lets the viewer re-render PDFs
+        from vector data when zoomed in (FR-9.1)."""
         self.subtitle_label.setText(subtitle)
         self.viewport.set_images(outcome.aligned_original, outcome.aligned_suspect)
+        self.viewport.set_sources(original, suspect, outcome.alignment.transform)
         self.panel.set_result(outcome.clusters, outcome.alignment, outcome.warnings)
         self._sync_markers()
+
+    def release_sources(self) -> None:
+        """Stop holding the loaded files (they are closed when replaced)."""
+        self.viewport.release_sources()
 
     def _sync_markers(self) -> None:
         self.viewport.set_marker_clusters(self.panel.marker_clusters())

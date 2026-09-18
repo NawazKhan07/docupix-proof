@@ -78,6 +78,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.compare_button)
 
         self.upload_panel.filesChanged.connect(self._update_compare_enabled)
+        # A replaced file is closed, so the results page must not keep drawing from it.
+        self.upload_panel.filesChanged.connect(self.results_view.release_sources)
         self.compare_button.clicked.connect(self._on_compare)
 
     def _update_compare_enabled(self) -> None:
@@ -132,6 +134,8 @@ class MainWindow(QMainWindow):
             outcome,
             f"{original.path.name}  vs  {suspect.path.name}  ·  "
             f"{MODE_DISPLAY_NAMES[self.mode_selector.mode]}",
+            original=original,
+            suspect=suspect,
         )
         self.stack.setCurrentWidget(self.results_view)
 
