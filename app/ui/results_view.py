@@ -84,7 +84,12 @@ class ResultsView(QWidget):
         """Show a result. Passing the loaded files lets the viewer re-render PDFs
         from vector data when zoomed in (FR-9.1)."""
         self.subtitle_label.setText(subtitle)
-        self.viewport.set_images(outcome.aligned_original, outcome.aligned_suspect)
+        ink_pair = (
+            (outcome.ink_original, outcome.ink_suspect)
+            if outcome.ink_original is not None and outcome.ink_suspect is not None
+            else None
+        )
+        self.viewport.set_images(outcome.aligned_original, outcome.aligned_suspect, ink_pair)
         self.viewport.set_sources(original, suspect, outcome.alignment.transform)
         self.viewport.set_compared_area(outcome.compared_outline)
         self.panel.set_result(outcome.clusters, outcome.alignment, outcome.warnings)

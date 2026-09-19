@@ -110,13 +110,18 @@ class UploadSlot(QWidget):
         reference = None
         if self.partner is not None and self.partner.cutout is not None and self.partner.loaded is not None:
             reference = SubjectReference(self.partner.cutout, self.partner.loaded.path.name)
-        dialog = IsolationDialog(self.loaded, self.title, self, reference=reference, config=self.config)
+        partner_title = self.partner.title if self.partner is not None else None
+        dialog = IsolationDialog(
+            self.loaded, self.title, self, reference=reference, config=self.config, partner_title=partner_title
+        )
         if dialog.exec() == IsolationDialog.DialogCode.Accepted:
             self.geometry = dialog.result_geometry()
             lifted = dialog.result_cutout()
             if lifted is not None:  # keep an earlier lift when this visit did not make a new one
                 self.cutout = lifted
             self._refresh_status()
+            if self.partner is not None and self.partner.loaded is not None:
+                self.partner._refresh_status()  # its note may now offer, or stop offering, the artwork lifted here
             self.changed.emit()
 
     def _refresh_status(self) -> None:
@@ -131,13 +136,28 @@ class UploadSlot(QWidget):
             origin = self.geometry.boundary_origin
             if origin == "lifted":
                 geometry_note = " · artwork lifted"
+                if self._can_offer_cutout():
+                    geometry_note += f" (place it on the {self.partner.title} from its Edit Artwork Area)"
             elif origin == "placed":
                 geometry_note = " · trimmed to the placed outline"
             else:
                 kind = "polygon" if hasattr(self.geometry.boundary, "points") else "crop"
                 geometry_note = f" · {kind} area set"
+        if self.geometry is not None and self.geometry.erase_regions:
+            count = len(self.geometry.erase_regions)
+            geometry_note += f" · {count} area{'s' if count != 1 else ''} erased"
         self.detail_label.setText(
             f"{self.loaded.path.name} ({self.loaded.kind}{pages}){geometry_note}"
+        )
+
+    def _can_offer_cutout(self) -> bool:
+        """Whether the artwork lifted here is waiting to be placed on a partner that has no area of its own yet."""
+        partner = self.partner
+        return (
+            self.cutout is not None
+            and partner is not None
+            and partner.loaded is not None
+            and (partner.geometry is None or partner.geometry.boundary is None)
         )
 
     def clear(self) -> None:

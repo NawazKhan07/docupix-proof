@@ -41,7 +41,7 @@ _MIN_LEVEL_EDGE_PX = 64  # never reduce an image below this on its long edge
 _CLICK_SLOP_PX = 5  # a press-release within this distance is a click, not a drag
 _MARKER_Z = 10
 _COMPARED_AREA_Z = 2  # over the page and its detail tile, under the findings
-_OUTSIDE_TINT = QColor(15, 23, 42, 105)
+_OUTSIDE_TINT = QColor(255, 255, 255)  # what the comparison left out is erased: plain white, as it was compared
 
 
 def _to_pixmap(rgb: np.ndarray) -> QPixmap:
@@ -275,7 +275,7 @@ class PaneView(QGraphicsView):
 
     # -- what was compared -----------------------------------------------------
     def set_compared_area(self, polygons: list[list[tuple[float, float]]] | None) -> None:
-        """Dim what the comparison left out and outline what it covered (None: the whole page was compared)."""
+        """Erase what the comparison left out (to white) and outline what it covered (None: the whole page was compared)."""
         self._compared_area = polygons
         self._draw_compared_area()
 
@@ -303,7 +303,7 @@ class PaneView(QGraphicsView):
             path = QPainterPath()
             path.addPolygon(QPolygonF([QPointF(x, y) for x, y in polygon]))
             path.closeSubpath()
-            outside.addPath(path)  # odd-even: outside the outer boundary is dim, inside a hole is dim again
+            outside.addPath(path)  # odd-even: outside the outer boundary is erased, inside a hole is erased again
             outline.addPath(path)
         outside.setFillRule(Qt.FillRule.OddEvenFill)
 

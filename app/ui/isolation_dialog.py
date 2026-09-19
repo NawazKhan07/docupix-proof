@@ -1,5 +1,5 @@
 """Dialog wrapping InteractiveCanvas so one file's artwork area can be chosen from the upload
-panel: crop it, lift it from its background, lay another file's outline over it, or erase parts.
+panel: crop it, lift it from its background, lay the other file's lifted artwork over it, or erase parts.
 
 **Lift Subject** is how the artwork is separated from everything else on the sheet. Press and
 hold on the artwork and only what is inside its border is lifted -- for a packaging sheet, the
@@ -7,9 +7,14 @@ carton inside its die-cut line, and none of the title, colour legend, crop marks
 around it. The outline can be corrected with Keep / Drop strokes, saved as a transparent PNG
 cutout, and used as the area to compare.
 
-**Place Outline** is for a file with no clear border of its own (a photograph, a plain scan):
-the other file's lifted outline is laid over it, snapped into place by matching the artwork,
-adjusted by hand if need be, and the file is trimmed to it.
+**Place Subject** is for a file with no clear border of its own (a photograph, a plain scan):
+the artwork lifted from the other file is laid over it, snapped into place by matching what is
+printed (Auto-fit), adjusted by hand if need be, and this file is trimmed to that outline. When the
+other file has a lifted subject, the dialog offers it at once in a banner, so this route does not have
+to be found.
+
+**Erase** selects a rectangle the way a crop is selected (drag it, adjust it by its edges, move it),
+and Erase selected area leaves it out of the comparison. Any number of areas can be erased.
 """
 
 from __future__ import annotations
@@ -28,10 +33,12 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QStackedWidget,
     QVBoxLayout,
@@ -60,16 +67,23 @@ _STATUS_TEXT = {
         "not the text, colour legend or marks around it. Use Keep / Drop to correct the outline."
     ),
     IsolationTool.PLACE_OUTLINE: (
-        "Lay the other file's outline over this one: Auto-fit matches the artwork, and you can drag it into "
-        "place. Then press Trim to outline."
+        "Place Subject lays the artwork lifted from the other file over this one, so this file is trimmed to the "
+        "same area: Auto-fit matches what is printed, you can drag it into place, then press Trim to outline."
     ),
-    IsolationTool.ERASE: "Drag to paint regions to exclude from comparison.",
+    IsolationTool.ERASE: (
+        "Drag on the page to select an area to leave out, adjust it by its edges, then press Erase selected "
+        "area (or Enter). Erased areas are not compared."
+    ),
 }
 _NAVIGATION_HINT = "Pinch or Ctrl + wheel to zoom  ·  two-finger scroll, Space + drag or middle-drag to pan"
 _SCREEN_SHARE = 0.85  # how much of the screen the dialog may take, so the whole page can be seen
 _MM_PER_INCH = 25.4
 _METHODS = (("Automatic", "auto"), ("Border line", "border"), ("Colour", "colour"))
 _BRUSH_UNIT = 1 / 1000  # the brush slider is in thousandths of the page's long edge
+_PLACED_MARGIN_PX = 1.5  # a placed outline is only as exact as the fit: start comparing this far further in
+# A colour lift much smaller than the artwork already lifted from the other file has probably caught
+# only the printed part of a scan (a pale flap is close to the paper it lies on).
+_SMALLER_THAN_REFERENCE = 0.7
 
 
 @dataclass
@@ -90,6 +104,7 @@ class IsolationDialog(QDialog):
         parent=None,
         reference: SubjectReference | None = None,
         config: AppConfig | None = None,
+        partner_title: str | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(f"Isolate Artwork — {title}")
@@ -98,6 +113,7 @@ class IsolationDialog(QDialog):
         self._config = config or AppConfig()
         self._rendered = artwork.render()
         self._reference = reference
+        self._partner_title = partner_title or "the other file"
         self._result: Optional[IsolationGeometry] = None
         self._result_cutout: Optional[Cutout] = None
 
@@ -105,8 +121,12 @@ class IsolationDialog(QDialog):
         self._subject: LiftedSubject | None = None
         self._subject_seed: tuple[float, float] | None = None
         self._hints: list[HintStroke] = []
-        # The region that will be compared: a lifted outline, or a placed one.
+        # The region that will be compared: a lifted outline, or a placed one; and how far inside its
+        # edge (image pixels) comparing starts.
         self._outline: tuple[NormalizedPolygon, str] | None = None
+        self._outline_inset_px = 0.0
+        # Shown above the page when the other file's lifted artwork can be laid over this one.
+        self._banner_hint: str | None = None
         # The cutout laid over the page.
         self._cutout: Cutout | None = None
 
@@ -118,7 +138,10 @@ class IsolationDialog(QDialog):
         tool_row.setSpacing(6)
         self.crop_button = QPushButton("Crop")
         self.lift_button = QPushButton("Lift Subject")
-        self.place_button = QPushButton("Place Outline")
+        self.place_button = QPushButton("Place Subject")
+        self.place_button.setToolTip(
+            "Lay the artwork lifted from the other file over this one, so this file is trimmed to the same area."
+        )
         self.erase_button = QPushButton("Erase")
         self._tool_buttons = (
             (self.crop_button, IsolationTool.CROP),
@@ -149,11 +172,14 @@ class IsolationDialog(QDialog):
             tool_row.addWidget(widget)
         layout.addLayout(tool_row)
 
+        layout.addWidget(self._build_reference_banner())
+
         # The options of the current tool.
         self.options = QStackedWidget()
-        self.options.addWidget(QWidget())  # crop and erase have none
+        self.options.addWidget(QWidget())  # crop has none
         self.options.addWidget(self._build_lift_options())
         self.options.addWidget(self._build_place_options())
+        self.options.addWidget(self._build_erase_options())
         layout.addWidget(self.options)
 
         self.canvas = InteractiveCanvas(self)
@@ -190,6 +216,8 @@ class IsolationDialog(QDialog):
         self.canvas.subjectRequested.connect(self._on_subject_requested)
         self.canvas.hintPainted.connect(self._on_hint_painted)
         self.canvas.overlayChanged.connect(self._sync_placement_controls)
+        self.canvas.eraseSelectionChanged.connect(self._on_erase_selection_changed)
+        self.canvas.eraseRegionsChanged.connect(self._update_option_states)
         self.canvas.cropRectAdjusting.connect(self._show_crop_readout)
         self.canvas.cropRectChanged.connect(self._on_crop_changed)
         self.canvas.zoomChanged.connect(self._show_zoom)
@@ -201,6 +229,7 @@ class IsolationDialog(QDialog):
         self.buttons.accepted.connect(self._on_save_clicked)
         self.buttons.rejected.connect(self.reject)
         self._show_zoom(self.canvas.zoom)
+        self._show_options(0)
         self._update_option_states()
 
     # -- building the option bars ---------------------------------------------------------
@@ -247,16 +276,54 @@ class IsolationDialog(QDialog):
         self.save_cutout_button.clicked.connect(self._save_cutout)
         return bar
 
+    def _build_reference_banner(self) -> QWidget:
+        """A strip above the page offering the other file's lifted artwork, so the way to place it is in plain sight."""
+        self.reference_banner = QFrame()
+        self.reference_banner.setProperty("role", "banner")
+        row = QHBoxLayout(self.reference_banner)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(12)
+        self.reference_label = QLabel()
+        self.reference_label.setWordWrap(True)
+        self.reference_button = QPushButton("Place it on this file")
+        self.reference_button.setProperty("variant", "primary")
+        row.addWidget(self.reference_label, stretch=1)
+        row.addWidget(self.reference_button)
+        self.reference_button.clicked.connect(self._place_reference_from_banner)
+        return self.reference_banner
+
+    def _default_banner_text(self) -> str:
+        name = self._reference.source_name if self._reference else self._partner_title
+        return (
+            f"The artwork lifted from {name} is ready. Lay it over this file to trim this file to the same "
+            "area — the way to compare a scan or photo that has no clear border of its own."
+        )
+
     def _build_place_options(self) -> QWidget:
-        bar = QWidget()
-        row = QHBoxLayout(bar)
+        panel = QWidget()
+        column = QVBoxLayout(panel)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(6)
+
+        # Says, in words, whether there is anything to place -- a greyed-out button says nothing.
+        self.place_hint_label = QLabel()
+        self.place_hint_label.setWordWrap(True)
+        self.place_hint_label.setProperty("secondary", "true")
+        column.addWidget(self.place_hint_label)
+
+        row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
+        column.addLayout(row)
 
-        name = self._reference.source_name if self._reference else "the other file"
-        self.use_reference_button = QPushButton(f"Use outline from {name}")
+        name = self._reference.source_name if self._reference else self._partner_title
+        self.use_reference_button = QPushButton(f"Use artwork lifted from {name}")
         self.use_reference_button.setEnabled(self._reference is not None)
-        self.use_reference_button.setToolTip("Lift the artwork in the other file first (Lift Subject), then use it here.")
+        self.use_reference_button.setToolTip(
+            "Lay the artwork lifted from the other file over this one."
+            if self._reference is not None
+            else f"Nothing has been lifted from {self._partner_title} yet."
+        )
         self.open_cutout_button = QPushButton("Open cutout…")
         self.open_cutout_button.setToolTip("Use a cutout saved earlier (a PNG with a transparent background).")
         self.autofit_button = QPushButton("Auto-fit")
@@ -293,7 +360,36 @@ class IsolationDialog(QDialog):
         self.scale_spin.valueChanged.connect(self._apply_placement_controls)
         self.opacity_slider.valueChanged.connect(lambda value: self.canvas.set_overlay_opacity(value / 100))
         self.trim_button.clicked.connect(self._trim_to_outline)
+        return panel
+
+    def _build_erase_options(self) -> QWidget:
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.erase_apply_button = QPushButton("Erase selected area")
+        self.erase_apply_button.setProperty("variant", "primary")
+        self.erase_apply_button.setToolTip("Leave the selected rectangle out of the comparison (Enter).")
+        self.erase_undo_button = QPushButton("Undo last")
+        self.erase_undo_button.setToolTip("Bring back the area erased last.")
+        self.erase_clear_button = QPushButton("Clear all")
+        self.erase_clear_button.setToolTip("Bring back every erased area.")
+        self.erase_count_label = QLabel("")
+        self.erase_count_label.setProperty("secondary", "true")
+
+        for widget in (self.erase_apply_button, self.erase_undo_button, self.erase_clear_button):
+            row.addWidget(widget)
+        row.addWidget(self.erase_count_label)
+        row.addStretch(1)
+
+        self.erase_apply_button.clicked.connect(self._apply_erase_selection)
+        self.erase_undo_button.clicked.connect(lambda: self.canvas.undo_erase())
+        self.erase_clear_button.clicked.connect(lambda: self.canvas.clear_erase_regions())
         return bar
+
+    def _apply_erase_selection(self) -> None:
+        self.canvas.apply_erase_selection()
 
     def _size_to_screen(self) -> None:
         """Open large enough that the whole page can be seen, whatever the screen."""
@@ -348,15 +444,57 @@ class IsolationDialog(QDialog):
         for widget in (self.autofit_button, self.rotation_spin, self.scale_spin, self.opacity_slider, self.trim_button):
             widget.setEnabled(has_overlay)
 
+        self.erase_apply_button.setEnabled(self.canvas.erase_selection() is not None)
+        applied = len(self.canvas.erase_regions())
+        self.erase_undo_button.setEnabled(applied > 0)
+        self.erase_clear_button.setEnabled(applied > 0)
+        self.erase_count_label.setText(f"{applied} area{'s' if applied != 1 else ''} erased" if applied else "")
+
+        if self._reference is None:
+            self.place_hint_label.setText(
+                f"Nothing has been lifted from {self._partner_title} yet. Open Edit Artwork Area on it, use Lift Subject "
+                "and Apply & Save, then come back here — or open a cutout saved earlier."
+            )
+        else:
+            self.place_hint_label.setText(
+                f"The artwork lifted from {self._reference.source_name} can be laid over this file: press the first "
+                "button, and Auto-fit matches what is printed."
+            )
+        show_banner = self._reference is not None and not has_overlay and (self._outline is None or self._banner_hint is not None)
+        self.reference_banner.setVisible(show_banner)
+        if show_banner:
+            self.reference_label.setText(self._banner_hint or self._default_banner_text())
+
     # -- choosing a tool -------------------------------------------------------------------------
     def _select_tool(self, tool: IsolationTool) -> None:
         self.canvas.set_tool(tool)
         for button, button_tool in self._tool_buttons:
             button.setChecked(button_tool == tool)
-        self.options.setCurrentIndex({IsolationTool.LIFT_SUBJECT: 1, IsolationTool.PLACE_OUTLINE: 2}.get(tool, 0))
+        self._show_options({IsolationTool.LIFT_SUBJECT: 1, IsolationTool.PLACE_OUTLINE: 2, IsolationTool.ERASE: 3}.get(tool, 0))
         if tool != IsolationTool.LIFT_SUBJECT:
             self._set_brush(None, True)
         self._say(_STATUS_TEXT[tool])
+        if tool == IsolationTool.PLACE_OUTLINE and self._reference is not None and self._cutout is None:
+            self._use_reference()  # there is something to place: place it, rather than wait for a second click
+
+    def _show_options(self, index: int) -> None:
+        """Show one tool's options, and give the page all the height the other tools' taller options would leave blank."""
+        self.options.setCurrentIndex(index)
+        for position in range(self.options.count()):
+            page = self.options.widget(position)
+            page.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Preferred if position == index else QSizePolicy.Policy.Ignored,
+            )
+        self.options.updateGeometry()
+
+    def _on_erase_selection_changed(self, rect: NormalizedRect | None) -> None:
+        self._update_option_states()
+        size = self.canvas.erase_selection_size_px()
+        if rect is None or size is None:
+            self.crop_readout.setText("")
+            return
+        self.crop_readout.setText(self._size_text("Erase", *size))
 
     def _on_crop_changed(self, rect: NormalizedRect | None) -> None:
         """A crop and an outline are two ways of saying the same thing: the last one drawn is the one used."""
@@ -419,11 +557,37 @@ class IsolationDialog(QDialog):
             QGuiApplication.restoreOverrideCursor()
 
         self._subject, self._subject_seed = subject, seed
-        self._set_outline(subject.normalized_polygon(), "lifted")
+        self._banner_hint = self._partial_lift_hint(subject)
+        self._set_outline(subject.normalized_polygon(), "lifted", subject.edge_inset_px)
         how = "inside its closed border line" if subject.source == "border" else "by colour, from its background"
+        follow_up = ""
+        if self._reference is None:
+            follow_up = f" Then open Edit Artwork Area on {self._partner_title} and place this artwork over it."
+            if subject.source == "segmented":
+                follow_up += (
+                    " On a scan the paler parts (flaps the colour of the paper) can be missed: if "
+                    f"{self._partner_title} has a clear border, lift it there first and use Place Subject here instead."
+                )
         self._say(
             f"Lifted the artwork {how}: {100 * subject.area_fraction:.0f}% of the page. Press and hold elsewhere to lift "
-            "something else, or use Keep / Drop to correct it, then Apply & Save."
+            f"something else, or use Keep / Drop to correct it, then Apply & Save.{follow_up}"
+        )
+
+    def _partial_lift_hint(self, subject: LiftedSubject) -> str | None:
+        """Advice when a lift by colour caught much less than the artwork lifted from the other file.
+
+        A scan of a die-cut sheet is the usual cause: its flaps are the colour of the paper they lie on, so
+        colour finds only the printed panels. Laying the other file's outline over it does not depend on that.
+        """
+        if self._reference is None or subject.source != "segmented":
+            return None
+        expected = float(self._reference.cutout.mask.sum())
+        if expected <= 0 or float(subject.mask.sum()) >= _SMALLER_THAN_REFERENCE * expected:
+            return None
+        share = 100 * float(subject.mask.sum()) / expected
+        return (
+            f"This lift is only {share:.0f}% of the artwork lifted from {self._reference.source_name}: on a scan the outline "
+            "is often too faint to follow. Lay that artwork over this file instead — Auto-fit matches what is printed."
         )
 
     def _on_hint_painted(self, points: list, radius_px: float, keep: bool) -> None:
@@ -435,8 +599,9 @@ class IsolationDialog(QDialog):
         self._run_lift(self._subject_seed)
         self.canvas.clear_hint_strokes()  # it is part of the outline now
 
-    def _set_outline(self, polygon: NormalizedPolygon, origin: str) -> None:
+    def _set_outline(self, polygon: NormalizedPolygon, origin: str, inset_px: float = 0.0) -> None:
         self._outline = (polygon, origin)
+        self._outline_inset_px = inset_px
         self.canvas.clear_crop()
         self._show_crop_readout(None)
         self.canvas.show_polygon(polygon)
@@ -445,6 +610,8 @@ class IsolationDialog(QDialog):
 
     def _clear_outline(self) -> None:
         self._outline = None
+        self._outline_inset_px = 0.0
+        self._banner_hint = None
         self.canvas.clear_polygon()
         self._show_outline_readout(None)
         self._update_option_states()
@@ -462,7 +629,19 @@ class IsolationDialog(QDialog):
     # -- placing another file's outline ----------------------------------------------------------
     def _use_reference(self) -> None:
         if self._reference is not None:
-            self._set_cutout(self._reference.cutout, f"the outline from {self._reference.source_name}")
+            self._set_cutout(self._reference.cutout, f"the artwork lifted from {self._reference.source_name}")
+
+    def _place_reference_from_banner(self) -> None:
+        """The banner's button: switch to Place Subject with the other file's artwork laid over this one."""
+        if self._reference is None:
+            return
+        self._banner_hint = None
+        if self._outline is not None and self._outline[1] == "lifted":
+            # The partial lift it was offered instead of: forget it, so it is not saved as this file's artwork.
+            self._subject, self._subject_seed, self._hints = None, None, []
+            self.canvas.clear_hint_strokes()
+            self._clear_outline()
+        self._select_tool(IsolationTool.PLACE_OUTLINE)
 
     def _open_cutout(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, "Open cutout", "", "PNG image (*.png)")
@@ -477,6 +656,7 @@ class IsolationDialog(QDialog):
 
     def _set_cutout(self, cutout: Cutout, name: str) -> None:
         self._cutout = cutout
+        self._banner_hint = None
         self.canvas.set_overlay(cutout)
         self.canvas.set_overlay_opacity(self.opacity_slider.value() / 100)
         self._update_option_states()
@@ -525,7 +705,10 @@ class IsolationDialog(QDialog):
             return
         height, width = self._rendered.shape[:2]
         polygon = NormalizedPolygon(points=[(x / width, y / height) for x, y in points])
-        self._set_outline(polygon, "placed")
+        placement = self.canvas.overlay_placement()
+        scale = placement.scale if placement is not None else 1.0
+        inset = (self._cutout.edge_inset_px * scale if self._cutout is not None else 0.0) + _PLACED_MARGIN_PX
+        self._set_outline(polygon, "placed", inset)
         self._say("Trimmed to the placed outline: only the area inside it will be compared. Apply & Save to keep it.")
 
     # -- resetting and saving ------------------------------------------------------------------------
@@ -548,7 +731,9 @@ class IsolationDialog(QDialog):
                 self._clear_outline()
             self._update_option_states()
         else:
-            self.canvas.clear_erase_strokes()
+            self.canvas.clear_erase_selection()
+            self.canvas.clear_erase_regions()
+            self.crop_readout.setText("")
         self._say(_STATUS_TEXT[tool])
 
     def _on_save_clicked(self) -> None:
@@ -565,6 +750,19 @@ class IsolationDialog(QDialog):
                 return
             if answer == QMessageBox.StandardButton.Yes:
                 self._trim_to_outline()
+
+        if self.canvas.erase_selection() is not None:
+            answer = QMessageBox.question(
+                self,
+                "Erase the selected area?",
+                "You selected an area to erase but did not press Erase selected area. Leave it out of the comparison?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            if answer == QMessageBox.StandardButton.Yes:
+                self.canvas.apply_erase_selection()
 
         if self._outline is not None and self._outline[1] == "placed":
             question = "Only the area inside the placed outline will be compared; the rest of the page is ignored."
@@ -596,11 +794,15 @@ class IsolationDialog(QDialog):
             _, rotation_deg = crop_tool.auto_rotate_align(cropped)
         else:
             boundary = None
+        inset_norm = 0.0
+        if isinstance(boundary, NormalizedPolygon) and self._outline is not None:
+            inset_norm = self._outline_inset_px / max(self._rendered.shape[:2])
         self._result = IsolationGeometry(
             boundary=boundary,
-            erase_regions=self.canvas.erase_strokes(),
+            erase_regions=self.canvas.erase_regions(),
             rotation_deg=rotation_deg,
             boundary_origin=origin,
+            edge_inset_norm=inset_norm,
         )
         # A lifted subject stays available to lay over the other file, whether or not it is this file's area.
         self._result_cutout = Cutout.from_subject(self._rendered, self._subject) if self._subject is not None else None

@@ -138,6 +138,38 @@ def run(report_path: Path | None = None) -> int:
                 f"{time.perf_counter() - started:.1f} s",
             )
 
+        # Comparing only inside a chosen area (each file cleared to white outside it, then aligned and
+        # compared): the change is found inside it, and gone once its rectangle is erased.
+        try:
+            from dataclasses import replace
+
+            from app.models.isolation import IsolationGeometry, NormalizedPolygon, NormalizedRect
+
+            area = IsolationGeometry(
+                boundary=NormalizedPolygon([(0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95)]),
+                boundary_origin="lifted",
+                edge_inset_norm=0.005,
+            )
+            erased = replace(area, erase_regions=[NormalizedRect(0.1, 0.45, 0.45, 0.8)])
+            inside, error = _run_job(ComparisonRequest(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(), area, area))
+            hidden, error2 = _run_job(ComparisonRequest(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(), erased, erased))
+            ok = inside is not None and bool(inside.clusters) and hidden is not None and not hidden.clusters
+            record("comparing inside a chosen area", ok, f"{len(inside.clusters) if inside else error} finding(s) inside, "
+                   f"{len(hidden.clusters) if hidden else error2} once erased")
+        except Exception as exc:
+            record("comparing inside a chosen area", False, f"{type(exc).__name__}: {exc}")
+
+        # Scan vs Digital: each file as ink on paper (background removed, print black), and no barcode decoding.
+        try:
+            scan_outcome, scan_error = _run_job(
+                ComparisonRequest(original, suspect, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+            )
+            ink = scan_outcome.ink_original if scan_outcome is not None else None
+            ok = ink is not None and ink.ndim == 2 and bool((ink == 255).mean() > 0.5) and bool((ink < 60).any())
+            record("black-and-white ink pictures (Scan vs Digital)", ok, "ready" if ok else f"{scan_error}")
+        except Exception as exc:
+            record("black-and-white ink pictures (Scan vs Digital)", False, f"{type(exc).__name__}: {exc}")
+
         # Symbol decoding: a Pharmacode drawn here must be read back by the bundled decoders.
         try:
             import cv2

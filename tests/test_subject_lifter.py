@@ -439,3 +439,59 @@ def test_the_bounding_box_and_area_describe_the_mask():
     ys, xs = np.nonzero(subject.mask)
     assert (x0, y0, x1, y1) == (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)
     assert subject.area_fraction == pytest.approx(subject.mask.sum() / subject.mask.size)
+
+
+# ---- dimension lines and their arrowheads, and the width of the line the outline follows ------------------------------------------
+
+
+def _with_dimension_line(sheet: np.ndarray) -> np.ndarray:
+    """A dimension line rising from the dust flap's top edge to a label: an arrowhead ON the outline, a long thin
+    shaft, a second arrowhead and a number -- the way a packaging sheet's measurements hang off its outline."""
+    marked = sheet.copy()
+    blue = (30, 50, 150)
+    cv2.line(marked, (760, 521), (760, 404), blue, 1)  # the shaft
+    cv2.fillConvexPoly(marked, np.array([(760, 545), (751, 521), (769, 521)], np.int32), blue)  # tip touching the outline
+    cv2.fillConvexPoly(marked, np.array([(760, 380), (751, 404), (769, 404)], np.int32), blue)  # the far arrowhead
+    cv2.putText(marked, "59", (775, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.9, blue, 2)
+    return marked
+
+
+def test_a_dimension_line_with_arrowheads_hanging_off_the_outline_is_not_lifted_with_it():
+    """The reported problem: the lifted area included the arrows and lines the sheet's measurements hang off
+    the outline with."""
+    sheet, truth, _ = scenes.dieline_sheet()
+    subject = lift_subject(_with_dimension_line(sheet), (600, 800), CONFIG)
+
+    assert subject.source == "border"
+    assert subject.mask[370:538, 700:830].sum() == 0  # the arrowheads, the shaft and the number
+    assert scenes.iou(subject.mask, _outline_dilated(truth)) > 0.97
+
+
+def test_the_outlines_own_corners_survive_the_shaving_of_what_hangs_off_it():
+    sheet, truth, _ = scenes.dieline_sheet()
+    subject = lift_subject(_with_dimension_line(sheet), (600, 800), CONFIG)
+    # the body row's four corners: the 5 x 5 pixels just inside each must still be there, the point not rounded off
+    for x, y in [(160, 620), (1135, 620), (1135, 975), (160, 975)]:
+        assert subject.mask[y : y + 5, x : x + 5].all(), (x, y)
+
+
+@pytest.mark.parametrize("line_px", [1, 2, 4])
+def test_the_lift_measures_how_thick_the_line_it_followed_is(line_px):
+    sheet, _truth, _ = scenes.dieline_sheet(line_px=line_px)
+    subject = lift_subject(sheet, (600, 800), CONFIG)
+    assert line_px - 0.6 <= subject.edge_inset_px - CONFIG.border_line_margin_px <= line_px + 1.6
+
+
+def test_a_lift_by_colour_starts_a_little_inside_its_edge_because_a_scans_edge_is_a_blur():
+    art = scenes.artwork(edge="coloured")
+    scene, truth = scenes.compose(art, "grey desk", rotation_deg=3.0, offset=(10, -20))
+    subject = lift_subject(scene, _centre(truth), CONFIG, method="colour")
+    assert subject.source == "segmented" and subject.edge_inset_px == CONFIG.colour_edge_inset_px
+
+
+def test_a_cutout_carries_the_inset_so_a_file_it_is_laid_over_starts_the_same_distance_in():
+    from app.engine.isolation.cutout import Cutout
+
+    sheet, _truth, _ = scenes.dieline_sheet(line_px=3)
+    subject = lift_subject(sheet, (600, 800), CONFIG)
+    assert Cutout.from_subject(sheet, subject).edge_inset_px == subject.edge_inset_px > 3

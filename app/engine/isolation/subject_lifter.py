@@ -77,6 +77,9 @@ class LiftedSubject:
     source: str  # "border" (inside a closed line) | "segmented" (by colour)
     image_size: tuple[int, int]  # (width, height) of the image it was lifted from
     hints: list[HintStroke] = field(default_factory=list)  # the corrections that produced it
+    # How far inside the outline comparing should start (pixels of the image it was lifted from): the
+    # width of the border line the outline traces, or the blurred fringe of an edge found by colour.
+    edge_inset_px: float = 0.0
 
     @property
     def bbox(self) -> tuple[int, int, int, int]:
@@ -397,7 +400,8 @@ def lift_subject(
             region = border_region(image_rgb, seed, config, page=page, dpi=dpi, strict=(method == "auto"))
             if region is not None:
                 mask = _corrected(region.mask, hints, seed)
-                return LiftedSubject(mask, outline_from_mask(mask, config), "border", (width, height), hints)
+                inset = region.line_width_px + config.border_line_margin_px
+                return LiftedSubject(mask, outline_from_mask(mask, config), "border", (width, height), hints, inset)
             if method == "border":
                 raise NoSubjectFoundError(
                     "No closed border line was found around that spot. Press and hold inside the outlined artwork, "
@@ -436,4 +440,4 @@ def lift_subject(
             "lifted a subject",
             extra={"area_fraction": round(float(mask.sum()) / mask.size, 4), "points": len(polygon), "hints": len(hints)},
         )
-        return LiftedSubject(mask, polygon, "segmented", (width, height), hints)
+        return LiftedSubject(mask, polygon, "segmented", (width, height), hints, config.colour_edge_inset_px)

@@ -24,7 +24,8 @@ Refinements, each from a way real sheets differ from the ideal:
   flow in and the carton would come back as a single panel, so walls are thickened
   by 0-5 px until the enclosure stops growing.
 * **A leader line or dimension line touching the outline** is part of the same
-  piece, and so is the label at its end. Thin protrusions are shaved off, then the
+  piece, and so is its arrowhead and the label at its end. Anything thin is shaved
+  off, what that cuts loose (an arrowhead, a label) is dropped with it, and the
   outline's own corners are restored.
 * **A frame around the whole sheet** would seal the whole page as one piece. When
   the piece is nearly the whole page, the frame is peeled away and the search
@@ -41,7 +42,7 @@ import cv2
 import numpy as np
 
 from app.config import SubjectConfig
-from app.engine.isolation.mask_ops import component_at, disc_kernel, fill_holes, touches_edge
+from app.engine.isolation.mask_ops import disc_kernel, fill_holes
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ _CURVE_SAMPLES = 8
 class BorderRegion:
     mask: np.ndarray  # bool (H, W) at the image's own resolution
     source: str  # "vector lines" | "dark lines"
+    line_width_px: float = 0.0  # how thick the outline's own stroke is, at the image's resolution
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +198,55 @@ def _pick(pieces: np.ndarray, count: int, seed: Point | None) -> np.ndarray | No
     return pieces == int(areas.argmax())
 
 
+def _main_body(core: np.ndarray, seed: Point | None) -> np.ndarray:
+    """The piece of `core` under the press, or the biggest piece if the press is not on one."""
+    count, labels = cv2.connectedComponents(core, connectivity=8)
+    if count <= 2:
+        return core.astype(bool)
+    if seed is not None:
+        label = labels[min(max(int(seed[1]), 0), labels.shape[0] - 1), min(max(int(seed[0]), 0), labels.shape[1] - 1)]
+        if label > 0:
+            return labels == label
+    sizes = np.bincount(labels.ravel(), minlength=count)
+    sizes[0] = 0
+    return labels == int(sizes.argmax())
+
+
 def _shave(region: np.ndarray, config: SubjectConfig, seed: Point | None) -> np.ndarray:
-    """Remove thin protrusions (leader lines, dimension lines) but keep the outline's own corners."""
-    radius = max(1, round(config.border_shave_fraction * max(region.shape)))
+    """Remove what hangs off the outline (leader and dimension lines, arrowheads, labels), keep its corners.
+
+    Eroding the region by the shave radius erases everything narrower than twice that radius and, more to the
+    point, cuts what hangs off loose: an arrowhead is wider than the line that carries it, but joined to the
+    outline only through that line. (An opening would not: the rounded ends of its disc bridge a gap of a
+    pixel or two.) Only the body under the press is then grown back, far enough to give the outline's own
+    corners back; an arrowhead that was cut loose is not part of it.
+    """
+    radius = max(2, round(config.border_shave_fraction * max(region.shape)))
     solid = region.astype(np.uint8)
-    opened = cv2.morphologyEx(solid, cv2.MORPH_OPEN, disc_kernel(radius))
-    restored = solid.astype(bool) & cv2.dilate(opened, disc_kernel(radius + 1)).astype(bool)
+    core = cv2.erode(solid, disc_kernel(radius))
+    if not core.any():
+        return region  # nothing as thick as the disc: the region is itself thin, leave it
+    body = _main_body(core, seed)
+    restored = solid.astype(bool) & cv2.dilate(body.astype(np.uint8), disc_kernel(2 * radius + 1)).astype(bool)
     if seed is not None and not restored[min(max(int(seed[1]), 0), restored.shape[0] - 1), min(max(int(seed[0]), 0), restored.shape[1] - 1)]:
         return region  # shaving would lose the press point: leave it
     return restored
+
+
+def _line_width(region: np.ndarray, walls: np.ndarray) -> float:
+    """How thick the outline's own stroke is (working pixels): what its rim is made of.
+
+    Along the region's rim the walls are the drawn line; the thickness of a stroke is twice its
+    distance from the nearest non-wall pixel, taken at its centre line.
+    """
+    solid = region.astype(np.uint8)
+    rim = region & ~cv2.erode(solid, np.ones((3, 3), np.uint8)).astype(bool)
+    depth = cv2.distanceTransform(walls.astype(np.uint8), cv2.DIST_L2, 3)
+    centre_depth = cv2.dilate(depth, np.ones((13, 13), np.uint8))  # the centre line is a few pixels in
+    at_rim = centre_depth[rim & walls]
+    if at_rim.size == 0:
+        return 0.0
+    return float(max(1.0, 2.0 * np.median(at_rim) - 1.0))
 
 
 def _region(walls: np.ndarray, seed: Point | None, config: SubjectConfig, minimum: float) -> np.ndarray | None:
@@ -278,8 +320,12 @@ def border_region(
         region = _region(walls, seed_small, config, minimum)
         if region is None:
             continue
+        line_width = _line_width(region, walls) / scale
         soft = cv2.GaussianBlur(region.astype(np.float32), (0, 0), 0.8) if scale < 1.0 else region.astype(np.float32)
         mask = cv2.resize(soft, (width, height), interpolation=cv2.INTER_LINEAR) > 0.5 if scale < 1.0 else region
-        logger.info("lifted the area inside a closed border", extra={"source": source, "area_fraction": round(float(mask.sum()) / mask.size, 4)})
-        return BorderRegion(mask, source)
+        logger.info(
+            "lifted the area inside a closed border",
+            extra={"source": source, "area_fraction": round(float(mask.sum()) / mask.size, 4), "line_width_px": round(line_width, 1)},
+        )
+        return BorderRegion(mask, source, line_width)
     return None

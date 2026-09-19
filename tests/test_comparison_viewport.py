@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
@@ -420,3 +421,101 @@ def test_loading_new_images_resets_to_a_fitted_view(viewport, outcome):
     viewport.set_images(outcome.aligned_original, outcome.aligned_suspect)
     assert viewport._fit_mode
     assert viewport.zoom < 4.0
+
+
+# ---------------------------------------------------------------------------
+# Scan vs Digital: each file as ink on paper, shown by default
+# ---------------------------------------------------------------------------
+
+
+def _ink_pair(outcome):
+    height, width = outcome.aligned_original.shape[:2]
+    original = np.full((height, width), 255, np.uint8)
+    suspect = np.full((height, width), 255, np.uint8)
+    original[20:40, 20:200] = 0  # a black bar only the original has
+    return original, suspect
+
+
+def test_without_ink_pictures_there_is_no_black_and_white_option(viewport):
+    assert viewport.ink_check.isHidden() and not viewport.showing_ink
+
+
+def test_the_ink_pictures_are_shown_by_default_with_a_way_back_to_colour(qapp, outcome):
+    widget = ComparisonViewport()
+    widget.resize(1100, 700)
+    widget.show()
+    ink = _ink_pair(outcome)
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect, ink)
+    qapp.processEvents()
+
+    assert not widget.ink_check.isHidden() and widget.ink_check.isChecked() and widget.showing_ink
+    assert widget.original_pane.image_size == (ink[0].shape[1], ink[0].shape[0])
+    assert widget.original_pane._stacks["original"]._array(0)[30, 30].tolist() == [0, 0, 0]  # the ink picture is on show
+
+    widget.ink_check.setChecked(False)
+    assert not widget.showing_ink
+    assert widget.original_pane._stacks["original"]._array(0)[30, 30].tolist() == outcome.aligned_original[30, 30].tolist()
+
+    widget.ink_check.setChecked(True)
+    assert widget.showing_ink
+    widget.close()
+
+
+def test_the_choice_of_colour_or_black_and_white_reaches_every_view_mode(qapp, outcome):
+    widget = ComparisonViewport()
+    widget.resize(1100, 700)
+    widget.show()
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect, _ink_pair(outcome))
+    for mode in ViewMode:
+        widget.set_view_mode(mode)
+        qapp.processEvents()
+        widget.ink_check.setChecked(False)
+        widget.ink_check.setChecked(True)
+        assert widget.view_mode is mode and widget.showing_ink
+    widget.close()
+
+
+def test_pdf_detail_is_not_rendered_over_the_ink_pictures(qapp, outcome):
+    """Zoomed-in tiles come from a PDF's vector data; over the black-and-white picture that would put colour back."""
+    widget = ComparisonViewport()
+    widget.resize(1100, 700)
+    widget.show()
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect, _ink_pair(outcome))
+    marker = object()
+    widget.set_sources(marker, marker, np.eye(3))  # stand-ins: only where they are kept matters here
+
+    assert widget._original_artwork is None and widget._suspect_artwork is None
+    widget.ink_check.setChecked(False)
+    assert widget._original_artwork is marker and widget._alignment_transform is not None
+    widget.ink_check.setChecked(True)
+    assert widget._original_artwork is None
+    widget.close()
+
+
+def test_a_new_result_without_ink_pictures_hides_the_option_again(qapp, outcome):
+    widget = ComparisonViewport()
+    widget.resize(1100, 700)
+    widget.show()
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect, _ink_pair(outcome))
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect)
+    assert widget.ink_check.isHidden() and not widget.showing_ink
+    widget.close()
+
+
+def test_the_results_page_shows_the_ink_pictures_of_a_scan_comparison(qapp, outcome):
+    import dataclasses
+
+    from app.ui.results_view import ResultsView
+
+    ink_original, ink_suspect = _ink_pair(outcome)
+    view = ResultsView()
+    view.resize(1400, 800)
+    view.show()
+    view.show_outcome(dataclasses.replace(outcome, ink_original=ink_original, ink_suspect=ink_suspect), "a  vs  b")
+    qapp.processEvents()
+    assert view.viewport.showing_ink and not view.viewport.ink_check.isHidden()
+
+    view.show_outcome(outcome, "c  vs  d")  # a comparison in another mode
+    qapp.processEvents()
+    assert not view.viewport.showing_ink and view.viewport.ink_check.isHidden()
+    view.close()

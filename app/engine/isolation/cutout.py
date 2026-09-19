@@ -34,6 +34,7 @@ class Cutout:
     rgba: np.ndarray  # (h, w, 4) uint8, cropped to the subject's bounding box
     polygon: list[Point]  # the outline, in this picture's own pixels
     origin: tuple[int, int] | None = None  # where its top-left sat in the source image, if known
+    edge_inset_px: float = 0.0  # how far inside its outline comparing should start (see LiftedSubject)
 
     @property
     def size(self) -> tuple[int, int]:
@@ -58,7 +59,7 @@ class Cutout:
         alpha = np.where(mask > 0, np.maximum(alpha, 200), alpha).astype(np.uint8)  # soften outward, never eat inward
         rgba = np.dstack([image_rgb[y0:y1, x0:x1], alpha])
         polygon = [(x - x0, y - y0) for x, y in subject.polygon]
-        return cls(rgba=np.ascontiguousarray(rgba), polygon=polygon, origin=(x0, y0))
+        return cls(rgba=np.ascontiguousarray(rgba), polygon=polygon, origin=(x0, y0), edge_inset_px=subject.edge_inset_px)
 
     # -- saving and loading ---------------------------------------------------------
     def save_png(self, path: Path | str) -> Path:

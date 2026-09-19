@@ -172,6 +172,9 @@ class StructureResult:
     unverifiable_fraction: float = 0.0
     # Gaussian blur (px) applied to the sharper image to match the softer one.
     matched_softness_px: float = 0.0
+    # Where that is (boolean, full size), so text read from the same pictures is not reported
+    # missing where the scan cannot hold it. None when nothing was skipped.
+    unverifiable_mask: np.ndarray | None = None
 
 
 def _pool(values: np.ndarray, factor: int) -> np.ndarray:
@@ -206,6 +209,11 @@ def _local_correlation(a: np.ndarray, b: np.ndarray, variance_floor: float) -> n
     informative = (var_a > variance_floor) & (var_b > variance_floor)
     denominator = np.sqrt(np.maximum(var_a * var_b, 1e-6))
     return np.where(informative, covariance / denominator, 0.0)
+
+
+def _unverifiable_area(unverifiable: np.ndarray, compared: np.ndarray) -> np.ndarray | None:
+    area = unverifiable & compared
+    return area if area.any() else None
 
 
 def unresolvable_mask(original: np.ndarray, suspect: np.ndarray, config: DetectionConfig) -> np.ndarray:
@@ -412,7 +420,7 @@ def detect(
         only_suspect &= compare_mask
         different = only_original | only_suspect
         if not different.any():
-            return StructureResult([], unverifiable_fraction, matched_softness)
+            return StructureResult([], unverifiable_fraction, matched_softness, _unverifiable_area(unverifiable, compared))
 
         # Group differing ink into objects; the box is then the tight extent of
         # the differing pixels themselves, not of the grouping dilation. Done
@@ -472,4 +480,4 @@ def detect(
             "matched_softness_px": round(matched_softness, 2),
         },
     )
-    return StructureResult(candidates, unverifiable_fraction, matched_softness)
+    return StructureResult(candidates, unverifiable_fraction, matched_softness, _unverifiable_area(unverifiable, compared))

@@ -1,4 +1,4 @@
-"""Lift Subject and Place Outline in the canvas, the dialog and the upload slots."""
+"""Lift Subject, Place Subject and Erase in the canvas, the dialog and the upload slots."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from app.engine.file_loader import load_artwork
 from app.engine.isolation.cutout import Cutout
 from app.engine.isolation.placement import Placement
 from app.engine.isolation.subject_lifter import lift_subject
-from app.models.isolation import IsolationGeometry, IsolationTool, NormalizedPolygon
+from app.models.isolation import IsolationGeometry, IsolationTool, NormalizedPolygon, NormalizedRect
 from app.ui.interactive_canvas import InteractiveCanvas
 from app.ui.isolation_dialog import IsolationDialog, SubjectReference
 from app.ui.upload_panel import UploadPanel
@@ -275,7 +275,7 @@ def _dilated(truth):
 def test_lift_subject_replaces_trace_dieline_in_the_tool_row(sheet_dialog):
     dialog, _truth, _not_artwork = sheet_dialog
     labels = [button.text() for button, _tool in dialog._tool_buttons]
-    assert labels == ["Crop", "Lift Subject", "Place Outline", "Erase"]
+    assert labels == ["Crop", "Lift Subject", "Place Subject", "Erase"]
     assert "Trace Dieline" not in labels
 
 
@@ -301,6 +301,8 @@ def test_the_tool_options_follow_the_tool(sheet_dialog):
     dialog.place_button.click()
     assert dialog.options.currentIndex() == 2
     dialog.erase_button.click()
+    assert dialog.options.currentIndex() == 3
+    dialog.crop_button.click()
     assert dialog.options.currentIndex() == 0
 
 
@@ -619,6 +621,8 @@ def test_opening_something_that_is_not_a_cutout_explains(suspect_dialog, tmp_pat
     flat = tmp_path / "flat.png"
     Image.fromarray(np.full((40, 40, 3), 128, np.uint8)).save(flat)
     monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **k: (str(flat), ""))
+    dialog.reset_button.click()  # the fixture's dialog already laid the other file's artwork over the page
+    assert not dialog.canvas.has_overlay
     dialog.open_cutout_button.click()
     assert not dialog.canvas.has_overlay and "no transparent background" in dialog.status_label.text()
 
@@ -650,7 +654,7 @@ def test_each_file_is_offered_the_others_lifted_subject(qapp, tmp_path, monkeypa
         class DialogCode:
             Accepted = 1
 
-        def __init__(self, artwork, title, parent=None, reference=None, config=None):
+        def __init__(self, artwork, title, parent=None, reference=None, config=None, partner_title=None):
             seen[title] = reference
 
         def exec(self):
@@ -712,3 +716,374 @@ def test_the_status_line_says_when_a_file_is_trimmed_to_a_placed_outline(qapp, s
     )
     panel.suspect_slot._refresh_status()
     assert "trimmed to the placed outline" in panel.suspect_slot.detail_label.text()
+
+
+# ---- placing is offered, not hidden ---------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def open_dialog(qapp, photo_pair):
+    """Builds the suspect's dialog, with or without the original's lifted artwork to offer."""
+    made = []
+
+    def build(with_reference=True, **kwargs):
+        original_path, suspect_path, _truth = photo_pair
+        reference = SubjectReference(_lift_original_cutout(original_path), "original.png") if with_reference else None
+        artwork = load_artwork(suspect_path)
+        dialog = IsolationDialog(artwork, "Suspect", reference=reference, **kwargs)
+        dialog.show()
+        qapp.processEvents()
+        made.append((dialog, artwork))
+        return dialog
+
+    yield build
+    for dialog, artwork in made:
+        dialog.close()
+        artwork.close()
+
+
+def test_the_other_files_lifted_artwork_is_offered_in_a_banner_when_the_dialog_opens(open_dialog):
+    dialog = open_dialog(partner_title="Original")
+    assert dialog.reference_banner.isVisible() and "original.png" in dialog.reference_label.text()
+    assert dialog.canvas.tool == IsolationTool.CROP  # nothing was done on the user's behalf yet
+
+    dialog.reference_button.click()
+
+    assert dialog.canvas.tool == IsolationTool.PLACE_OUTLINE and dialog.canvas.has_overlay
+    assert not dialog.reference_banner.isVisible()  # it has been taken up: nothing left to offer
+
+
+def test_no_banner_when_the_other_file_has_lifted_nothing(open_dialog):
+    dialog = open_dialog(with_reference=False, partner_title="Original")
+    assert not dialog.reference_banner.isVisible()
+
+
+def test_with_nothing_lifted_yet_the_place_tool_says_what_to_do_first_instead_of_only_being_greyed_out(open_dialog):
+    dialog = open_dialog(with_reference=False, partner_title="Original")
+    dialog.place_button.click()
+
+    hint = dialog.place_hint_label.text()
+    assert "Nothing has been lifted from Original" in hint and "Lift Subject" in hint
+    assert not dialog.use_reference_button.isEnabled() and "Original" in dialog.use_reference_button.toolTip()
+    assert dialog.open_cutout_button.isEnabled() and not dialog.canvas.has_overlay
+
+
+def test_choosing_place_subject_lays_the_other_files_artwork_over_the_page_without_a_second_click(open_dialog):
+    dialog = open_dialog()
+    dialog.place_button.click()
+    assert dialog.canvas.has_overlay and "Fitted by matching the artwork" in dialog.status_label.text()
+
+
+def test_the_banner_stays_until_the_file_has_an_outline_of_its_own(open_dialog):
+    dialog = open_dialog()
+    dialog.crop_button.click()
+    dialog.canvas.begin_crop_drag(QPointF(100, 100))
+    dialog.canvas.end_crop_drag(QPointF(400, 400))
+    assert dialog.reference_banner.isVisible()  # a crop is not an outline: the offer stands
+
+    dialog._set_outline(NormalizedPolygon([(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)]), "lifted")
+    assert not dialog.reference_banner.isVisible()
+
+
+def test_a_lift_with_no_other_file_lifted_says_where_it_goes_next(sheet_dialog):
+    dialog, *_ = sheet_dialog
+    dialog.lift_button.click()
+    dialog._on_subject_requested(600 / 1300, 800 / 1560)
+    assert "place this artwork over it" in dialog.status_label.text()
+
+
+def test_a_colour_lift_much_smaller_than_the_other_files_artwork_offers_to_use_that_instead(qapp, photo_pair):
+    """The scan of a die-cut sheet: colour finds only the printed panels. The dialog says so, and offers the
+    outline of the artwork already lifted from the digital file."""
+    _a, suspect_path, _truth = photo_pair
+    huge = np.zeros((3000, 3000, 4), np.uint8)
+    huge[..., 3] = 255
+    reference = SubjectReference(
+        Cutout(rgba=huge, polygon=[(0.0, 0.0), (3000.0, 0.0), (3000.0, 3000.0), (0.0, 3000.0)]), "digital.pdf"
+    )
+    artwork = load_artwork(suspect_path)
+    try:
+        dialog = IsolationDialog(artwork, "Suspect", reference=reference, partner_title="Original")
+        dialog.show()
+        dialog.lift_button.click()
+        dialog.method_combo.setCurrentIndex(dialog.method_combo.findData("colour"))
+        dialog._on_subject_requested(0.5, 0.5)
+        qapp.processEvents()
+
+        assert dialog._subject is not None and dialog.canvas.polygon() is not None
+        assert dialog.reference_banner.isVisible() and "digital.pdf" in dialog.reference_label.text()
+        assert "only" in dialog.reference_label.text() and "%" in dialog.reference_label.text()
+
+        dialog.reference_button.click()  # take the offer
+
+        assert dialog.canvas.tool == IsolationTool.PLACE_OUTLINE
+        assert dialog._subject is None and dialog.canvas.polygon() is None  # the partial lift is forgotten
+        dialog.close()
+    finally:
+        artwork.close()
+
+
+def test_a_lift_close_to_the_other_files_size_does_not_second_guess_itself(open_dialog):
+    dialog = open_dialog()
+    dialog.lift_button.click()
+    dialog.method_combo.setCurrentIndex(dialog.method_combo.findData("colour"))
+    dialog._on_subject_requested(0.5, 0.5)
+    assert dialog._subject is not None and dialog._banner_hint is None
+
+
+def test_a_lifted_area_keeps_the_width_of_the_line_it_followed_so_the_line_is_not_compared(sheet_dialog):
+    dialog, *_ = sheet_dialog
+    dialog.lift_button.click()
+    dialog._on_subject_requested(600 / 1300, 800 / 1560)
+    dialog._on_save()
+
+    geometry = dialog.result_geometry()
+    height, width = dialog._rendered.shape[:2]
+    assert geometry.edge_inset_norm * max(height, width) >= 2.0  # at least the 2 px line the sheet was drawn with
+
+
+def test_a_cropped_area_is_not_inset(sheet_dialog):
+    dialog, *_ = sheet_dialog
+    dialog.canvas.begin_crop_drag(QPointF(200, 200))
+    dialog.canvas.end_crop_drag(QPointF(900, 900))
+    dialog._on_save()
+    assert dialog.result_geometry().edge_inset_norm == 0.0
+
+
+def test_a_placed_outline_is_inset_by_a_margin_for_how_exact_the_fit_is(open_dialog):
+    dialog = open_dialog()
+    dialog.place_button.click()
+    dialog.trim_button.click()
+    dialog._on_save()
+
+    geometry = dialog.result_geometry()
+    assert geometry.edge_inset_norm * max(dialog._rendered.shape[:2]) >= 1.5
+
+
+# ---- erase: select a rectangle like a crop -----------------------------------------------------------------------------------------------------
+
+
+def test_the_erase_tool_selects_a_rectangle_like_a_crop_and_applies_it(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    seen = []
+    canvas.eraseSelectionChanged.connect(seen.append)
+
+    canvas.begin_erase_drag(QPointF(100, 80))
+    canvas.update_erase_drag(QPointF(300, 200))
+    canvas.end_erase_drag(QPointF(300, 200))
+
+    selection = canvas.erase_selection()
+    assert (selection.x0, selection.y0, selection.x1, selection.y1) == pytest.approx((100 / 600, 80 / 400, 300 / 600, 200 / 400))
+    assert canvas.erase_selection_size_px() == (200, 120) and seen[-1] is selection
+    assert canvas.erase_regions() == []  # selected, not yet applied
+
+    applied = canvas.apply_erase_selection()
+
+    assert applied is selection and canvas.erase_selection() is None and canvas.erase_regions() == [selection]
+
+
+def test_the_erase_selection_can_be_resized_and_moved_before_it_is_applied(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    canvas.begin_erase_drag(QPointF(100, 80))
+    canvas.end_erase_drag(QPointF(300, 200))
+
+    assert canvas.hit_test_erase(QPointF(300, 140)) == "r" and canvas.hit_test_erase(QPointF(200, 140)) == "move"
+    canvas.begin_erase_drag(QPointF(300, 140))  # the right edge
+    canvas.update_erase_drag(QPointF(400, 140))
+    canvas.end_erase_drag(QPointF(400, 140))
+    assert canvas.erase_selection_size_px() == (300, 120)
+
+    canvas.begin_erase_drag(QPointF(250, 140))  # the body
+    canvas.update_erase_drag(QPointF(270, 190))
+    canvas.end_erase_drag(QPointF(270, 190))
+    selection = canvas.erase_selection()
+    assert (selection.x0, selection.y0) == pytest.approx((120 / 600, 130 / 400))
+
+
+def test_a_click_with_the_erase_tool_selects_nothing(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    seen = []
+    canvas.eraseSelectionChanged.connect(seen.append)
+    canvas.begin_erase_drag(QPointF(100, 100))
+    canvas.end_erase_drag(QPointF(101, 101))
+    assert canvas.erase_selection() is None and seen[-1] is None
+
+
+def test_erased_areas_can_be_undone_one_by_one_or_cleared(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    changes = []
+    canvas.eraseRegionsChanged.connect(lambda: changes.append(len(canvas.erase_regions())))
+    for x in (50, 250, 450):
+        canvas.begin_erase_drag(QPointF(x, 50))
+        canvas.end_erase_drag(QPointF(x + 100, 150))
+        canvas.apply_erase_selection()
+    assert len(canvas.erase_regions()) == 3
+
+    canvas.undo_erase()
+    assert len(canvas.erase_regions()) == 2
+    canvas.clear_erase_regions()
+    assert canvas.erase_regions() == [] and changes[-1] == 0
+    canvas.undo_erase()  # nothing left: not an error
+    assert canvas.erase_regions() == []
+
+
+def test_enter_applies_the_erase_selection_and_escape_drops_it(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    canvas.begin_erase_drag(QPointF(100, 100))
+    canvas.end_erase_drag(QPointF(200, 200))
+    canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier))
+    assert len(canvas.erase_regions()) == 1 and canvas.erase_selection() is None
+
+    canvas.begin_erase_drag(QPointF(300, 100))
+    canvas.end_erase_drag(QPointF(400, 200))
+    canvas.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier))
+    assert len(canvas.erase_regions()) == 1 and canvas.erase_selection() is None
+
+
+def test_the_erase_selection_and_the_crop_are_independent(qapp):
+    canvas = _canvas(qapp, IsolationTool.CROP)
+    canvas.begin_crop_drag(QPointF(50, 50))
+    canvas.end_crop_drag(QPointF(500, 350))
+    canvas.set_tool(IsolationTool.ERASE)
+    canvas.begin_erase_drag(QPointF(100, 100))
+    canvas.end_erase_drag(QPointF(200, 200))
+
+    assert canvas.crop_rect() is not None and canvas.erase_selection() is not None
+    canvas.clear_erase_selection()
+    assert canvas.crop_rect() is not None
+
+
+def test_a_new_image_clears_the_erased_areas(qapp):
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    canvas.begin_erase_drag(QPointF(100, 100))
+    canvas.end_erase_drag(QPointF(200, 200))
+    canvas.apply_erase_selection()
+    canvas.set_image(np.full((400, 600, 3), 240, np.uint8))
+    assert canvas.erase_regions() == [] and canvas.erase_selection() is None
+
+
+def test_erasing_is_a_rectangle_not_a_pen(qapp):
+    """The reported problem: the Erase button gave a pen to draw with; it should select an area like a crop."""
+    canvas = _canvas(qapp, IsolationTool.ERASE)
+    assert not hasattr(canvas, "begin_erase_stroke")
+    canvas.begin_erase_drag(QPointF(100, 100))
+    canvas.update_erase_drag(QPointF(150, 250))
+    canvas.update_erase_drag(QPointF(300, 120))  # wandering does not paint anything: it is a rectangle
+    canvas.end_erase_drag(QPointF(300, 120))
+    assert canvas.erase_selection_size_px() == (200, 20)
+
+
+@pytest.fixture
+def erase_dialog(sheet_dialog):
+    dialog, *_ = sheet_dialog
+    dialog.erase_button.click()
+    return dialog
+
+
+def _select_erase(dialog, x0=0.3, y0=0.4, x1=0.5, y1=0.5):
+    width, height = dialog.canvas._image_size
+    dialog.canvas.begin_erase_drag(QPointF(width * x0, height * y0))
+    dialog.canvas.end_erase_drag(QPointF(width * x1, height * y1))
+
+
+def test_the_erase_options_follow_the_selection(erase_dialog):
+    dialog = erase_dialog
+    assert dialog.options.currentIndex() == 3 and not dialog.erase_apply_button.isEnabled()
+    assert not dialog.erase_undo_button.isEnabled() and not dialog.erase_clear_button.isEnabled()
+
+    _select_erase(dialog)
+    assert dialog.erase_apply_button.isEnabled() and dialog.crop_readout.text().startswith("Erase ")
+
+    dialog.erase_apply_button.click()
+    assert not dialog.erase_apply_button.isEnabled() and dialog.erase_undo_button.isEnabled()
+    assert dialog.erase_count_label.text() == "1 area erased"
+
+    _select_erase(dialog, 0.6, 0.6, 0.8, 0.7)
+    dialog.erase_apply_button.click()
+    assert dialog.erase_count_label.text() == "2 areas erased"
+
+    dialog.erase_undo_button.click()
+    assert dialog.erase_count_label.text() == "1 area erased"
+    dialog.erase_clear_button.click()
+    assert dialog.erase_count_label.text() == "" and not dialog.erase_clear_button.isEnabled()
+
+
+def test_erased_rectangles_are_saved_with_the_area(erase_dialog):
+    dialog = erase_dialog
+    _select_erase(dialog)
+    dialog.erase_apply_button.click()
+    dialog._on_save()
+
+    (region,) = dialog.result_geometry().erase_regions
+    assert isinstance(region, NormalizedRect)
+    assert (region.x0, region.y0, region.x1, region.y1) == pytest.approx((0.3, 0.4, 0.5, 0.5), abs=1e-3)
+
+
+def test_reset_in_the_erase_tool_brings_back_everything_erased(erase_dialog):
+    dialog = erase_dialog
+    _select_erase(dialog)
+    dialog.erase_apply_button.click()
+    _select_erase(dialog, 0.6, 0.6, 0.8, 0.7)
+
+    dialog.reset_button.click()
+
+    assert dialog.canvas.erase_regions() == [] and dialog.canvas.erase_selection() is None and dialog.crop_readout.text() == ""
+
+
+def test_saving_with_a_selected_but_unapplied_erase_area_asks_whether_to_apply_it(erase_dialog, monkeypatch):
+    dialog = erase_dialog
+    _select_erase(dialog)
+    titles = []
+
+    def answer(_parent, title, *_a, **_k):
+        titles.append(title)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", answer)
+    dialog._on_save_clicked()
+
+    assert titles == ["Erase the selected area?"] and len(dialog.result_geometry().erase_regions) == 1
+
+
+def test_declining_to_erase_the_selection_saves_without_it(erase_dialog, monkeypatch):
+    dialog = erase_dialog
+    _select_erase(dialog)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    dialog._on_save_clicked()
+    assert dialog.result_geometry().erase_regions == []
+
+
+def test_cancelling_at_the_erase_question_stays_in_the_dialog(erase_dialog, monkeypatch):
+    dialog = erase_dialog
+    _select_erase(dialog)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Cancel)
+    dialog._on_save_clicked()
+    assert dialog.result_geometry() is None
+
+
+def test_the_upload_slot_says_how_many_areas_were_erased(qapp, synthetic_png):
+    panel = UploadPanel()
+    panel.original_slot.load_path(synthetic_png)
+    panel.original_slot.geometry = IsolationGeometry(
+        erase_regions=[NormalizedRect(0.1, 0.1, 0.2, 0.2), NormalizedRect(0.5, 0.5, 0.6, 0.6)]
+    )
+    panel.original_slot._refresh_status()
+    assert "2 areas erased" in panel.original_slot.detail_label.text()
+
+
+def test_a_slot_says_its_lifted_artwork_can_be_placed_on_the_other_file(qapp, synthetic_png):
+    panel = UploadPanel()
+    panel.original_slot.load_path(synthetic_png)
+    panel.suspect_slot.load_path(synthetic_png)
+    panel.original_slot.cutout = _cutout()
+    panel.original_slot.geometry = IsolationGeometry(
+        boundary=NormalizedPolygon([(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)]), boundary_origin="lifted"
+    )
+    panel.original_slot._refresh_status()
+    assert "place it on the Suspect" in panel.original_slot.detail_label.text()
+
+    panel.suspect_slot.geometry = IsolationGeometry(
+        boundary=NormalizedPolygon([(0.1, 0.1), (0.9, 0.1), (0.9, 0.9)]), boundary_origin="placed"
+    )
+    panel.original_slot._refresh_status()  # the suspect has its area now: nothing left to suggest
+    assert "place it on" not in panel.original_slot.detail_label.text()

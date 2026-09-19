@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import math
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -87,6 +88,11 @@ class ComparisonViewport(QWidget):
         self._marker_clusters: list[DiffCluster] = []
         self._original_rgb: np.ndarray | None = None
         self._suspect_rgb: np.ndarray | None = None
+        # Scan vs Digital also has each file as ink on paper (black and white); it is what is shown by default.
+        self._colour_pair: tuple[np.ndarray, np.ndarray] | None = None
+        self._ink_pair: tuple[np.ndarray, np.ndarray] | None = None
+        self._showing_ink = False
+        self._sources: tuple[LoadedArtwork | None, LoadedArtwork | None, np.ndarray | None] = (None, None, None)
         self._stacks: dict[str, ImageStack] = {}
         self._original_artwork: LoadedArtwork | None = None
         self._suspect_artwork: LoadedArtwork | None = None
@@ -159,8 +165,20 @@ class ComparisonViewport(QWidget):
         self.scroll_lock_check.setChecked(True)
         self.scroll_lock_check.toggled.connect(self.set_scroll_lock)
         row.addWidget(self.scroll_lock_check)
-        self.compared_area_check = QCheckBox("Show compared area")
-        self.compared_area_check.setToolTip("Dim everything the comparison left out, and outline what it covered.")
+        self.ink_check = QCheckBox("Black && white")
+        self.ink_check.setToolTip(
+            "Show each file as ink on paper: background colours removed, everything printed in black. "
+            "This is the picture that was read for text and compared. Untick for the colour originals."
+        )
+        self.ink_check.setChecked(True)
+        self.ink_check.setVisible(False)  # only in Scan vs Digital
+        self.ink_check.toggled.connect(self._on_ink_toggled)
+        row.addWidget(self.ink_check)
+        self.compared_area_check = QCheckBox("Show compared area only")
+        self.compared_area_check.setToolTip(
+            "Erase everything the comparison left out (white background) and outline what it covered. "
+            "Untick to see the whole page."
+        )
         self.compared_area_check.setChecked(True)
         self.compared_area_check.setVisible(False)  # only when part of the page was left out
         self.compared_area_check.toggled.connect(self._on_compared_area_toggled)
@@ -202,21 +220,58 @@ class ComparisonViewport(QWidget):
             second.valueChanged.connect(lambda value, other=first: self._sync_scroll(other, value))
 
     # -- images --------------------------------------------------------------
-    def set_images(self, original_rgb: np.ndarray, aligned_suspect_rgb: np.ndarray) -> None:
-        """Load the aligned pair every mode is drawn from (FR-7.4)."""
-        self._original_rgb = original_rgb
-        self._suspect_rgb = aligned_suspect_rgb
-        self._stacks = {
-            "original": ImageStack(original_rgb),
-            "suspect": ImageStack(aligned_suspect_rgb),
-        }
+    def set_images(
+        self,
+        original_rgb: np.ndarray,
+        aligned_suspect_rgb: np.ndarray,
+        ink_pair: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> None:
+        """Load the aligned pair every mode is drawn from (FR-7.4).
+
+        `ink_pair` is the same pair as ink on paper (grey images, 255 = background): when given, it is what
+        is shown, with a checkbox to see the colour originals instead.
+        """
+        self._colour_pair = (original_rgb, aligned_suspect_rgb)
+        self._ink_pair = (
+            (cv2.cvtColor(ink_pair[0], cv2.COLOR_GRAY2RGB), cv2.cvtColor(ink_pair[1], cv2.COLOR_GRAY2RGB))
+            if ink_pair is not None
+            else None
+        )
+        self._showing_ink = self._ink_pair is not None
+        self.ink_check.blockSignals(True)
+        self.ink_check.setChecked(self._showing_ink)
+        self.ink_check.blockSignals(False)
+        self.ink_check.setVisible(self._ink_pair is not None)
         self._selected_id = None
         self._fit_mode = True
         self._phase = 0
+        self._load_active_pair()
+        self._apply_fit()
+
+    def _load_active_pair(self) -> None:
+        """Make the pair being shown (ink or colour) the one every mode is drawn from."""
+        original, suspect = (self._ink_pair if self._showing_ink and self._ink_pair else self._colour_pair)
+        self._original_rgb, self._suspect_rgb = original, suspect
+        self._stacks = {"original": ImageStack(original), "suspect": ImageStack(suspect)}
+        # Zoomed-in tiles are re-rendered from a PDF's vector data; the ink pictures exist only as pixels.
+        original_source, suspect_source, transform = self._sources
+        if self._showing_ink:
+            original_source = suspect_source = transform = None
+        self._original_artwork, self._suspect_artwork, self._alignment_transform = original_source, suspect_source, transform
         for pane in (self.original_pane, self.suspect_pane):
             pane.clear_detail()
         self._rebuild_for_mode()
-        self._apply_fit()
+        self._schedule_detail()
+
+    def _on_ink_toggled(self, checked: bool) -> None:
+        if self._ink_pair is None or checked == self._showing_ink:
+            return
+        self._showing_ink = checked
+        self._load_active_pair()
+
+    @property
+    def showing_ink(self) -> bool:
+        return self._showing_ink
 
     def set_sources(
         self,
@@ -229,6 +284,9 @@ class ComparisonViewport(QWidget):
         Without these (or for image files, which have no vector data) the
         viewer still works: it falls back to resampling the 300 DPI pair.
         """
+        self._sources = (original, suspect, alignment_transform)
+        if self._showing_ink:
+            original = suspect = alignment_transform = None
         self._original_artwork = original
         self._suspect_artwork = suspect
         self._alignment_transform = alignment_transform
@@ -239,6 +297,7 @@ class ComparisonViewport(QWidget):
         # Set the fields directly: going through `set_sources` would schedule
         # a render, which is exactly what releasing is meant to prevent.
         self._detail_timer.stop()
+        self._sources = (None, None, None)
         self._original_artwork = None
         self._suspect_artwork = None
         self._alignment_transform = None

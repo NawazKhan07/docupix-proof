@@ -1,12 +1,13 @@
 """Comparison pipeline: isolate -> align -> detect (Architecture §3.3).
 
-This is the function Phase 7 will run inside a worker process; for now the
-UI calls it directly. It owns the two things individual detectors must not
-each decide for themselves:
+This is the function Phase 7 runs inside a worker process. It owns the two things
+individual detectors must not each decide for themselves:
 
-* the single hard mask that keeps furniture out of every detector's view
-  (FR-2.1), built from both files' isolation geometry *and* the region the
-  warped suspect actually covers;
+* what is compared. Each file is first cleared to plain white everywhere outside its own
+  artwork area (a lifted or placed outline, a crop, minus anything erased), so the two files
+  that are aligned and compared are the two artworks and nothing else; then the single hard
+  mask that keeps furniture out of every detector's view (FR-2.1) is built from both files'
+  areas *and* the region the warped suspect actually covers;
 * the working resolution detection runs at, with candidate boxes scaled back
   into the shared aligned space afterwards so everything downstream speaks
   one coordinate system (FR-7.4).
@@ -36,8 +37,8 @@ from app.engine.detectors import (
 )
 from app.engine.detectors.change_regions import ChangeRegion, find_change_regions
 from app.engine.detectors.text_diff import OcrUnavailableError
-from app.engine.isolation.boundary_mask import apply_mask, resolve_keep_mask
-from app.engine.preprocessing.scan_normalizer import normalize_for_scan
+from app.engine.isolation.boundary_mask import apply_mask, boundary_mask, erased_mask
+from app.engine.preprocessing.scan_normalizer import ink_image
 from app.logging_config import StageTimer
 from app.models.diff import BoundingBox, DiffCandidate, DiffCluster
 from app.models.isolation import IsolationGeometry
@@ -72,6 +73,10 @@ class ComparisonOutcome:
     # The area that was compared, as outlines in the original's pixels (holes included, for odd-even
     # filling), or None when the whole page was. Lets the viewer show what was left out.
     compared_outline: list[list[tuple[float, float]]] | None = None
+    # Scan vs Digital only: each file as ink on paper (grey images, 255 = background, 0 = ink), aligned and
+    # limited to the compared area -- the pictures that were read for text and compared. Shown by default.
+    ink_original: np.ndarray | None = None
+    ink_suspect: np.ndarray | None = None
 
 
 def run_comparison(
@@ -87,32 +92,55 @@ def run_comparison(
     options = options_for_mode(mode)
     say = progress or (lambda _text: None)
 
+    # Erase, in each file, everything outside its own artwork area: what is aligned and compared
+    # is then the two artworks alone, on white, not two sheets with a title and marks around them.
+    original_area = _Area.of(original_image, original_geometry)
+    suspect_area = _Area.of(suspect_image, suspect_geometry)
+    artwork_original = original_area.blanked(original_image)
+    artwork_suspect = suspect_area.blanked(suspect_image)
+
     say("Aligning the files\u2026")
     alignment = align(
-        original_image, suspect_image, config.alignment, original_geometry, suspect_geometry
+        artwork_original, artwork_suspect, config.alignment, original_geometry, suspect_geometry
     )
     detection_config, profile = effective_detection_config(config.detection, alignment)
     say("Comparing the artwork\u2026")
 
     reference_shape = original_image.shape[:2]
     with StageTimer(logger, "warp_to_shared_space"):
-        warped_suspect = warp_to_reference(suspect_image, alignment.transform, reference_shape)
+        warped_artwork = warp_to_reference(artwork_suspect, alignment.transform, reference_shape)
+        # The viewer shows the whole suspect page; only the comparison uses the cleared copy.
+        warped_suspect = (
+            warped_artwork
+            if artwork_suspect is suspect_image
+            else warp_to_reference(suspect_image, alignment.transform, reference_shape)
+        )
         compare_mask = _build_compare_mask(
-            original_image,
-            suspect_image,
-            alignment.transform,
-            original_geometry,
-            suspect_geometry,
+            suspect_image.shape[:2], reference_shape, alignment.transform, original_area, suspect_area
         )
 
     # FR-2.1, enforced once here rather than trusted to each detector.
-    masked_original = apply_mask(original_image, compare_mask)
-    masked_suspect = apply_mask(warped_suspect, compare_mask)
+    masked_original = apply_mask(artwork_original, compare_mask)
+    masked_suspect = apply_mask(warped_artwork, compare_mask)
 
     candidates: list[DiffCandidate] = []
     warnings: list[str] = []
     symbol_comparisons: list[SymbolComparison] = []
     braille_comparison: BrailleComparison | None = None
+
+    # A scan changes every colour, so Scan vs Digital compares what is PRINTED, not what colour it is: each
+    # file is turned into ink on paper (background colours removed to white, everything else black). Text is
+    # read from those pictures, and they are what the reviewer is shown. Graphics and barcodes are compared
+    # by where the ink is, from the files' own grey levels rather than from the thresholded pictures: the
+    # softness of a scan (blur, dot gain, lost fine print) is what tells it apart from a real change, and a
+    # threshold applied first throws that away (a harsh scan lost its small print and the whole paragraph
+    # read as removed). Barcodes are not decoded here, only compared as the marks they are.
+    ink_original = ink_suspect = None
+    if options.normalize_scan:
+        say("Removing the background colour…")
+        with StageTimer(logger, "ink_pictures"):
+            ink_original = ink_image(masked_original, detection_config, compare_mask)
+            ink_suspect = ink_image(masked_suspect, detection_config, compare_mask)
 
     used_regions = False
     # Graphics of files that do not register exactly are compared by where INK is, within
@@ -122,6 +150,7 @@ def run_comparison(
     graphics_mode = detection_config.graphics_when_misregistered if misregistered else "ssim"
     use_structure = options.compare_graphics and graphics_mode in ("structure", "both")
     use_ssim = options.compare_graphics and graphics_mode in ("ssim", "both") and not options.normalize_scan
+    unverifiable_area: np.ndarray | None = None
     if use_structure:
         # Compare where INK is, at full resolution, tolerating the registration error
         # we measured (FR-6.3 for scans: colour is ignored there).
@@ -133,6 +162,7 @@ def run_comparison(
             compare_mask,
         )
         candidates += structure.candidates
+        unverifiable_area = structure.unverifiable_mask
         if structure.matched_softness_px >= detection_config.structure_soft_warning_sigma_px:
             warnings.append(
                 f"The scan is much softer than the original (about {structure.matched_softness_px:.1f} px of "
@@ -172,12 +202,14 @@ def run_comparison(
     if options.compare_color or options.compare_graphics or options.compare_text:
         needs_pixels = regions is None and pixel_detectors and not options.normalize_scan
         if needs_pixels or options.compare_text:
-            small_original, small_suspect, small_mask, scale = _to_working_resolution(
-                masked_original, masked_suspect, compare_mask, detection_config
-            )
             if options.normalize_scan:
-                small_original = normalize_for_scan(small_original)
-                small_suspect = normalize_for_scan(small_suspect)
+                # Text is read from the ink pictures at close to 300 DPI, not the coarser detection copy.
+                small_original, small_suspect, scale = _for_reading(ink_original, ink_suspect, detection_config)
+                small_mask = None
+            else:
+                small_original, small_suspect, small_mask, scale = _to_working_resolution(
+                    masked_original, masked_suspect, compare_mask, detection_config
+                )
 
             working_candidates: list[DiffCandidate] = []
             if needs_pixels and options.compare_color:
@@ -197,7 +229,11 @@ def run_comparison(
                     logger.warning("text detection skipped: %s", exc)
                     warnings.append(str(exc))
 
-            candidates += [_rescaled(candidate, 1 / scale) for candidate in working_candidates]
+            working_candidates = [_rescaled(candidate, 1 / scale) for candidate in working_candidates]
+            if options.normalize_scan:
+                # A scan too soft to hold small print cannot be read there either: not a difference.
+                working_candidates = _readable_only(working_candidates, unverifiable_area)
+            candidates += working_candidates
 
     # Symbols and Braille dots run at full resolution: a small barcode or a
     # 1 mm Braille dot does not survive the detection downscale.
@@ -252,11 +288,16 @@ def run_comparison(
         used_change_regions=used_regions,
         mode=mode,
         compared_outline=compared_area_outline(compare_mask),
+        ink_original=ink_original,
+        ink_suspect=ink_suspect,
     )
 
 
-_OUTLINE_LONG_EDGE_PX = 1400  # the outline is traced on a reduced copy of the mask
-_OUTLINE_EPSILON_PX = 1.2
+# The outline is traced on a copy of the mask no larger than this (a 300 DPI carton page is ~5000 px, so
+# nearly at full size: traced at 1400 px it strayed several pixels from the true edge, which shows when
+# zoomed in on a die line) and simplified to within this many pixels of that copy.
+_OUTLINE_LONG_EDGE_PX = 4000
+_OUTLINE_EPSILON_PX = 1.0
 _OUTLINE_MIN_AREA_FRACTION = 1e-4  # specks of the mask smaller than this share of the page are not shown
 
 
@@ -363,32 +404,107 @@ def _shifted(candidate: DiffCandidate, dx: float, dy: float) -> DiffCandidate:
     )
 
 
+@dataclass
+class _Area:
+    """One file's artwork area: inside its boundary, less what was erased by hand. Nothing chosen = the page."""
+
+    boundary: np.ndarray | None = None
+    erased: np.ndarray | None = None
+
+    @classmethod
+    def of(cls, image: np.ndarray, geometry: IsolationGeometry | None) -> "_Area":
+        shape = image.shape[:2]
+        return cls(boundary_mask(shape, geometry), erased_mask(shape, geometry))
+
+    @property
+    def is_whole_page(self) -> bool:
+        return self.boundary is None and self.erased is None
+
+    def blanked(self, image: np.ndarray) -> np.ndarray:
+        """The image with everything outside the area cleared to white (the image itself if nothing was chosen)."""
+        if self.is_whole_page:
+            return image
+        keep = np.ones(image.shape[:2], bool)
+        if self.boundary is not None:
+            keep &= self.boundary
+        if self.erased is not None:
+            keep &= ~self.erased
+        return apply_mask(image, keep)
+
+
+def _warped(mask: np.ndarray, transform: np.ndarray, reference_shape: tuple[int, int]) -> np.ndarray:
+    height, width = reference_shape
+    warped = cv2.warpPerspective(
+        mask.astype(np.uint8) * 255, transform, (width, height), flags=cv2.INTER_NEAREST, borderValue=0
+    )
+    return warped > 0
+
+
 def _build_compare_mask(
-    original_image: np.ndarray,
-    suspect_image: np.ndarray,
+    suspect_shape: tuple[int, int],
+    reference_shape: tuple[int, int],
     transform: np.ndarray,
-    original_geometry: IsolationGeometry | None,
-    suspect_geometry: IsolationGeometry | None,
+    original_area: _Area,
+    suspect_area: _Area,
 ) -> np.ndarray:
-    reference_shape = original_image.shape[:2]
-    mask = warp_validity_mask(suspect_image.shape[:2], transform, reference_shape)
+    """What is compared, in the original's pixels.
 
-    if original_geometry is not None:
-        mask &= resolve_keep_mask(reference_shape, original_geometry)
+    The artwork of either file: an area only the suspect has is compared too (where the original is
+    blank, what the suspect has there is a difference), rather than only where the two outlines
+    agree, which would hide a flap or a panel one of them lacks. A file with no area of its own is
+    taken to have the other's. Whatever was erased by hand, in either file, is left out.
+    """
+    mask = warp_validity_mask(suspect_shape, transform, reference_shape)
 
-    if suspect_geometry is not None:
-        suspect_keep = resolve_keep_mask(suspect_image.shape[:2], suspect_geometry)
-        height, width = reference_shape
-        warped_keep = cv2.warpPerspective(
-            suspect_keep.astype(np.uint8) * 255,
-            transform,
-            (width, height),
-            flags=cv2.INTER_NEAREST,
-            borderValue=0,
-        )
-        mask &= warped_keep > 0
+    areas = []
+    if original_area.boundary is not None:
+        areas.append(original_area.boundary)
+    if suspect_area.boundary is not None:
+        areas.append(_warped(suspect_area.boundary, transform, reference_shape))
+    if areas:
+        mask &= np.logical_or.reduce(areas)
 
+    if original_area.erased is not None:
+        mask &= ~original_area.erased
+    if suspect_area.erased is not None:
+        mask &= ~_warped(suspect_area.erased, transform, reference_shape)
     return mask
+
+
+_UNVERIFIABLE_SHARE = 0.5  # a word mostly inside an area the scan cannot hold is not reported
+
+
+def _readable_only(candidates: list[DiffCandidate], unverifiable: np.ndarray | None) -> list[DiffCandidate]:
+    """Drop the text findings that lie mostly where the two files cannot be compared at fine scale."""
+    if unverifiable is None:
+        return candidates
+    height, width = unverifiable.shape
+    kept = []
+    for candidate in candidates:
+        box = candidate.bbox
+        x0, y0 = max(0, int(box.x0)), max(0, int(box.y0))
+        x1, y1 = min(width, math.ceil(box.x1)), min(height, math.ceil(box.y1))
+        window = unverifiable[y0:y1, x0:x1]
+        if window.size and window.mean() > _UNVERIFIABLE_SHARE:
+            logger.info("text finding skipped: the scan cannot hold detail there", extra={"detail": candidate.detail})
+            continue
+        kept.append(candidate)
+    return kept
+
+
+def _for_reading(
+    original_ink: np.ndarray, suspect_ink: np.ndarray, config: DetectionConfig
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """The two ink pictures reduced (never enlarged) to the size text is read at, and the scale used."""
+    scale = min(1.0, config.ocr_long_edge_px / max(original_ink.shape[:2]))
+    if scale >= 1.0:
+        return original_ink, suspect_ink, 1.0
+    size = (max(1, round(original_ink.shape[1] * scale)), max(1, round(original_ink.shape[0] * scale)))
+    return (
+        cv2.resize(original_ink, size, interpolation=cv2.INTER_AREA),
+        cv2.resize(suspect_ink, size, interpolation=cv2.INTER_AREA),
+        scale,
+    )
 
 
 def _to_working_resolution(

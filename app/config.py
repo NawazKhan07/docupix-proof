@@ -209,6 +209,20 @@ class DetectionConfig:
     # scan cannot be told from JPEG ringing or noise at a corner.
     structure_footprint_sigmas: float = 2.0
 
+    # The ink picture of a file (Scan vs Digital; see scan_normalizer.ink_image): background colours
+    # removed to white and every ink black. A tint is estimated as the median over a window this share
+    # of the page's long edge (wider than any stroke, narrower than a panel); an ink is that many grey
+    # levels (0-255) darker than its tint to begin to show, and that many to be fully black; and a
+    # surround at least `ink_solid_level` dark is a solid graphic (a dark bar, a reversed-out block),
+    # not a tint, so it stays black.
+    ink_window_fraction: float = 0.02
+    ink_contrast_low: float = 48.0
+    ink_contrast_high: float = 108.0
+    ink_solid_level: float = 200.0
+    # Text is read from the ink pictures at no more than this long edge (px): Tesseract reads best at
+    # about 300 DPI, so an A4 page (3508 px) is read as it is and a larger sheet is reduced to this.
+    ocr_long_edge_px: int = 3600
+
     # Pharmacode (see pharmacode.py): bars of one length, at least this long and this
     # many times longer than thick (px at 300 DPI: ~1.4 mm up to ~50 mm), in a row of
     # 4 to 16 (the symbology's own limit is 2 to 16; 2-3 bars are indistinguishable
@@ -330,8 +344,15 @@ class SubjectConfig:
     # box is not taken for the artwork; "Border line" mode accepts any of at least this share.
     border_min_area_fraction: float = 0.08
     border_min_area_fraction_forced: float = 0.005
-    # Thin protrusions (leader lines) narrower than twice this share of the long edge are shaved off.
-    border_shave_fraction: float = 0.0008
+    # Thin protrusions (a leader line, a dimension line and its arrowheads, a label hung on one)
+    # narrower than twice this share of the long edge are shaved off; what is left of the outline
+    # is then grown back by the same amount, so real corners keep their points.
+    border_shave_fraction: float = 0.0016
+    # Comparing starts this many pixels inside a lifted outline's own edge, beyond the width of the
+    # drawn line: the die line itself is not printed artwork (a scan of the printed sheet has none),
+    # and the fringe of a colour-lifted edge is where a scan's blur and shadow are.
+    border_line_margin_px: float = 1.5
+    colour_edge_inset_px: float = 3.0
     # An enclosure this much of the sheet is a frame around it, not the artwork.
     border_frame_fraction: float = 0.92
     # How long a press must be held to lift, and how far it may drift while held (ms, screen px).

@@ -14,14 +14,18 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from app.engine.isolation.erase_mask import rasterize_erase_strokes
+from app.engine.isolation.erase_mask import rasterize_erase_regions
 from app.models.isolation import IsolationGeometry, NormalizedPolygon, NormalizedRect
 
 
 def boundary_to_mask(
-    shape: tuple[int, int], boundary: NormalizedRect | NormalizedPolygon
+    shape: tuple[int, int], boundary: NormalizedRect | NormalizedPolygon, inset_px: float = 0.0
 ) -> np.ndarray:
-    """A boolean mask (True = inside the artwork boundary, keep)."""
+    """A boolean mask (True = inside the artwork boundary, keep).
+
+    `inset_px` starts a polygon's mask that far inside its edge: the edge is drawn over as a
+    line twice that wide, which is far cheaper than eroding a page-sized mask and just as round.
+    """
     height, width = shape
     mask = np.zeros((height, width), dtype=np.uint8)
     if isinstance(boundary, NormalizedRect):
@@ -30,19 +34,33 @@ def boundary_to_mask(
     else:
         points = np.array(boundary.to_pixels(width, height), dtype=np.int32)
         cv2.fillPoly(mask, [points], 255)
+        if inset_px > 0:
+            cv2.polylines(mask, [points], True, 0, thickness=max(1, int(round(2 * inset_px))))
     return mask.astype(bool)
+
+
+def boundary_mask(shape: tuple[int, int], geometry: IsolationGeometry | None) -> np.ndarray | None:
+    """The artwork area chosen for one file, or None if no area was chosen (the whole page)."""
+    if geometry is None or geometry.boundary is None:
+        return None
+    inset_px = geometry.edge_inset_norm * max(shape)
+    return boundary_to_mask(shape, geometry.boundary, inset_px)
+
+
+def erased_mask(shape: tuple[int, int], geometry: IsolationGeometry | None) -> np.ndarray | None:
+    """What was erased by hand from one file, or None if nothing was."""
+    if geometry is None or not geometry.erase_regions:
+        return None
+    return rasterize_erase_regions(shape, geometry.erase_regions, geometry.erase_brush_radius_norm)
 
 
 def resolve_keep_mask(shape: tuple[int, int], geometry: IsolationGeometry) -> np.ndarray:
     """The final boolean mask for one file: inside the boundary AND not erased."""
-    if geometry.boundary is None:
+    keep = boundary_mask(shape, geometry)
+    if keep is None:
         keep = np.ones(shape, dtype=bool)
-    else:
-        keep = boundary_to_mask(shape, geometry.boundary)
-    if geometry.erase_regions:
-        erased = rasterize_erase_strokes(
-            shape, geometry.erase_regions, geometry.erase_brush_radius_norm
-        )
+    erased = erased_mask(shape, geometry)
+    if erased is not None:
         keep = keep & ~erased
     return keep
 

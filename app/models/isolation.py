@@ -60,12 +60,18 @@ class IsolationGeometry:
     """The resolved artwork boundary + exclusions for one file (original or suspect)."""
 
     boundary: NormalizedRect | NormalizedPolygon | None = None
-    erase_regions: list[NormalizedPolygon] = field(default_factory=list)
+    # Parts to leave out: a NormalizedRect is a region, a NormalizedPolygon a freehand stroke
+    # painted with `erase_brush_radius_norm`.
+    erase_regions: list[NormalizedRect | NormalizedPolygon] = field(default_factory=list)
     erase_brush_radius_norm: float = 0.01
     rotation_deg: float = 0.0  # auto-rotate correction applied on Save Crop (FR-3.2)
     # Where the boundary came from: "manual" (a crop, or an exact traced dieline), "lifted"
     # (segmented from its background) or "placed" (another file's outline laid over this one).
     boundary_origin: str = "manual"
+    # How far inside a polygon boundary comparing starts, as a share of the page's long edge: a lifted
+    # outline includes the die line drawn on it (or the blurred fringe of a photographed edge), which is
+    # not printed artwork. Rectangles are not inset -- a crop's edge is not a line.
+    edge_inset_norm: float = 0.0
 
     @property
     def anchors_alignment(self) -> bool:

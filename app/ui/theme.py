@@ -196,6 +196,13 @@ QGraphicsView {{
     background: #fafbfc;
 }}
 
+QFrame[role="banner"] {{
+    background: {ACCENT_SOFT};
+    border: 1px solid {ACCENT};
+    border-radius: 8px;
+}}
+QFrame[role="banner"] QLabel {{ background: transparent; color: {TEXT_PRIMARY}; }}
+
 QLabel[role="statusbar"] {{
     background: {ACCENT_SOFT};
     color: {ACCENT_HOVER};
