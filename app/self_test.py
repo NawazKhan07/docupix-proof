@@ -192,6 +192,19 @@ def run(report_path: Path | None = None) -> int:
 
     tesseract = configure_ocr()
     record("OCR engine (informational)", True, str(tesseract) if tesseract else "not found: text comparison will be reported as unavailable")
+    if tesseract is not None:
+        # An engine that is found must also work: read a line of text back from a picture.
+        try:
+            import cv2
+            import numpy as np
+            import pytesseract
+
+            page = np.full((160, 900, 3), 255, np.uint8)
+            cv2.putText(page, "PARACETAMOL 500 mg", (30, 105), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (10, 10, 10), 4, cv2.LINE_AA)
+            text = pytesseract.image_to_string(page, config="--psm 7").strip()
+            record("reading text (Tesseract)", "PARACETAMOL" in text.upper(), f"read {text!r}")
+        except Exception as exc:
+            record("reading text (Tesseract)", False, f"{type(exc).__name__}: {exc}")
 
     failed = [name for name, ok, _detail in checks if not ok]
     say("PASSED" if not failed else f"FAILED: {', '.join(failed)}")

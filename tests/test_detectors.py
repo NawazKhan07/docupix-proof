@@ -1,23 +1,37 @@
 from __future__ import annotations
 
-import shutil
 
 import cv2
 import numpy as np
+import pytesseract
 import pytest
 import zxingcpp
 
 from app.config import DetectionConfig
 from app.engine.detectors import barcode_diff, braille_diff, color_diff, graphics_diff, text_diff
+from app.engine.ocr_locator import find_tesseract
 from app.engine.preprocessing.scan_normalizer import normalize_for_scan
 from app.models.diff import DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
 
+# The application finds Tesseract itself (its usual install folders, not only PATH), so the tests ask the same way.
 tesseract_required = pytest.mark.skipif(
-    shutil.which("tesseract") is None,
+    find_tesseract() is None,
     reason="Tesseract OCR binary is not installed (pytesseract only wraps it)",
 )
+
+
+@pytest.fixture
+def real_ocr(monkeypatch):
+    """pytesseract pointed at the Tesseract the application would use (restored afterwards)."""
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(find_tesseract()))
+
+
+@pytest.fixture
+def no_ocr(monkeypatch):
+    """pytesseract pointed at nothing, whether or not Tesseract is installed here."""
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "no-such-tesseract-executable")
 
 
 def _artwork(width: int = 600, height: int = 400) -> np.ndarray:
@@ -295,16 +309,14 @@ def test_braille_detector_reports_a_moved_dot_rather_than_a_missing_plus_added_p
 # ---------------------------------------------------------------------------
 
 
-def test_text_detector_reports_ocr_unavailable_clearly():
+def test_text_detector_reports_ocr_unavailable_clearly(no_ocr):
     """Without Tesseract the detector must say so, not report 'no differences'."""
-    if shutil.which("tesseract") is not None:
-        pytest.skip("Tesseract is installed, so this failure path can't be exercised")
     with pytest.raises(text_diff.OcrUnavailableError, match="not installed"):
         text_diff.detect(_artwork(), _artwork(), CONFIG)
 
 
 @tesseract_required
-def test_text_detector_finds_a_changed_number():
+def test_text_detector_finds_a_changed_number(real_ocr):
     original = _artwork()
     suspect = np.full(original.shape, 255, dtype=np.uint8)
     cv2.rectangle(suspect, (40, 30), (560, 370), (0, 0, 0), 3)
@@ -317,6 +329,6 @@ def test_text_detector_finds_a_changed_number():
 
 
 @tesseract_required
-def test_text_detector_finds_no_differences_between_identical_pages():
+def test_text_detector_finds_no_differences_between_identical_pages(real_ocr):
     original = _artwork()
     assert text_diff.detect(original, original.copy(), CONFIG) == []

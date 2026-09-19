@@ -222,9 +222,16 @@ def run_comparison(
                 )
             if options.compare_text:
                 try:
-                    working_candidates += text_diff.detect(
-                        small_original, small_suspect, detection_config
-                    )
+                    if options.normalize_scan:
+                        scan_text = text_diff.detect_scan(small_original, small_suspect, detection_config)
+                        working_candidates += scan_text.candidates
+                        if scan_text.unreadable_lines:
+                            warnings.append(
+                                f"{scan_text.unreadable_lines} line(s) of small print are in the scan but too soft to "
+                                "read, so their text was not compared. Rescan at a higher resolution to check them."
+                            )
+                    else:
+                        working_candidates += text_diff.detect(small_original, small_suspect, detection_config)
                 except OcrUnavailableError as exc:
                     logger.warning("text detection skipped: %s", exc)
                     warnings.append(str(exc))

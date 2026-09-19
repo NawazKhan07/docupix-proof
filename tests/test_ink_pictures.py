@@ -356,9 +356,9 @@ def test_text_is_read_from_the_ink_pictures(monkeypatch):
 
     def fake_detect(original, suspect, config):
         seen.append((original, suspect))
-        return []
+        return text_diff.TextScanResult([])
 
-    monkeypatch.setattr(text_diff, "detect", fake_detect)
+    monkeypatch.setattr(text_diff, "detect_scan", fake_detect)
     outcome = run_comparison(page, simulate_scan(page, LIGHT), ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
 
     assert len(seen) == 1 and seen[0][0].ndim == 2 and seen[0][0].dtype == np.uint8

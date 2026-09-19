@@ -260,6 +260,27 @@ class DetectionConfig:
     # Text (OCR).
     ocr_min_confidence: float = 40.0
     text_move_tolerance_px: float = 6.0
+    # Reading a SCAN is noisier than reading the digital file it came from. Compared page against page,
+    # a changed digit reshuffled the reading order and one identical layout gave 23 false 'changes'
+    # (a case or comma, an l read as i, a line grouped differently, rotated text read as junk). So
+    # Scan vs Digital anchors on the DIGITAL file's own lines: each line's window is read again, alone, in
+    # both files; the words are compared without case, punctuation or the l/i/1 and o/0 confusions (and
+    # nothing looser: one letter is also what a real change to a word is), and words read less surely
+    # than these floors are ignored. A line the scan yields nothing for is REMOVED only if
+    # the ink is gone too (under this share of the digital's); with the ink still there the scan is simply
+    # too soft to read it, which is reported as unreadable, not as a change. Text that is only in the scan
+    # is found by reading the whole scan and keeping confidently read words outside every digital line
+    # where the digital has no ink. Moves are left to the graphics comparison, which sees where ink is.
+    ocr_min_confidence_scan: float = 55.0
+    ocr_short_word_confidence: float = 75.0
+    text_line_pad_px: int = 8
+    text_removed_ink_share: float = 0.35
+    text_added_confidence: float = 70.0
+    text_added_ink_share: float = 0.25
+    # A word read differently in the scan whose ink lies, at least this much of it each way (within 2 px), on the
+    # digital word's ink was very probably only misread: it is kept, ranked Minor and worded as a likely misread.
+    # (A real one-letter change also matches this closely, so it cannot be dropped -- only ranked.)
+    text_misread_ink_agreement: float = 0.96
 
     # Symbols (barcode / pharmacode / QR).
     symbol_match_tolerance_px: float = 60.0

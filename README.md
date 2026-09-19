@@ -46,8 +46,14 @@ scan's cream paper, uneven lighting -- comes out white, and everything printed o
 whatever its colour (cyan, yellow and orange lettering included; a solid dark bar stays a black bar, its
 white lettering staying white). Then:
 
-* **Text** is read from those two pictures (Tesseract) and compared word by word, so "500 mg" against
-  "250 mg" is one change with both values. Words the scan is too soft to hold are not reported as missing.
+* **Text** is read (Tesseract) from those two pictures, anchored on the *digital file's own lines*: each
+  line's window is read again, alone, in both files, so a changed word cannot reshuffle the reading order.
+  Case, punctuation and l/i/1 or o/0 confusions are ignored, and a number must match exactly, so "500 mg"
+  against "250 mg" is one change showing both values. A word the scan reads differently although its ink
+  matches the digital word's is listed but ranked **Minor** ("likely a misread of the scan"), so real changes
+  stay on top without hiding a one-letter change. A line whose ink is in the scan but too soft to read is
+  reported as *unreadable*, not as a change; a line whose ink is gone is *removed*; text only the scan has
+  is *added*. Moves are left to the graphics comparison.
 * **Graphics and barcodes** are compared by where the ink is, tolerating a scan's softness, blur, fatter
   strokes, tilt and noise. Barcodes are **not decoded** in this mode; a bar added, missing or moved is
   reported as a physical difference.
@@ -147,8 +153,10 @@ folder instead of one file (faster to start).
 
 ## Known limits and open items
 
-* **Text comparison needs Tesseract**, and has only been exercised against the synthetic
-  suite where it is installed.
+* **Text comparison needs Tesseract** (the UB-Mannheim Windows installer, default folder; `pip install tesseract`
+  is an unrelated package). On a real digital-vs-scan pair (Amphotret) it finds a changed digit or word and ranks
+  its own misreads of soft small print as Minor, but a few false *serious* findings can remain around tiny,
+  condensed print; rescan at a higher resolution to check such lines.
 * **Scans:** detection thresholds are measured from each image (noise, softness,
   registration), but have been validated on *simulated* scans, not a range of real
   scanners. Fine print softer than the scan can hold is reported as unverifiable rather

@@ -37,6 +37,11 @@ COLOUR_MAJOR_DELTA_E = 5.0
 # square at 300 DPI) is reported as Minor rather than Major.
 GRAPHICS_MAJOR_MIN_AREA_PX = 2500.0
 
+# A scan's text is sometimes read differently from the file it was made from although the ink is the same
+# (a soft, fat small print). The text detector marks such a reading with this confidence, and it is ranked
+# Minor: still listed, so a real change in small print is not hidden, but not shouting at the reviewer.
+LIKELY_MISREAD_CONFIDENCE = 0.25
+
 _CONTENT_CHANGES = frozenset({DiffSubtype.CHANGED, DiffSubtype.ADDED, DiffSubtype.REMOVED})
 _TEXT_TYPES = frozenset({DiffType.TEXT, DiffType.NUMBER})
 
@@ -50,6 +55,7 @@ class SeverityRule:
     subtypes: frozenset[DiffSubtype] | None = None
     min_magnitude: float | None = None  # inclusive; colour: peak dE, graphics: 1 - SSIM
     min_area_px: float | None = None  # inclusive; box area in the shared space
+    max_confidence: float | None = None  # inclusive; how surely the detector read it
 
     def matches(self, candidate: DiffCandidate) -> bool:
         if self.types is not None and candidate.type not in self.types:
@@ -59,6 +65,8 @@ class SeverityRule:
         if self.min_magnitude is not None and candidate.magnitude < self.min_magnitude:
             return False
         if self.min_area_px is not None and candidate.bbox.area < self.min_area_px:
+            return False
+        if self.max_confidence is not None and candidate.confidence > self.max_confidence:
             return False
         return True
 
@@ -71,6 +79,9 @@ DEFAULT_RULES: tuple[SeverityRule, ...] = (
     # Text and numbers: content changes are Critical (a dose, batch or expiry
     # is exactly what must not slip through); a pure move is Major, since
     # regulated text often has to sit in a defined place.
+    SeverityRule(
+        Severity.MINOR, types=_TEXT_TYPES, subtypes=_CONTENT_CHANGES, max_confidence=LIKELY_MISREAD_CONFIDENCE
+    ),
     SeverityRule(Severity.CRITICAL, types=_TEXT_TYPES, subtypes=_CONTENT_CHANGES),
     SeverityRule(Severity.MAJOR, types=_TEXT_TYPES, subtypes=frozenset({DiffSubtype.MOVED})),
     # Colour, by how far it moved (Architecture: "colour dE above a threshold

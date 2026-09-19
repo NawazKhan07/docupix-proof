@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 
 import cv2
 import numpy as np
+import pytesseract
 import pytest
 
 from app.config import AppConfig
@@ -173,10 +173,8 @@ def test_content_outside_the_dieline_is_never_compared():
     assert restricted.candidates == []  # invisible once the dieline is applied
 
 
-@pytest.mark.skipif(
-    shutil.which("tesseract") is not None, reason="Tesseract installed; no warning expected"
-)
-def test_missing_ocr_is_reported_as_a_warning_without_stopping_other_detectors():
+def test_missing_ocr_is_reported_as_a_warning_without_stopping_other_detectors(monkeypatch):
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", "no-such-tesseract-executable")  # installed or not
     original = _artwork()
     suspect = _recolour_block(original)
 

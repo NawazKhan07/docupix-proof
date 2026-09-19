@@ -18,7 +18,10 @@ EXE = "tesseract.exe" if sys.platform == "win32" else "tesseract"
 def _isolated(monkeypatch, tmp_path):
     """Nothing on this machine may influence the search; the pytesseract setting is restored."""
     monkeypatch.delenv(ocr_locator.EXPLICIT_ENV, raising=False)
-    monkeypatch.delenv("TESSDATA_PREFIX", raising=False)
+    # configure_ocr() writes TESSDATA_PREFIX itself: set it first so the teardown puts the environment back as it was
+    # (a variable left pointing into a temporary folder broke every later real reading of text).
+    monkeypatch.setenv("TESSDATA_PREFIX", "placeholder")
+    monkeypatch.delenv("TESSDATA_PREFIX")
     monkeypatch.setattr(ocr_locator.shutil, "which", lambda name: None)
     monkeypatch.setattr(ocr_locator, "_WINDOWS_FOLDERS", ())
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
