@@ -105,6 +105,27 @@ def run(report_path: Path | None = None) -> int:
         except Exception as exc:
             record("PDF rendering", False, f"{type(exc).__name__}: {exc}")
 
+        # Lifting the artwork: the die-cut line of a PDF page, and a picture by colour (GrabCut).
+        try:
+            import cv2
+            import numpy as np
+
+            from app.config import SubjectConfig
+            from app.engine.isolation.subject_lifter import lift_subject
+
+            with load_artwork(pdf) as artwork:
+                page_image = artwork.render()
+                by_border = lift_subject(page_image, (page_image.shape[1] / 2, page_image.shape[0] / 2),
+                                         SubjectConfig(), page=artwork.pdf_page(0), dpi=300, method="border")
+            scene = np.full((600, 800, 3), 150, np.uint8)
+            cv2.rectangle(scene, (200, 150), (600, 450), (200, 60, 50), -1)
+            cv2.circle(scene, (400, 300), 60, (240, 240, 240), -1)
+            by_colour = lift_subject(scene, (300, 200), SubjectConfig(), method="colour")
+            ok = by_border.source == "border" and 0.4 < by_border.area_fraction < 0.9 and 0.2 < by_colour.area_fraction < 0.35
+            record("lifting the artwork", ok, f"border line {100 * by_border.area_fraction:.0f}%, colour {100 * by_colour.area_fraction:.0f}%")
+        except Exception as exc:
+            record("lifting the artwork", False, f"{type(exc).__name__}: {exc}")
+
         started = time.perf_counter()
         outcome, error = _run_job(ComparisonRequest(original, suspect, ComparisonMode.AUTOMATIC, AppConfig()))
         if outcome is None:
