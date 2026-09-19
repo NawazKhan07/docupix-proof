@@ -15,6 +15,7 @@ each decide for themselves:
 from __future__ import annotations
 
 import logging
+import math
 from typing import Callable
 from dataclasses import dataclass, field, replace
 
@@ -264,12 +265,19 @@ def effective_detection_config(
     """
     if alignment.residual_error_px > config.exact_alignment_residual_px:
         return config, "tolerant"
+    residual = alignment.residual_error_px
+    intensity = min(
+        config.exact_max_intensity_tolerance,
+        max(config.exact_intensity_tolerance, math.ceil(config.exact_levels_per_px * residual)),
+    )
+    delta_e = min(config.exact_max_delta_e, max(config.color_delta_e_threshold, 1.0 + config.exact_delta_e_per_px * residual))
     exact = replace(
         config,
         registration_tolerance_px=0,
         color_registration_tolerance_px=0,
         edge_tolerance_px=0,
-        registration_intensity_tolerance=config.exact_intensity_tolerance,
+        registration_intensity_tolerance=intensity,
+        color_delta_e_threshold=delta_e,
         color_min_area_px=config.exact_min_area_px,
         ssim_min_area_px=config.exact_min_area_px,
     )
@@ -279,7 +287,7 @@ def effective_detection_config(
 def _region_threshold(config: DetectionConfig, profile: str) -> int:
     """How big a pixel change must be to open a region (see `find_change_regions`)."""
     if profile == "exact":
-        return min(config.region_diff_threshold, config.exact_intensity_tolerance * 2)
+        return min(config.region_diff_threshold, config.registration_intensity_tolerance * 2)
     return config.region_diff_threshold
 
 

@@ -19,10 +19,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import RuntimeConfig
+from app.config import AppConfig, RuntimeConfig
 from app.engine.file_loader import ArtworkLoadError, LoadedArtwork, SUPPORTED_EXTENSIONS, load_artwork
+from app.engine.isolation.cutout import Cutout
 from app.models.isolation import IsolationGeometry
-from app.ui.isolation_dialog import IsolationDialog
+from app.ui.isolation_dialog import IsolationDialog, SubjectReference
 from app.ui.theme import set_variant
 
 _FILE_DIALOG_FILTER = "Artwork files (*" + " *".join(sorted(SUPPORTED_EXTENSIONS)) + ")"
@@ -33,12 +34,18 @@ class UploadSlot(QWidget):
 
     changed = Signal()
 
-    def __init__(self, title: str, parent=None, limits: RuntimeConfig | None = None):
+    def __init__(
+        self, title: str, parent=None, limits: RuntimeConfig | None = None, config: AppConfig | None = None
+    ):
         super().__init__(parent)
         self.title = title
-        self.limits = limits or RuntimeConfig()
+        self.config = config or AppConfig()
+        self.limits = limits or self.config.runtime
         self.loaded: Optional[LoadedArtwork] = None
         self.geometry: Optional[IsolationGeometry] = None
+        # The artwork lifted from this file (if any), which the other file can lay over itself.
+        self.cutout: Optional[Cutout] = None
+        self.partner: Optional[UploadSlot] = None  # the other slot; set by the panel
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -91,6 +98,7 @@ class UploadSlot(QWidget):
             self.loaded.close()
         self.loaded = artwork
         self.geometry = None
+        self.cutout = None
         self.isolate_button.setEnabled(True)
         set_variant(self.status_pill, "pill", "loaded")
         self.status_pill.setText("Loaded")
@@ -99,9 +107,15 @@ class UploadSlot(QWidget):
 
     def _on_edit_artwork_area(self) -> None:
         assert self.loaded is not None
-        dialog = IsolationDialog(self.loaded, self.title, self)
+        reference = None
+        if self.partner is not None and self.partner.cutout is not None and self.partner.loaded is not None:
+            reference = SubjectReference(self.partner.cutout, self.partner.loaded.path.name)
+        dialog = IsolationDialog(self.loaded, self.title, self, reference=reference, config=self.config)
         if dialog.exec() == IsolationDialog.DialogCode.Accepted:
             self.geometry = dialog.result_geometry()
+            lifted = dialog.result_cutout()
+            if lifted is not None:  # keep an earlier lift when this visit did not make a new one
+                self.cutout = lifted
             self._refresh_status()
             self.changed.emit()
 
@@ -114,8 +128,14 @@ class UploadSlot(QWidget):
                 pages += " \u2014 only page 1 is compared"
         geometry_note = ""
         if self.geometry is not None and self.geometry.boundary is not None:
-            kind = "polygon" if hasattr(self.geometry.boundary, "points") else "crop"
-            geometry_note = f" · {kind} area set"
+            origin = self.geometry.boundary_origin
+            if origin == "lifted":
+                geometry_note = " · artwork lifted"
+            elif origin == "placed":
+                geometry_note = " · trimmed to the placed outline"
+            else:
+                kind = "polygon" if hasattr(self.geometry.boundary, "points") else "crop"
+                geometry_note = f" · {kind} area set"
         self.detail_label.setText(
             f"{self.loaded.path.name} ({self.loaded.kind}{pages}){geometry_note}"
         )
@@ -125,6 +145,7 @@ class UploadSlot(QWidget):
             self.loaded.close()
         self.loaded = None
         self.geometry = None
+        self.cutout = None
         self.isolate_button.setEnabled(False)
         set_variant(self.status_pill, "pill", "empty")
         self.status_pill.setText("Not loaded")
@@ -137,13 +158,14 @@ class UploadPanel(QGroupBox):
 
     filesChanged = Signal()
 
-    def __init__(self, parent=None, limits: RuntimeConfig | None = None):
+    def __init__(self, parent=None, limits: RuntimeConfig | None = None, config: AppConfig | None = None):
         super().__init__("Upload", parent)
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
 
-        self.original_slot = UploadSlot("Original", self, limits)
-        self.suspect_slot = UploadSlot("Suspect", self, limits)
+        self.original_slot = UploadSlot("Original", self, limits, config)
+        self.suspect_slot = UploadSlot("Suspect", self, limits, config)
+        self.original_slot.partner, self.suspect_slot.partner = self.suspect_slot, self.original_slot
 
         divider = QFrame(self)
         divider.setFrameShape(QFrame.Shape.HLine)

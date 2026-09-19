@@ -88,8 +88,12 @@ def _keep_mask(image: np.ndarray, geometry: IsolationGeometry | None) -> np.ndar
 
 
 def _polygon_px(image: np.ndarray, geometry: IsolationGeometry | None) -> np.ndarray | None:
-    """The geometry's boundary as pixel coordinates, if it is a traced polygon."""
-    if geometry is None or not isinstance(geometry.boundary, NormalizedPolygon):
+    """The geometry's boundary as pixel coordinates, if it is a polygon fit to register on.
+
+    A polygon that was lifted or placed (see `IsolationGeometry.anchors_alignment`) still
+    masks the comparison but is not used for registration.
+    """
+    if geometry is None or not isinstance(geometry.boundary, NormalizedPolygon) or not geometry.anchors_alignment:
         return None
     height, width = image.shape[:2]
     return np.array(

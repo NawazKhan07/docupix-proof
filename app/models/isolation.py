@@ -12,7 +12,8 @@ from enum import Enum
 
 class IsolationTool(Enum):
     CROP = "crop"
-    POLYGON_TRACE = "polygon_trace"
+    LIFT_SUBJECT = "lift_subject"  # press and hold on the artwork to lift it from its background
+    PLACE_OUTLINE = "place_outline"  # lay another file's lifted outline over this one, and trim to it
     ERASE = "erase"
 
 
@@ -62,3 +63,18 @@ class IsolationGeometry:
     erase_regions: list[NormalizedPolygon] = field(default_factory=list)
     erase_brush_radius_norm: float = 0.01
     rotation_deg: float = 0.0  # auto-rotate correction applied on Save Crop (FR-3.2)
+    # Where the boundary came from: "manual" (a crop, or an exact traced dieline), "lifted"
+    # (segmented from its background) or "placed" (another file's outline laid over this one).
+    boundary_origin: str = "manual"
+
+    @property
+    def anchors_alignment(self) -> bool:
+        """Whether a polygon boundary may be used to REGISTER the files, not just to mask them.
+
+        A lifted outline is only as exact as the segmentation, and a placed one is the
+        other file's outline moved by hand: registering two files on such outlines would
+        report a fit that is largely an artefact of how they were drawn, and a residual
+        that means nothing ("do not silently claim perfect alignment"). They trim the
+        comparison area; the artwork's own features do the registering.
+        """
+        return self.boundary_origin not in ("lifted", "placed")

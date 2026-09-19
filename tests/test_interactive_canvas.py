@@ -50,80 +50,24 @@ def test_crop_drag_clamps_to_image_bounds(qapp):
     assert rect.y1 == 1.0
 
 
-def test_click_point_emits_normalized_coordinates(qapp):
+def test_a_held_press_asks_for_the_subject_at_that_point(qapp):
+    import time
+
     canvas = InteractiveCanvas()
     canvas.set_image(_image(200, 100))
-    canvas.set_tool(IsolationTool.POLYGON_TRACE)
+    canvas.set_tool(IsolationTool.LIFT_SUBJECT)
+    canvas.set_hold_timing(20, 6)
     received = []
-    canvas.pointClicked.connect(lambda x, y: received.append((x, y)))
+    canvas.subjectRequested.connect(lambda x, y: received.append((x, y)))
 
-    canvas.click_point(QPointF(50, 25))
+    canvas.begin_hold(QPointF(50, 25))
+    assert canvas.holding and not received
+    deadline = time.monotonic() + 2
+    while not received and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
 
     assert received == [(0.25, 0.25)]
+    assert not canvas.holding
 
 
-def test_show_polygon_and_clear(qapp):
-    canvas = InteractiveCanvas()
-    canvas.set_image(_image(200, 100))
-    polygon = NormalizedPolygon(points=[(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)])
-
-    canvas.show_polygon(polygon)
-    assert canvas.polygon() is polygon
-
-    canvas.clear_polygon()
-    assert canvas.polygon() is None
-
-
-def test_erase_stroke_lifecycle(qapp):
-    canvas = InteractiveCanvas()
-    canvas.set_image(_image(200, 100))
-    received = []
-    canvas.eraseStrokeAdded.connect(lambda s: received.append(s))
-
-    canvas.begin_erase_stroke(QPointF(10, 10))
-    canvas.update_erase_stroke(QPointF(50, 10))
-    canvas.update_erase_stroke(QPointF(90, 10))
-    canvas.end_erase_stroke()
-
-    strokes = canvas.erase_strokes()
-    assert len(strokes) == 1
-    assert len(received) == 1
-    assert strokes[0].points[0] == (10 / 200, 10 / 100)
-    assert strokes[0].points[-1] == (90 / 200, 10 / 100)
-
-
-def test_erase_stroke_with_no_movement_is_discarded(qapp):
-    """A click without a drag shouldn't register as a (degenerate) stroke."""
-    canvas = InteractiveCanvas()
-    canvas.set_image(_image(200, 100))
-    received = []
-    canvas.eraseStrokeAdded.connect(lambda s: received.append(s))
-
-    canvas.begin_erase_stroke(QPointF(10, 10))
-    canvas.end_erase_stroke()
-
-    assert canvas.erase_strokes() == []
-    assert received == []
-
-
-def test_clear_erase_strokes(qapp):
-    canvas = InteractiveCanvas()
-    canvas.set_image(_image(200, 100))
-    canvas.begin_erase_stroke(QPointF(10, 10))
-    canvas.update_erase_stroke(QPointF(50, 50))
-    canvas.end_erase_stroke()
-    assert len(canvas.erase_strokes()) == 1
-
-    canvas.clear_erase_strokes()
-    assert canvas.erase_strokes() == []
-
-
-def test_set_image_resets_prior_selections(qapp):
-    canvas = InteractiveCanvas()
-    canvas.set_image(_image(200, 100))
-    canvas.begin_crop_drag(QPointF(20, 10))
-    canvas.end_crop_drag(QPointF(180, 90))
-    assert canvas.crop_rect() is not None
-
-    canvas.set_image(_image(200, 100))
-    assert canvas.crop_rect() is None

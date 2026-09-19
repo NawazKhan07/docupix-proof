@@ -39,39 +39,36 @@ def test_save_crop_applies_auto_rotate_and_returns_geometry(qapp, tmp_path: Path
         artwork.close()
 
 
-def test_point_click_traces_dieline_on_vector_pdf(qapp, synthetic_pdf: Path):
+def test_a_held_press_lifts_the_area_inside_a_pdfs_die_line(qapp, synthetic_pdf: Path):
+    """The synthetic page is a vector rectangle (the die line) with text inside it."""
     artwork = load_artwork(synthetic_pdf)
     try:
         dialog = IsolationDialog(artwork, "Original")
-        dialog.canvas.set_tool(IsolationTool.POLYGON_TRACE)
+        dialog.canvas.set_tool(IsolationTool.LIFT_SUBJECT)
 
-        height, width = dialog._rendered.shape[:2]
-        dialog.canvas.click_point(QPointF(5, height / 2))  # near left dieline edge
+        dialog._on_subject_requested(0.5, 0.5)
 
         polygon = dialog.canvas.polygon()
         assert polygon is not None
-        assert len(polygon.points) == 4
+        xs = [x for x, _ in polygon.points]
+        ys = [y for _, y in polygon.points]
+        assert min(xs) == pytest.approx(20 / 400, abs=0.01) and max(xs) == pytest.approx(380 / 400, abs=0.01)
+        assert min(ys) == pytest.approx(20 / 300, abs=0.01) and max(ys) == pytest.approx(280 / 300, abs=0.01)
     finally:
         artwork.close()
 
 
-def test_point_click_shows_message_when_no_dieline_found(qapp, tmp_path: Path, monkeypatch):
-    # QMessageBox.information() would otherwise block on a real (modal) event
-    # loop waiting for a user click; there's no user under the offscreen
-    # platform, so replace it with a no-op for this test.
-    import app.ui.isolation_dialog as isolation_dialog_module
-
-    monkeypatch.setattr(isolation_dialog_module.QMessageBox, "information", lambda *a, **k: None)
-
+def test_nothing_to_lift_says_so_in_the_status_line(qapp, tmp_path: Path):
     blank = np.full((100, 100, 3), 255, dtype=np.uint8)
     path = tmp_path / "blank.png"
     Image.fromarray(blank).save(path)
     artwork = load_artwork(path)
     try:
         dialog = IsolationDialog(artwork, "Original")
-        dialog.canvas.set_tool(IsolationTool.POLYGON_TRACE)
-        dialog.canvas.click_point(QPointF(50, 50))
+        dialog.canvas.set_tool(IsolationTool.LIFT_SUBJECT)
+        dialog._on_subject_requested(0.5, 0.5)
         assert dialog.canvas.polygon() is None
+        assert "Press and hold on the artwork" in dialog.status_label.text() or "too small" in dialog.status_label.text()
     finally:
         artwork.close()
 

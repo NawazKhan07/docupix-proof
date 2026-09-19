@@ -86,6 +86,15 @@ class DetectionConfig:
     exact_min_area_px: int = 6
     # Smallest per-channel change worth reporting when alignment is exact.
     exact_intensity_tolerance: int = 3
+    # "Exact" is not "zero": a residual of a few hundredths of a pixel still moves a black-on-white
+    # edge by that share of its contrast (255 grey levels, ~100 delta-E), and at full sensitivity
+    # that shows up as hairline 'differences' along every strong edge. So the tolerances are never
+    # tighter than the residual measured for THIS pair explains (1.5x, in grey levels; 3x, in
+    # delta-E), up to these caps -- a real change is far larger.
+    exact_levels_per_px: float = 380.0
+    exact_delta_e_per_px: float = 300.0
+    exact_max_intensity_tolerance: int = 24
+    exact_max_delta_e: float = 8.0
 
     # Registration tolerance, in detection-resolution pixels. Any rotation
     # between the two files means the suspect is resampled, so thin strokes
@@ -271,6 +280,61 @@ class ClusteringConfig:
 
 
 @dataclass(frozen=True)
+class SubjectConfig:
+    """Lifting the artwork off its background (`app/engine/isolation/subject_lifter.py`)."""
+
+    # Segmentation runs on a reduced copy of the page, then the outline is refined at full
+    # resolution along its edge. A carton at 300 DPI is ~5000 px tall; 800 is what keeps a
+    # lift to a fraction of a second.
+    working_long_edge_px: int = 720
+    # The outer strip of the page is where the background is looked for.
+    border_band_fraction: float = 0.03
+    # The press point marks a disc of definite subject this big (share of the page's short side).
+    seed_radius_fraction: float = 0.02
+    grabcut_iterations: int = 4
+    # A pixel this close (CIELAB) to the background's colours, and closer to it than to the
+    # subject at the press point, starts out as background -- if it is joined to the page
+    # edge through such pixels, so a background-coloured panel INSIDE the artwork is not
+    # mistaken for background. "This close" follows how much the page edge itself varies
+    # (spread_factor x its 90th-percentile distance from its own colours), between the two limits.
+    background_tolerance: float = 12.0
+    background_tolerance_min: float = 4.0
+    background_spread_factor: float = 1.6
+    # A cast shadow is the background darkened, hue unchanged: a pixel that is the page
+    # edge's colour at this fraction of its brightness (between the two limits), to within
+    # this relative colour error, counts as background too. Without it a photographed
+    # carton's shadow is lifted along with the carton.
+    shadow_brightness_range: tuple[float, float] = (0.45, 0.97)
+    shadow_hue_tolerance: float = 0.08
+    # Full-resolution edge refinement reaches this many working-resolution pixels either side
+    # of the outline.
+    refine_band_working_px: float = 1.6
+    # The outline is simplified to within this many pixels (full resolution)...
+    outline_epsilon_px: float = 1.5
+    max_outline_points: int = 400
+    # ...and an outline that is nearly a rectangle is drawn as one (share of its rotated box).
+    rectangle_snap_fill: float = 0.985
+    # Lifting the area inside a closed border line (border_lifter.py), tried before colour:
+    # the lines are found at this size (long edge, px); a line is a pixel darker than this
+    # (or than half the sheet's own brightness); the sheet must be at least this light for
+    # lines to be told from the surface it is on.
+    border_working_long_edge_px: int = 2400
+    border_dark_level: float = 115.0
+    border_min_page_brightness: float = 170.0
+    # Automatic mode accepts an enclosure only if it is a sizeable part of the sheet, so a text
+    # box is not taken for the artwork; "Border line" mode accepts any of at least this share.
+    border_min_area_fraction: float = 0.08
+    border_min_area_fraction_forced: float = 0.005
+    # Thin protrusions (leader lines) narrower than twice this share of the long edge are shaved off.
+    border_shave_fraction: float = 0.0008
+    # An enclosure this much of the sheet is a frame around it, not the artwork.
+    border_frame_fraction: float = 0.92
+    # How long a press must be held to lift, and how far it may drift while held (ms, screen px).
+    hold_ms: int = 350
+    hold_slop_px: int = 6
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     """Guard rails and worker settings (Architecture §5 and §7).
 
@@ -301,6 +365,7 @@ class AppConfig:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    subject: SubjectConfig = field(default_factory=SubjectConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -322,6 +387,7 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         detection=_merge(DetectionConfig(), raw.get("detection", {})),
         clustering=_merge(ClusteringConfig(), raw.get("clustering", {})),
         runtime=_merge(RuntimeConfig(), raw.get("runtime", {})),
+        subject=_merge(SubjectConfig(), raw.get("subject", {})),
     )
 
 

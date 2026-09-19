@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
-        self.upload_panel = UploadPanel(central, self.config.runtime)
+        self.upload_panel = UploadPanel(central, config=self.config)
         self.mode_selector = ModeSelector(central)
         top_row.addWidget(self.upload_panel, stretch=1)
         top_row.addWidget(self.mode_selector)

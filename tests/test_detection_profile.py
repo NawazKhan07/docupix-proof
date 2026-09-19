@@ -183,3 +183,44 @@ def test_the_pipeline_is_much_faster_on_a_mostly_identical_sheet():
     elapsed = time.perf_counter() - started
 
     assert elapsed < 3.0  # NFR-1's window, with margin (measured ~0.6 s)
+
+
+# ---- exact is not zero: tolerances follow the residual that was measured ----------------------------------------------
+
+
+def _alignment(residual: float):
+    from app.models.result import AlignmentResult
+
+    return AlignmentResult(
+        transform=np.eye(3), residual_error_px=residual, residual_basis="keypoints", method="features",
+        match_count=100, inlier_count=100, inlier_ratio=1.0, low_confidence=False, threshold_px=2.0,
+    )
+
+
+def test_a_cleaner_registration_keeps_the_sensitive_defaults():
+    config, profile = effective_detection_config(DetectionConfig(), _alignment(0.004))
+    assert profile == "exact"
+    assert config.registration_intensity_tolerance == DetectionConfig().exact_intensity_tolerance
+    assert config.color_delta_e_threshold == DetectionConfig().color_delta_e_threshold
+
+
+def test_a_residual_of_a_few_hundredths_of_a_pixel_raises_the_tolerances_to_match():
+    """Measured: 0.019 px moved a black-on-white edge by ~5 grey levels, which at full sensitivity
+    came back as hairline differences along every strong edge."""
+    low, _ = effective_detection_config(DetectionConfig(), _alignment(0.004))
+    higher, profile = effective_detection_config(DetectionConfig(), _alignment(0.019))
+    assert profile == "exact"
+    assert higher.registration_intensity_tolerance > low.registration_intensity_tolerance
+    assert higher.registration_intensity_tolerance >= 0.019 * 255  # at least what the shift explains
+    assert higher.color_delta_e_threshold > low.color_delta_e_threshold
+
+
+def test_the_tolerances_are_capped_so_a_real_change_is_never_explained_away():
+    config, _ = effective_detection_config(DetectionConfig(), _alignment(0.24))
+    assert config.registration_intensity_tolerance <= DetectionConfig().exact_max_intensity_tolerance
+    assert config.color_delta_e_threshold <= DetectionConfig().exact_max_delta_e
+
+
+def test_a_worse_registration_is_still_tolerant_not_exact():
+    _config, profile = effective_detection_config(DetectionConfig(), _alignment(0.6))
+    assert profile == "tolerant"
