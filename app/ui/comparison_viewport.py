@@ -159,6 +159,12 @@ class ComparisonViewport(QWidget):
         self.scroll_lock_check.setChecked(True)
         self.scroll_lock_check.toggled.connect(self.set_scroll_lock)
         row.addWidget(self.scroll_lock_check)
+        self.compared_area_check = QCheckBox("Show compared area")
+        self.compared_area_check.setToolTip("Dim everything the comparison left out, and outline what it covered.")
+        self.compared_area_check.setChecked(True)
+        self.compared_area_check.setVisible(False)  # only when part of the page was left out
+        self.compared_area_check.toggled.connect(self._on_compared_area_toggled)
+        row.addWidget(self.compared_area_check)
 
         row.addStretch(1)
         self.zoom_out_button = QPushButton("−")
@@ -341,6 +347,17 @@ class ComparisonViewport(QWidget):
             self._build_grayscale_stacks()  # the coloured regions follow the findings
         self._refresh_markers()
         self._schedule_detail()
+
+    def set_compared_area(self, polygons: list[list[tuple[float, float]]] | None) -> None:
+        """Show what the comparison covered (None when it covered the whole page)."""
+        self.compared_area_check.setVisible(polygons is not None)
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_compared_area(polygons)
+            pane.show_compared_area(self.compared_area_check.isChecked())
+
+    def _on_compared_area_toggled(self, checked: bool) -> None:
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.show_compared_area(checked)
 
     def set_selected(self, cluster_id: int | None) -> None:
         self._selected_id = cluster_id

@@ -12,8 +12,21 @@ import math
 import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QTransform, QWheelEvent
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QPolygonF,
+    QTransform,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -27,6 +40,8 @@ from app.ui.gestures import enable_zoom_gestures, zoom_from_viewport_event, zoom
 _MIN_LEVEL_EDGE_PX = 64  # never reduce an image below this on its long edge
 _CLICK_SLOP_PX = 5  # a press-release within this distance is a click, not a drag
 _MARKER_Z = 10
+_COMPARED_AREA_Z = 2  # over the page and its detail tile, under the findings
+_OUTSIDE_TINT = QColor(15, 23, 42, 105)
 
 
 def _to_pixmap(rgb: np.ndarray) -> QPixmap:
@@ -102,6 +117,10 @@ class PaneView(QGraphicsView):
         self._marker_items: dict[int, QGraphicsRectItem] = {}
         self._halo_items: list[QGraphicsRectItem] = []
         self._press_pos = None
+        self._outside_item: QGraphicsPathItem | None = None
+        self._outline_item: QGraphicsPathItem | None = None
+        self._compared_area: list[list[tuple[float, float]]] | None = None
+        self._show_compared_area = True
         enable_zoom_gestures(self)
 
         # A screen-resolution tile drawn over the base image once zoomed in
@@ -253,6 +272,56 @@ class PaneView(QGraphicsView):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.resized.emit()
+
+    # -- what was compared -----------------------------------------------------
+    def set_compared_area(self, polygons: list[list[tuple[float, float]]] | None) -> None:
+        """Dim what the comparison left out and outline what it covered (None: the whole page was compared)."""
+        self._compared_area = polygons
+        self._draw_compared_area()
+
+    def show_compared_area(self, visible: bool) -> None:
+        self._show_compared_area = visible
+        self._draw_compared_area()
+
+    @property
+    def compared_area_visible(self) -> bool:
+        return self._outside_item is not None and self._outside_item.isVisible()
+
+    def _draw_compared_area(self) -> None:
+        for item in (self._outside_item, self._outline_item):
+            if item is not None and item.scene() is not None:
+                self._scene.removeItem(item)
+        self._outside_item = self._outline_item = None
+        if not self._compared_area or not self._show_compared_area or self.image_size == (0, 0):
+            return
+
+        width, height = self.image_size
+        outside = QPainterPath()
+        outside.addRect(QRectF(0, 0, width, height))
+        outline = QPainterPath()
+        for polygon in self._compared_area:
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(x, y) for x, y in polygon]))
+            path.closeSubpath()
+            outside.addPath(path)  # odd-even: outside the outer boundary is dim, inside a hole is dim again
+            outline.addPath(path)
+        outside.setFillRule(Qt.FillRule.OddEvenFill)
+
+        self._outside_item = QGraphicsPathItem(outside)
+        self._outside_item.setBrush(QBrush(_OUTSIDE_TINT))
+        self._outside_item.setPen(QPen(Qt.PenStyle.NoPen))
+        self._outside_item.setZValue(_COMPARED_AREA_Z)
+        self._outside_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._scene.addItem(self._outside_item)
+
+        pen = QPen(QColor(47, 111, 237), 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._outline_item = QGraphicsPathItem(outline)
+        self._outline_item.setPen(pen)
+        self._outline_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._outline_item.setZValue(_COMPARED_AREA_Z + 0.1)
+        self._outline_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._scene.addItem(self._outline_item)
 
     # -- markers -------------------------------------------------------------
     def set_markers(self, clusters: list[DiffCluster], selected_id: int | None = None) -> None:

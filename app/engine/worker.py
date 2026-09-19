@@ -69,6 +69,9 @@ class ComparisonOutcome:
     used_change_regions: bool = False
     # Which mode produced this, so the results view can show the panels that mode calls for.
     mode: ComparisonMode | None = None
+    # The area that was compared, as outlines in the original's pixels (holes included, for odd-even
+    # filling), or None when the whole page was. Lets the viewer show what was left out.
+    compared_outline: list[list[tuple[float, float]]] | None = None
 
 
 def run_comparison(
@@ -248,7 +251,36 @@ def run_comparison(
         detection_profile=profile,
         used_change_regions=used_regions,
         mode=mode,
+        compared_outline=compared_area_outline(compare_mask),
     )
+
+
+_OUTLINE_LONG_EDGE_PX = 1400  # the outline is traced on a reduced copy of the mask
+_OUTLINE_EPSILON_PX = 1.2
+_OUTLINE_MIN_AREA_FRACTION = 1e-4  # specks of the mask smaller than this share of the page are not shown
+
+
+def compared_area_outline(compare_mask: np.ndarray) -> list[list[tuple[float, float]]] | None:
+    """The compared area as polygons in the mask's own pixels: outer boundaries and holes.
+
+    None when nothing was left out, i.e. the whole page was compared.
+    """
+    if compare_mask.all():
+        return None
+    height, width = compare_mask.shape
+    scale = min(1.0, _OUTLINE_LONG_EDGE_PX / max(height, width))
+    small = cv2.resize(
+        compare_mask.astype(np.uint8), (max(2, round(width * scale)), max(2, round(height * scale))), interpolation=cv2.INTER_NEAREST
+    )
+    contours, _ = cv2.findContours(small, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    minimum = _OUTLINE_MIN_AREA_FRACTION * small.size
+    polygons = []
+    for contour in contours:
+        if cv2.contourArea(contour) < minimum:
+            continue
+        simplified = cv2.approxPolyDP(contour, _OUTLINE_EPSILON_PX, True)
+        polygons.append([(float(x) / scale, float(y) / scale) for x, y in simplified[:, 0, :]])
+    return polygons or None
 
 
 def effective_detection_config(

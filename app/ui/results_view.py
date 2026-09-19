@@ -86,6 +86,7 @@ class ResultsView(QWidget):
         self.subtitle_label.setText(subtitle)
         self.viewport.set_images(outcome.aligned_original, outcome.aligned_suspect)
         self.viewport.set_sources(original, suspect, outcome.alignment.transform)
+        self.viewport.set_compared_area(outcome.compared_outline)
         self.panel.set_result(outcome.clusters, outcome.alignment, outcome.warnings)
         self._show_mode_panels(outcome)
         self._sync_markers()
