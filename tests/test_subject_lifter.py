@@ -251,6 +251,54 @@ def test_it_copes_with_the_ways_real_sheets_differ(kwargs):
     assert (subject.mask & not_artwork).sum() < 30
 
 
+@pytest.mark.parametrize(
+    "kwargs,scale,minimum",
+    [
+        (dict(line_px=1), 0.5, 0.95),  # a screenshot of the sheet: 1 px lines softened to grey by the resampling
+        (dict(line_px=1), 0.35, 0.94),
+        (dict(line_px=1, line_colour=(150, 150, 150)), 1.0, 0.97),  # a grey hairline, at full size
+    ],
+    ids=["screenshot", "small screenshot", "grey hairline"],
+)
+def test_faint_thin_lines_are_lines_too(kwargs, scale, minimum):
+    """The lines of a screenshot or a scan are rarely black: resampling turns a 1 px black line into a grey one,
+    which no fixed darkness threshold finds. A thin structure clearly darker than what is around it is a line."""
+    sheet, truth, _ = scenes.dieline_sheet(**kwargs)
+    image = cv2.resize(sheet, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale != 1.0 else sheet
+    region = cv2.resize(truth.astype(np.uint8), (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+    subject = lift_subject(image, (600 * scale, 800 * scale), CONFIG)
+
+    assert subject.source == "border"
+    assert scenes.iou(subject.mask, cv2.dilate(region.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)) > minimum
+
+
+def test_a_scan_of_the_sheet_lifts_the_carton_and_not_the_page():
+    """A tilted, softened, noisy, vignetted scan: the outline is still a closed dark line."""
+    from dataclasses import replace
+
+    from scan_simulator import TYPICAL, simulate_scan
+
+    sheet, truth, _ = scenes.dieline_sheet()
+    scan = simulate_scan(sheet, TYPICAL)
+    where = simulate_scan(
+        np.dstack([truth.astype(np.uint8) * 255] * 3),
+        replace(TYPICAL, blur_sigma=0.0, noise_sigma=0.0, vignette=0.0, brightness=1.0, colour_cast=(1, 1, 1), jpeg_quality=100),
+    )[..., 0]
+    # the scanner's own margin (outside the sheet) is white in `where`; the carton is what is inside the sheet
+    ys, xs = np.nonzero(where > 127)
+    inside_sheet = np.zeros(where.shape, bool)
+    inside_sheet[60:-60, 60:-60] = True
+    region = (where > 127) & inside_sheet
+    ys, xs = np.nonzero(region)
+
+    subject = lift_subject(scan, (float(xs.mean()), float(ys.mean())), CONFIG)
+
+    assert subject.source == "border"
+    assert scenes.iou(subject.mask & inside_sheet, cv2.dilate(region.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)) > 0.95
+    assert subject.area_fraction < 0.4  # the carton, not the sheet it is printed on
+
+
 def test_an_outline_with_a_break_too_wide_to_bridge_is_not_silently_wrong():
     """A gap wider than the bridging leaves the outline open: the answer must not be an arbitrary panel
     presented as the artwork."""

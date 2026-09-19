@@ -70,11 +70,13 @@ def _working_scale(height: int, width: int, long_edge: int) -> tuple[float, tupl
 
 
 def raster_walls(image_rgb: np.ndarray, config: SubjectConfig) -> tuple[np.ndarray, float] | None:
-    """(dark-line mask at working size, scale), or None if the page is not a light sheet.
+    """(line mask at working size, scale), or None if the page is not a light sheet.
 
-    Lines are the pixels darker than most of the sheet is light. Reducing the page by
-    averaging would fade a one-pixel line to nothing, so each working pixel takes the
-    DARKEST pixel of the block it stands for.
+    A line is a pixel darker than most of the sheet is light, or a thin structure noticeably
+    darker than what is around it -- the second catches a hairline in grey, or a black one
+    softened to grey by a screenshot's or a scan's resampling, which no fixed darkness
+    threshold can. Reducing the page by averaging would fade a one-pixel line to nothing, so
+    each working pixel takes the DARKEST pixel of the block it stands for.
     """
     height, width = image_rgb.shape[:2]
     gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
@@ -89,7 +91,12 @@ def raster_walls(image_rgb: np.ndarray, config: SubjectConfig) -> tuple[np.ndarr
     if scale < 1.0:
         block = math.ceil(1.0 / scale)
         gray = cv2.resize(cv2.erode(gray, np.ones((block, block), np.uint8)), size, interpolation=cv2.INTER_NEAREST)
-    return gray < level, scale
+    # Thin dark structures of any depth: what a closing (which fills anything narrower than
+    # the kernel) adds to the picture.
+    width = max(5, round(config.border_line_width_fraction * max(gray.shape))) | 1
+    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, np.ones((width, width), np.uint8))
+    faint = (closed.astype(np.int16) - gray) >= config.border_faint_line_contrast
+    return (gray < level) | faint, scale
 
 
 def _bezier(points: list[Point]) -> list[Point]:

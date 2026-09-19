@@ -320,6 +320,11 @@ class SubjectConfig:
     # lines to be told from the surface it is on.
     border_working_long_edge_px: int = 2400
     border_dark_level: float = 115.0
+    # A thin line that is not dark (a grey hairline, or a black one softened by a screenshot or a
+    # scan's resampling) still counts if it is this many grey levels darker than its surroundings.
+    # "Thin" is narrower than this share of the long edge (at least 5 px).
+    border_faint_line_contrast: float = 30.0
+    border_line_width_fraction: float = 0.006
     border_min_page_brightness: float = 170.0
     # Automatic mode accepts an enclosure only if it is a sizeable part of the sheet, so a text
     # box is not taken for the artwork; "Border line" mode accepts any of at least this share.
