@@ -9,8 +9,8 @@ are listed in `sample test files/pairs.json`, and the expected answer is
 *derived from the pixels* rather than written down:
 
 * ``"truth": "pixel_diff"`` is for two digital files that are already
-  registered (alignment exact). Their raw pixel difference IS the ground
-  truth, so the test groups the differing pixels into objects and demands one
+  registered (alignment exact). Their raw pixel difference IS the ground truth (except
+  that a letter drawn a pixel off where it is in the other file is drawn the same), so the test groups the differing pixels into objects and demands one
   finding per object, each pointing at it tightly, and nothing pointing at
   anything else.
 
@@ -37,7 +37,9 @@ import pytest
 
 from scan_simulator import TYPICAL, simulate_scan
 
-from app.config import AppConfig
+from dataclasses import replace
+
+from app.config import AppConfig, DetectionConfig
 from app.engine.file_loader import load_artwork
 from app.engine.worker import run_comparison
 from app.models.job import ComparisonMode
@@ -65,17 +67,32 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+TRUTH_BLUR_SIGMA = 1.5
+
+
 def _true_boxes(original: np.ndarray, suspect: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """Tight boxes of the raw differing pixels, grouped into physical objects."""
-    difference = np.abs(original.astype(np.int16) - suspect.astype(np.int16)).max(axis=2)
-    mask = (difference > TRUTH_THRESHOLD).astype(np.uint8)
+    """Tight boxes of the raw differing pixels, grouped into physical objects.
+
+    An object is a real change only if it survives a small blur (1.5 px): a letter drawn a fraction of a pixel
+    from where it is in the other file differs at its edges by up to 50 grey levels, and is drawn the same.
+    """
+    raw = np.abs(original.astype(np.int16) - suspect.astype(np.int16)).max(axis=2)
+    blurred = np.abs(
+        cv2.GaussianBlur(original, (0, 0), TRUTH_BLUR_SIGMA).astype(np.int16)
+        - cv2.GaussianBlur(suspect, (0, 0), TRUTH_BLUR_SIGMA).astype(np.int16)
+    ).max(axis=2)
+    real = (blurred > TRUTH_THRESHOLD).astype(np.uint8)
+    mask = (raw > TRUTH_THRESHOLD).astype(np.uint8)
     grouping = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (TRUTH_GROUPING_PX, TRUTH_GROUPING_PX))
     count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(
         cv2.dilate(mask, grouping), connectivity=8
     )
     boxes = []
     for index in range(1, count):
-        ys, xs = np.nonzero((labels == index) & (mask > 0))
+        here = labels == index
+        if not (here & (real > 0)).any():
+            continue
+        ys, xs = np.nonzero(here & (mask > 0))
         boxes.append((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
     return sorted(boxes, key=lambda box: (box[1], box[0]))
 
@@ -142,9 +159,13 @@ def misregistered(images):
 
 @pytest.fixture(scope="module")
 def scanned(images):
-    """(outcome on a scan of the changed file, outcome on a scan of identical content, truth)."""
+    """(outcome on a scan of the changed file, outcome on a scan of identical content, truth).
+
+    A scan's graphics are compared only when asked for (Scan vs Digital is a TEXT comparison by default), and the
+    truth here is every physical change, so they are asked for.
+    """
     _entry, original_image, suspect_image = images
-    config = AppConfig()
+    config = AppConfig(detection=replace(DetectionConfig(), scan_compare_graphics=True))
     changed = run_comparison(
         original_image, simulate_scan(suspect_image, TYPICAL), ComparisonMode.SCAN_VS_DIGITAL, config
     )

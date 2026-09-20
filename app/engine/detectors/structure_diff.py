@@ -381,6 +381,42 @@ def _differences_at(
     )
 
 
+def _group_ink(different: np.ndarray, config: DetectionConfig) -> tuple[int, np.ndarray]:
+    """Label the differing ink as objects: pixels within `structure_group_px` of each other are one object,
+    except that a chain (a big object whose ink fills little of its box) is grouped again more tightly."""
+    reach = config.structure_group_px
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(different.astype(np.uint8), _ellipse(reach)), connectivity=8)
+    labels = labels.astype(np.int32)
+    boxes = {label: (int(stats[label, 0]), int(stats[label, 1]), int(stats[label, 2]), int(stats[label, 3])) for label in range(1, count)}
+    big = config.structure_split_min_area_px
+    pending = [(label, reach) for label, (_x, _y, w, h) in boxes.items() if w * h >= big]
+    while pending:
+        label, radius = pending.pop()
+        x, y, w, h = boxes[label]
+        window = (slice(y, y + h), slice(x, x + w))
+        ink = different[window] & (labels[window] == label)
+        if ink.sum() >= config.structure_split_fill * w * h:
+            continue
+        smaller = radius // 2
+        while smaller >= 1:
+            pieces_count, pieces, piece_stats, _ = cv2.connectedComponentsWithStats(
+                cv2.dilate(ink.astype(np.uint8), _ellipse(smaller)), connectivity=8
+            )
+            if pieces_count > 2:  # it fell apart
+                view = labels[window]
+                assigned = pieces > 0  # (the shorter reach's dilation lies inside the original's, so inside this object)
+                view[assigned] = pieces[assigned] + (count - 1)
+                for piece in range(1, pieces_count):
+                    px, py, pw, ph = (int(v) for v in piece_stats[piece, :4])
+                    boxes[count] = (x + px, y + py, pw, ph)
+                    if pw * ph >= big:
+                        pending.append((count, smaller))
+                    count += 1
+                break
+            smaller //= 2
+    return count, labels
+
+
 def detect(
     original: np.ndarray,
     suspect: np.ndarray,
@@ -427,8 +463,7 @@ def detect(
         # with per-label reductions rather than a loop over labels: a noisy scan
         # can have thousands of components, and masking the whole image for each
         # one took a harsh scan from ~1 s to ~6 s.
-        grouped = cv2.dilate(different.astype(np.uint8), _ellipse(config.structure_group_px))
-        count, labels, _stats, _centroids = cv2.connectedComponentsWithStats(grouped, connectivity=8)
+        count, labels = _group_ink(different, config)
 
         ys, xs = np.nonzero(different)
         owner = labels[ys, xs]

@@ -6,10 +6,18 @@ on how a mask becomes regions instead of each rolling its own.
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
 from app.models.diff import BoundingBox
+
+
+def padded_window(box: BoundingBox, pad: int, shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    """`box` grown by `pad` pixels on every side and clipped to an image of `shape`, as (x0, y0, x1, y1)."""
+    height, width = shape[:2]
+    return max(0, int(box.x0) - pad), max(0, int(box.y0) - pad), min(width, math.ceil(box.x1) + pad), min(height, math.ceil(box.y1) + pad)
 
 
 def _min_difference_over_shifts(

@@ -19,7 +19,7 @@ and Erase selected area leaves it out of the comparison. Any number of areas can
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -215,6 +215,7 @@ class IsolationDialog(QDialog):
             button.clicked.connect(lambda _checked=False, t=tool: self._select_tool(t))
         self.canvas.subjectRequested.connect(self._on_subject_requested)
         self.canvas.hintPainted.connect(self._on_hint_painted)
+        self.canvas.outlineEdited.connect(self._on_outline_edited)
         self.canvas.overlayChanged.connect(self._sync_placement_controls)
         self.canvas.eraseSelectionChanged.connect(self._on_erase_selection_changed)
         self.canvas.eraseRegionsChanged.connect(self._update_option_states)
@@ -250,9 +251,15 @@ class IsolationDialog(QDialog):
         self.autodetect_button.setToolTip("Lift the largest closed border on the page, without pressing on it.")
         self.keep_button = QPushButton("+ Keep")
         self.drop_button = QPushButton("− Drop")
-        for button in (self.keep_button, self.drop_button):
+        self.edit_button = QPushButton("Edit outline")
+        for button in (self.keep_button, self.drop_button, self.edit_button):
             button.setCheckable(True)
             button.setProperty("variant", "segment")
+        self.edit_button.setToolTip(
+            "Reshape the outline by hand. Drag a corner to move it; drag an edge to push it out (taking in what the "
+            "lift left) or in (dropping what it took); double-click an edge to add a corner; right-click a corner to "
+            "remove it; Ctrl+Z undoes. Do this after Keep / Drop, which lift again."
+        )
         self.keep_button.setToolTip("Paint over a part of the artwork the outline missed.")
         self.drop_button.setToolTip("Paint over something the outline wrongly took.")
         self.brush_slider = QSlider(Qt.Orientation.Horizontal)
@@ -264,7 +271,7 @@ class IsolationDialog(QDialog):
         self.save_cutout_button.setToolTip("Save the lifted artwork as a PNG with a transparent background.")
 
         for widget in (QLabel("Method"), self.method_combo, self.autodetect_button, self.keep_button, self.drop_button,
-                       QLabel("Brush"), self.brush_slider):
+                       QLabel("Brush"), self.brush_slider, self.edit_button):
             row.addWidget(widget)
         row.addStretch(1)
         row.addWidget(self.save_cutout_button)
@@ -272,6 +279,7 @@ class IsolationDialog(QDialog):
         self.autodetect_button.clicked.connect(lambda: self._run_lift(None))
         self.keep_button.toggled.connect(lambda on: self._set_brush("keep", on))
         self.drop_button.toggled.connect(lambda on: self._set_brush("drop", on))
+        self.edit_button.toggled.connect(lambda on: self._set_brush("edit", on))
         self.brush_slider.valueChanged.connect(self._on_brush_size_changed)
         self.save_cutout_button.clicked.connect(self._save_cutout)
         return bar
@@ -504,20 +512,17 @@ class IsolationDialog(QDialog):
 
     # -- lifting the artwork --------------------------------------------------------------------
     def _set_brush(self, mode: str | None, on: bool) -> None:
-        """Keep and Drop are exclusive brushes; with neither on, pressing and holding lifts.
+        """Keep, Drop and Edit outline are exclusive; with none on, pressing and holding lifts.
 
-        `mode=None` switches both off (used when another tool is chosen)."""
-        if mode is None:
-            for button in (self.keep_button, self.drop_button):
+        `mode=None` switches all off (used when another tool is chosen)."""
+        buttons = {"keep": self.keep_button, "drop": self.drop_button, "edit": self.edit_button}
+        for name, button in buttons.items():
+            if mode is None or (on and name != mode):
                 button.blockSignals(True)
                 button.setChecked(False)
                 button.blockSignals(False)
-        elif on:
-            other = self.drop_button if mode == "keep" else self.keep_button
-            other.blockSignals(True)
-            other.setChecked(False)
-            other.blockSignals(False)
         self.canvas.set_brush(self._current_brush_mode())
+        self.canvas.set_outline_editing(self.edit_button.isChecked())
 
     def _current_brush_mode(self) -> str | None:
         if self.keep_button.isChecked():
@@ -525,6 +530,21 @@ class IsolationDialog(QDialog):
         if self.drop_button.isChecked():
             return "drop"
         return None
+
+    def _on_outline_edited(self, polygon: NormalizedPolygon) -> None:
+        """The outline was reshaped by hand: it is the outline now, and what would be lifted for the other file."""
+        if self._outline is None:
+            return
+        self._outline = (polygon, self._outline[1])
+        self._show_outline_readout(polygon)
+        if self._subject is not None:
+            height, width = self._rendered.shape[:2]
+            corners = np.array([(x * width, y * height) for x, y in polygon.points], np.float32)
+            mask = np.zeros((height, width), np.uint8)
+            cv2.fillPoly(mask, [np.round(corners).astype(np.int32)], 1)
+            self._subject = replace(self._subject, mask=mask.astype(bool), polygon=[(float(x), float(y)) for x, y in corners])
+        self._update_option_states()
+        self._say("Outline reshaped by hand. Apply & Save uses it as it is now.")
 
     def _on_brush_size_changed(self, value: int) -> None:
         height, width = self._rendered.shape[:2]

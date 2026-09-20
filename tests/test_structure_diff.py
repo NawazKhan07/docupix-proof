@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 from scan_simulator import HARSH, LIGHT, TYPICAL, ScanProfile, simulate_scan
 
+from dataclasses import replace
+
 from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import structure_diff
 from app.engine.detectors.structure_diff import estimate_noise, slack_for, unresolvable_mask
@@ -17,6 +19,7 @@ from app.models.diff import DiffSubtype
 from app.models.job import ComparisonMode
 
 CONFIG = DetectionConfig()
+GRAPHICS = AppConfig(detection=replace(DetectionConfig(), scan_compare_graphics=True))  # (a scan's graphics are compared only when asked for)
 ORANGE = (238, 106, 45)
 GREY = (218, 218, 218)
 SENTENCE = "Read the enclosed leaflet carefully before use."
@@ -261,7 +264,7 @@ def test_a_scan_of_identical_content_reports_nothing(profile):
     page = _page()
     scan = simulate_scan(page, profile)
 
-    outcome = run_comparison(page, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(page, scan, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     assert outcome.clusters == []
 
@@ -271,7 +274,7 @@ def test_a_scan_with_a_missing_sentence_points_at_it(profile):
     original = _page(sentence=True)
     scan = simulate_scan(_page(sentence=False), profile)
 
-    outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     assert outcome.clusters
     (text_w, _), _ = cv2.getTextSize(SENTENCE, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
@@ -287,7 +290,7 @@ def test_a_harsh_scan_degrades_gracefully_rather_than_flooding_the_reviewer():
     page = _page()
     scan = simulate_scan(page, HARSH)
 
-    outcome = run_comparison(page, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(page, scan, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     page_area = page.shape[0] * page.shape[1]
     # An extreme scan (a 180 DPI, noisy, vignetted JPEG) may leave a few specks at
@@ -302,7 +305,7 @@ def test_softness_the_scan_cannot_overcome_is_disclosed_to_the_reviewer():
     original = _dense_small_print()
     soft = cv2.GaussianBlur(original, (0, 0), 3.2)
 
-    outcome = run_comparison(original, soft, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(original, soft, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     assert any("softer than the original" in warning for warning in outcome.warnings)
 
@@ -311,7 +314,7 @@ def test_a_sharp_scan_is_not_warned_about():
     original = _dense_small_print()
     scan = cv2.GaussianBlur(original, (0, 0), 0.7)
 
-    outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     assert not any("softer than the original" in warning for warning in outcome.warnings)
 

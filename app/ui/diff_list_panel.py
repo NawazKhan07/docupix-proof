@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.aggregation.severity import SEVERITY_COLOURS
+from app.engine.aggregation.aggregator import merge_clusters
 from app.models.diff import DiffCluster, Severity
 from app.models.result import AlignmentResult
 from app.ui.theme import set_variant
@@ -95,12 +96,13 @@ class FindingCard(QFrame):
 
 class DiffListPanel(QWidget):
     clusterSelected = Signal(int)
-    visibilityChanged = Signal()  # filters or ignore state changed what should be shown
+    visibilityChanged = Signal()  # filters, ignoring or merging changed what should be shown
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._clusters: list[DiffCluster] = []
         self._selected_id: int | None = None
+        self._merges: list[tuple[DiffCluster, list[DiffCluster], int]] = []  # (merged, the findings it replaced, where)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -167,6 +169,7 @@ class DiffListPanel(QWidget):
     ) -> None:
         self._clusters = list(clusters)
         self._selected_id = None
+        self._merges = []
 
         low = alignment.low_confidence
         set_variant(self.alignment_pill, "pill", "warn" if low else "loaded")
@@ -198,6 +201,47 @@ class DiffListPanel(QWidget):
 
     def cluster(self, cluster_id: int) -> DiffCluster | None:
         return next((c for c in self._clusters if c.id == cluster_id), None)
+
+    # -- merging --------------------------------------------------------------
+    @property
+    def can_undo_merge(self) -> bool:
+        return bool(self._merges)
+
+    def merge(self, cluster_ids: list[int]) -> DiffCluster | None:
+        """Make the findings with these ids one finding (in the place of the first); None if fewer than two exist."""
+        chosen = [cluster for cluster in self._clusters if cluster.id in set(cluster_ids)]
+        if len(chosen) < 2:
+            return None
+        merged = merge_clusters(chosen)
+        position = min(self._clusters.index(cluster) for cluster in chosen)
+        self._clusters = [cluster for cluster in self._clusters if cluster not in chosen]
+        self._clusters.insert(position, merged)
+        self._merges.append((merged, chosen, position))
+        self._selected_id = merged.id
+        # Merging is the reviewer's decision about what counts as one difference in regulated artwork: leave a trace.
+        logger.info(
+            "findings merged",
+            extra={"merged_ids": sorted(cluster.id for cluster in chosen), "into": merged.id, "severity": merged.severity.value},
+        )
+        self._rebuild()
+        self.visibilityChanged.emit()
+        return merged
+
+    def undo_merge(self) -> bool:
+        """Split the last merged finding back into the findings it was made of."""
+        if not self._merges:
+            return False
+        merged, originals, position = self._merges.pop()
+        if merged not in self._clusters:
+            return False
+        self._clusters.remove(merged)
+        for offset, cluster in enumerate(originals):
+            self._clusters.insert(position + offset, cluster)
+        self._selected_id = originals[0].id
+        logger.info("findings unmerged", extra={"merged_id": merged.id, "restored_ids": sorted(c.id for c in originals)})
+        self._rebuild()
+        self.visibilityChanged.emit()
+        return True
 
     # -- interaction ----------------------------------------------------------
     def select(self, cluster_id: int | None) -> None:

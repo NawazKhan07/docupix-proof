@@ -100,6 +100,7 @@ class PaneView(QGraphicsView):
     zoomStepRequested = Signal(int)  # +1 / -1, a fixed step (keyboard / buttons)
     zoomRequested = Signal(float, QPointF)  # scale factor about a viewport point (pinch, Ctrl + wheel)
     resized = Signal()
+    regionSelected = Signal(QRectF)  # a rectangle dragged out while region selection is on (scene units)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -117,6 +118,9 @@ class PaneView(QGraphicsView):
         self._marker_items: dict[int, QGraphicsRectItem] = {}
         self._halo_items: list[QGraphicsRectItem] = []
         self._press_pos = None
+        self._selecting = False  # region selection: a drag draws a rectangle instead of panning
+        self._region_from: QPointF | None = None
+        self._region_item: QGraphicsRectItem | None = None
         self._outside_item: QGraphicsPathItem | None = None
         self._outline_item: QGraphicsPathItem | None = None
         self._compared_area: list[list[tuple[float, float]]] | None = None
@@ -373,12 +377,66 @@ class PaneView(QGraphicsView):
         cx, cy = box.center
         self.centerOn(QPointF(cx, cy))
 
+    # -- selecting a region --------------------------------------------------
+    @property
+    def selecting_region(self) -> bool:
+        return self._selecting
+
+    def set_region_selection(self, on: bool) -> None:
+        """While on, dragging draws a rectangle (reported as `regionSelected`) instead of panning the page."""
+        self._selecting = bool(on)
+        self._cancel_region()
+        self.setDragMode(QGraphicsView.DragMode.NoDrag if on else QGraphicsView.DragMode.ScrollHandDrag)
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
+
+    def _cancel_region(self) -> None:
+        if self._region_item is not None and self._region_item.scene() is not None:
+            self._scene.removeItem(self._region_item)
+        self._region_item = None
+        self._region_from = None
+
+    def _begin_region(self, scene_pos: QPointF) -> None:
+        self._cancel_region()
+        self._region_from = scene_pos
+        pen = QPen(QColor(47, 111, 237), 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self._region_item = self._scene.addRect(QRectF(scene_pos, scene_pos), pen, QBrush(QColor(47, 111, 237, 40)))
+        self._region_item.setZValue(_MARKER_Z + 5)
+        self._region_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    def _update_region(self, scene_pos: QPointF) -> None:
+        if self._region_from is not None and self._region_item is not None:
+            self._region_item.setRect(QRectF(self._region_from, scene_pos).normalized())
+
+    def _end_region(self, scene_pos: QPointF) -> None:
+        if self._region_from is None:
+            return
+        rect = QRectF(self._region_from, scene_pos).normalized()
+        self._cancel_region()
+        if rect.width() * self.transform().m11() >= _CLICK_SLOP_PX or rect.height() * self.transform().m22() >= _CLICK_SLOP_PX:
+            self.regionSelected.emit(rect)
+
     # -- click-to-select -----------------------------------------------------
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._selecting and event.button() == Qt.MouseButton.LeftButton:
+            self._begin_region(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         self._press_pos = event.position().toPoint()
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._selecting and self._region_from is not None:
+            self._update_region(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._selecting and self._region_from is not None:
+            self._end_region(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         if self._press_pos is None:
             return

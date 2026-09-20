@@ -202,6 +202,12 @@ class DetectionConfig:
     # Differing ink this close together is one object (~1 mm at 300 DPI); the
     # aggregator then joins words into a sentence.
     structure_group_px: int = 12
+    # Where two layouts differ, differing ink is everywhere and the grouping above joins it, line to line,
+    # into one 'object' the size of the sheet (one 2278 x 2556 px 'graphic changed' on a real pair). An
+    # object bigger than this whose differing ink fills under `structure_split_fill` of its box is a chain:
+    # it is grouped again with a shorter reach (halved, down to 1 px) until it falls into its pieces.
+    structure_split_min_area_px: int = 250000
+    structure_split_fill: float = 0.08
     # Fewest differing ink pixels worth reporting (~0.4 mm across at 300 DPI).
     structure_min_area_px: int = 25
     # ...and never less than the footprint of the blur the two files were matched at
@@ -212,13 +218,24 @@ class DetectionConfig:
     # The ink picture of a file (Scan vs Digital; see scan_normalizer.ink_image): background colours
     # removed to white and every ink black. A tint is estimated as the median over a window this share
     # of the page's long edge (wider than any stroke, narrower than a panel); an ink is that many grey
-    # levels (0-255) darker than its tint to begin to show, and that many to be fully black; and a
-    # surround at least `ink_solid_level` dark is a solid graphic (a dark bar, a reversed-out block),
-    # not a tint, so it stays black.
+    # levels (0-255) darker than its tint to begin to show, and that many to be fully black -- but a scan's
+    # strokes are lighter than a digital file's, so those two follow the picture's own ink strength (this
+    # share of its 90th percentile, never below the minimum). And how SOLID a surround is (a dark bar, a
+    # reversed-out block, which stays black) is a smooth function of its luminance darkness, 0 below `low`
+    # and 1 above `high`: never a cut-off that a scan's slightly lighter colour can fall the wrong side of.
     ink_window_fraction: float = 0.02
     ink_contrast_low: float = 48.0
     ink_contrast_high: float = 108.0
-    ink_solid_level: float = 200.0
+    ink_ramp_share: float = 0.5
+    ink_ramp_low_share: float = 0.45
+    ink_ramp_min_high: float = 60.0
+    ink_ramp_min_low: float = 20.0
+    ink_solid_low: float = 100.0
+    ink_solid_high: float = 160.0
+    # Scan vs Digital compares TEXT (and barcode bars as marks). Its graphics are compared only if this is set: a scan
+    # changes every colour, blurs every edge and never registers exactly, and comparing the two pictures gave dozens
+    # of false 'graphics' differences (a fold line, the scanner's own edge, every dark block) round the few real ones.
+    scan_compare_graphics: bool = False
     # Text is read from the ink pictures at no more than this long edge (px): Tesseract reads best at
     # about 300 DPI, so an A4 page (3508 px) is read as it is and a larger sheet is reduced to this.
     ocr_long_edge_px: int = 3600
@@ -260,6 +277,10 @@ class DetectionConfig:
     # Text (OCR).
     ocr_min_confidence: float = 40.0
     text_move_tolerance_px: float = 6.0
+    # Two digital files are read the same where their pixels are the same: a word read differently over
+    # marks that agree this closely (within 2 px, each way) is the reader's inconsistency (reading a page
+    # groups its lines differently when anything else on it differs), not a change.
+    text_identical_marks_agreement: float = 0.985
     # Reading a SCAN is noisier than reading the digital file it came from. Compared page against page,
     # a changed digit reshuffled the reading order and one identical layout gave 23 false 'changes'
     # (a case or comma, an l read as i, a line grouped differently, rotated text read as junk). So
@@ -267,31 +288,78 @@ class DetectionConfig:
     # both files; the words are compared without case, punctuation or the l/i/1 and o/0 confusions (and
     # nothing looser: one letter is also what a real change to a word is), and words read less surely
     # than these floors are ignored. A line the scan yields nothing for is REMOVED only if
-    # the ink is gone too (under this share of the digital's); with the ink still there the scan is simply
+    # the ink is gone too (its marks agree with the digital's under `text_present_ink_agreement`, judged where
+    # the scan actually sits); with the ink still there the scan is simply
     # too soft to read it, which is reported as unreadable, not as a change. Text that is only in the scan
     # is found by reading the whole scan and keeping confidently read words outside every digital line
-    # where the digital has no ink. Moves are left to the graphics comparison, which sees where ink is.
+    # where the digital has no ink. A moved line is a change of its words' place, not of the words.
     ocr_min_confidence_scan: float = 55.0
     ocr_short_word_confidence: float = 75.0
-    text_line_pad_px: int = 8
-    text_removed_ink_share: float = 0.35
+    text_line_pad_px: int = 20
+    # Ink this close to where a word is counts as being there: a scan is never registered exactly (a two-sheet scan
+    # of a carton was 10-20 px out in places, so lines the scan HAD were 'removed' and words it had 'added').
+    text_ink_reach_px: int = 14
+    text_present_ink_agreement: float = 0.5
     text_added_confidence: float = 70.0
     text_added_ink_share: float = 0.25
     # A word read differently in the scan whose ink lies, at least this much of it each way (within 2 px), on the
     # digital word's ink was very probably only misread: it is kept, ranked Minor and worded as a likely misread.
     # (A real one-letter change also matches this closely, so it cannot be dropped -- only ranked.)
     text_misread_ink_agreement: float = 0.96
+    # ...where 'on the same ink' is judged to this many pixels: a scan's dot gain makes a hairline of lettering several
+    # times as thick, so its ink lies further from the digital's than a couple of pixels.
+    text_misread_slack_px: int = 3
+
+    # Automatic mode finds differences in the PIXELS. Two files that register to a pixel or two, or where one is a
+    # little softer than the other (a picture of the type against live type), differ along every edge -- 13 of 19
+    # 'critical colour changes' on one real carton pair were hairlines round letters that are the same in both. So
+    # each finding is judged by what is INSIDE its box (plus this margin, to take in the whole edge). It is the same
+    # artwork drawn slightly differently if the two files' marks (ink) coincide to at least `residue_min_agreement`
+    # and their AVERAGE colour there differs by less than `residue_max_ink_colour_delta` (CIEDE2000: a thin line
+    # drawn softer or a shade lighter) while the background between the marks differs by less than
+    # `residue_max_colour_delta` (a tint that changed is a change). Where there are no marks to compare (a flat
+    # area), the average colour must differ by less than the latter. On the carton pairs every such hairline
+    # measured under 3 (average) and over 0.97 (marks), and every real change was over 4 or under 0.94.
+    residue_margin_px: int = 6
+    # 'Coincide' means within this many pixels: the registration error and the softness to be forgiven. It applies to an
+    # exactly registered pair too: a copy softened by a pixel or two has marks that far apart (a page blurred by 1.3 px
+    # gave a finding at 1), and a glyph 1.5 px from where it was is drawn the same.
+    residue_slack_px: int = 2
+    residue_max_colour_delta: float = 2.0
+    residue_max_ink_colour_delta: float = 4.0
+    residue_min_agreement: float = 0.97
+    # What a finding says is then READ from its own box (never the whole page: two readings of one page group
+    # their lines differently and report areas that did not change). At most this many findings are read.
+    text_describe_max_findings: int = 80
+    # A word is claimed changed, missing or new only if it was read at least this surely, and the pixels back it: over
+    # the same marks (to `residue_min_agreement`) a reading that differs is the reader's; a word said to be
+    # missing or new whose marks are still at least this much the same in the other file is unread there, not gone.
+    text_describe_min_confidence: float = 75.0
+    text_describe_present_agreement: float = 0.5
 
     # Symbols (barcode / pharmacode / QR).
     symbol_match_tolerance_px: float = 60.0
 
-    # Braille. PENDING SIGN-OFF (SRS §7): the dot colour convention used in
-    # our source artwork is an open item. These HSV bounds cover the
-    # magenta/pink spot colour dots are commonly marked in; they must be
-    # confirmed against real files before this detector is trusted.
-    braille_hsv_lower: tuple[int, int, int] = (140, 80, 80)
-    braille_hsv_upper: tuple[int, int, int] = (175, 255, 255)
-    braille_dot_min_area_px: int = 6
+    # Braille. PENDING SIGN-OFF (SRS §7): the dot colour convention is still an open item, but the
+    # only real Braille files so far (the B-Carton / Metformin cartons) mark their dots RED
+    # (RGB 239, 65, 53: hue 2 on OpenCV's 0-179 scale), where the first assumption was magenta/pink,
+    # which found no dot at all. Hue wraps round 0/180, so red is two arcs: these cover red and orange-red
+    # (not orange, whose hue is ~15) and magenta/pink. A dot is a small, roundish blob: text, logos and
+    # panels of the same colour are not dots.
+    braille_hsv_ranges: tuple[tuple[tuple[int, int, int], tuple[int, int, int]], ...] = (
+        ((0, 110, 110), (9, 255, 255)),
+        ((140, 80, 80), (179, 255, 255)),
+    )
+    braille_dot_min_area_px: int = 30
+    braille_dot_max_area_px: int = 1500
+    # Real dots are all one size (~270 px at 300 DPI on the sample cartons); the specks of a red letter
+    # (the dot of an i, a colon) are round and small enough to pass the shape test but are a fraction of
+    # that. With enough dots to judge by, a blob must be within this factor of the median dot's area.
+    braille_dot_size_factor: float = 2.5
+    braille_dot_min_count_for_size: int = 8
+    braille_dot_min_fill: float = 0.5  # share of its bounding box a round dot fills (a disc is ~0.79)
+    braille_dot_max_aspect: float = 1.8  # a dot is about as wide as it is tall
+    braille_dot_min_circularity: float = 0.6  # 4 pi area / perimeter^2: a disc is ~1, the strokes of a letter far less
     braille_match_tolerance_px: float = 10.0
 
 
@@ -312,6 +380,22 @@ class ClusteringConfig:
     # ...unless one box is vastly larger than the other, which is a stray
     # outline artefact swallowing genuine findings rather than a duplicate.
     merge_max_area_ratio: float = 60.0
+    # Single-linkage chains: on a real pair whose layout differs, hundreds of neighbouring changed words
+    # and boxes linked one after another into ONE finding covering a third of the carton (or 61% of a
+    # sheet), which says nothing about where anything changed. A finding whose member boxes cover less
+    # than this share of its own box is a chain, not one thing: it is re-clustered with a shorter link
+    # (halved until it falls apart, down to `min_link_px`) -- as long as its box is bigger than
+    # `split_min_area_px` (small findings are left whole).
+    min_fill_ratio: float = 0.25
+    split_min_area_px: float = 60000.0
+    min_link_px: float = 4.0
+    # A single candidate box bigger than this (px^2; ~12 cm square at 300 DPI) is a whole panel differing,
+    # not a place: it is a finding of its own and links nothing (see `cluster_candidates`).
+    huge_candidate_area_px: float = 2000000.0
+    # Words that MOVED are one move only if they moved alike: this much difference in displacement (px) at
+    # most, or this share of the larger one, whichever is more.
+    moved_displacement_tolerance_px: float = 6.0
+    moved_displacement_tolerance_share: float = 0.3
 
 
 @dataclass(frozen=True)

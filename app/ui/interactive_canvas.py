@@ -19,10 +19,15 @@ Lifting a subject adds three more: a press held still on the artwork (with a rin
 fills while it is held) asks for the artwork to be lifted; a correction brush paints
 'keep' or 'drop' over what the lift got wrong; and a lifted cutout can be laid over the
 page as a movable, rotatable, translucent overlay, whose outline then trims the page.
+
+And a lifted outline can be reshaped by hand: with outline editing on, its corners show as handles that
+can be dragged, an edge can be dragged to push it out (taking in what the lift left) or in (dropping what it
+wrongly took), a double-click on an edge adds a point, a right-click on a point removes it, and Ctrl+Z undoes.
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -30,6 +35,7 @@ from PySide6.QtGui import (
     QColor,
     QImage,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -70,6 +76,11 @@ _HOLD_RING_MAX_PX = 30
 _RING_TICK_MS = 30
 _OVERLAY_Z = 4
 _OUTLINE_Z = 4.5
+_HANDLE_COLOUR = QColor(255, 255, 255)
+_HANDLE_EDGE = QColor(47, 111, 237)
+_MAX_EDIT_POINTS = 100  # an outline with more corners than this is simplified when editing starts (handles must be usable)
+_MIN_EDIT_POINTS = 3
+_MAX_UNDO = 50
 _ERASE_COLOUR = QColor(214, 40, 40)
 _ERASE_PEN = QPen(_ERASE_COLOUR, 2)
 _ERASE_PEN.setCosmetic(True)
@@ -333,6 +344,7 @@ class InteractiveCanvas(QGraphicsView):
     overlayChanged = Signal()  # the placed cutout was moved, rotated, scaled or replaced
     eraseSelectionChanged = Signal(object)  # NormalizedRect being selected for erasing, or None when it was dropped
     eraseRegionsChanged = Signal()  # a region was applied, undone or cleared
+    outlineEdited = Signal(object)  # NormalizedPolygon: the outline was reshaped by hand
     zoomChanged = Signal(float)
 
     def __init__(self, parent=None):
@@ -367,6 +379,12 @@ class InteractiveCanvas(QGraphicsView):
         self._polygon_halo: QGraphicsPolygonItem | None = None
         self._outline_dim: QGraphicsPathItem | None = None
         self._polygon_norm: NormalizedPolygon | None = None
+        # Reshaping the outline by hand.
+        self._edit_outline = False
+        self._edit_points: list[QPointF] = []  # the outline's corners being edited, in image pixels
+        self._edit_handles: list[QGraphicsRectItem] = []
+        self._edit_grab: tuple | None = None  # ("vertex", i) | ("edge", i, start, first, second) while dragging
+        self._edit_history: list[list[QPointF]] = []
 
         # Press and hold to lift.
         self._hold_ms = 350
@@ -412,6 +430,10 @@ class InteractiveCanvas(QGraphicsView):
         self._erase_items = []
         self._erase_regions = []
         self._polygon_norm = None
+        self._edit_handles = []
+        self._edit_points = []
+        self._edit_grab = None
+        self._edit_history = []
         pixmap = _numpy_rgb_to_qpixmap(image)
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._image_size = (image.shape[1], image.shape[0])
@@ -573,12 +595,7 @@ class InteractiveCanvas(QGraphicsView):
         self._crop_editor.clear()
 
     # -- the outline (a lifted subject, or a placed one) --------------------------------
-    def show_polygon(self, polygon: NormalizedPolygon) -> None:
-        """Outline the region and dim the rest of the page."""
-        self.clear_polygon()
-        width, height = self._image_size
-        qpoly = QPolygonF([QPointF(x * width, y * height) for x, y in polygon.points])
-
+    def _dim_path(self, qpoly: QPolygonF) -> QPainterPath:
         outside = QPainterPath()
         outside.addRect(self._scene.sceneRect())
         inside = QPainterPath()
@@ -586,7 +603,15 @@ class InteractiveCanvas(QGraphicsView):
         inside.closeSubpath()
         outside.addPath(inside)
         outside.setFillRule(Qt.FillRule.OddEvenFill)
-        self._outline_dim = QGraphicsPathItem(outside)
+        return outside
+
+    def show_polygon(self, polygon: NormalizedPolygon) -> None:
+        """Outline the region and dim the rest of the page."""
+        self.clear_polygon()
+        width, height = self._image_size
+        qpoly = QPolygonF([QPointF(x * width, y * height) for x, y in polygon.points])
+
+        self._outline_dim = QGraphicsPathItem(self._dim_path(qpoly))
         self._outline_dim.setBrush(_DIM_BRUSH)
         self._outline_dim.setPen(QPen(Qt.PenStyle.NoPen))
         self._outline_dim.setZValue(_OUTLINE_Z)
@@ -600,16 +625,194 @@ class InteractiveCanvas(QGraphicsView):
         self._polygon_halo.setZValue(_OUTLINE_Z + 0.1)
         self._polygon_item.setZValue(_OUTLINE_Z + 0.2)
         self._polygon_norm = polygon
+        if self._edit_outline:
+            self._begin_editing()
 
     def polygon(self) -> NormalizedPolygon | None:
         return self._polygon_norm
 
     def clear_polygon(self) -> None:
+        self._remove_handles()
         for item in (self._polygon_item, self._polygon_halo, self._outline_dim):
             if item is not None and item.scene() is not None:
                 self._scene.removeItem(item)
         self._polygon_item = self._polygon_halo = self._outline_dim = None
         self._polygon_norm = None
+        self._edit_points = []
+        self._edit_grab = None
+
+    # -- reshaping the outline by hand ---------------------------------------------------
+    @property
+    def outline_editing(self) -> bool:
+        return self._edit_outline
+
+    def set_outline_editing(self, on: bool) -> None:
+        """Show the outline's corners as handles to drag (and let its edges be dragged), or stop."""
+        self._edit_outline = bool(on)
+        self._edit_grab = None
+        if self._edit_outline and self._polygon_norm is not None:
+            self._begin_editing()
+        else:
+            self._remove_handles()
+        self._update_cursor(None)
+
+    def edit_points(self) -> list[tuple[float, float]]:
+        """The corners of the outline being edited, in image pixels."""
+        return [(point.x(), point.y()) for point in self._edit_points]
+
+    def _begin_editing(self) -> None:
+        """Take the outline's corners as the points to edit, simplified if there are too many to grab."""
+        polygon = self._polygon_norm
+        if polygon is None:
+            return
+        width, height = self._image_size
+        points = np.array([(x * width, y * height) for x, y in polygon.points], np.float32).reshape(-1, 1, 2)
+        if len(points) > _MAX_EDIT_POINTS:
+            epsilon = 0.5
+            simplified = points
+            while len(simplified) > _MAX_EDIT_POINTS and epsilon < max(width, height):
+                simplified = cv2.approxPolyDP(points, epsilon, True)
+                epsilon *= 1.4
+            points = simplified
+        self._edit_points = [QPointF(float(x), float(y)) for x, y in points.reshape(-1, 2)]
+        self._edit_history = []
+        self._refresh_outline(emit=False)
+
+    def _remove_handles(self) -> None:
+        for handle in self._edit_handles:
+            if handle.scene() is not None:
+                self._scene.removeItem(handle)
+        self._edit_handles = []
+
+    def _refresh_outline(self, emit: bool) -> None:
+        """Redraw the outline, its dimming and its handles from the points being edited."""
+        width, height = self._image_size
+        qpoly = QPolygonF(self._edit_points)
+        for item in (self._polygon_halo, self._polygon_item):
+            if item is not None:
+                item.setPolygon(qpoly)
+        if self._outline_dim is not None:
+            self._outline_dim.setPath(self._dim_path(qpoly))
+        self._polygon_norm = NormalizedPolygon(points=[(p.x() / width, p.y() / height) for p in self._edit_points])
+
+        self._remove_handles()
+        if self._edit_outline:
+            for point in self._edit_points:
+                handle = QGraphicsRectItem(-_HANDLE_PX / 2, -_HANDLE_PX / 2, _HANDLE_PX, _HANDLE_PX)
+                handle.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)  # a constant size on screen
+                pen = QPen(_HANDLE_EDGE, 2)
+                pen.setCosmetic(True)
+                handle.setPen(pen)
+                handle.setBrush(QBrush(_HANDLE_COLOUR))
+                handle.setZValue(_OUTLINE_Z + 0.3)
+                handle.setPos(point)
+                handle.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self._scene.addItem(handle)
+                self._edit_handles.append(handle)
+        if emit and self._polygon_norm is not None:
+            self.outlineEdited.emit(self._polygon_norm)
+
+    def _reach(self) -> float:
+        """How close (in image pixels) a press must be to a corner or an edge to grab it."""
+        return _GRAB_PX / max(self._zoom, 1e-6)
+
+    @staticmethod
+    def _nearest_on_segment(point: QPointF, a: QPointF, b: QPointF) -> tuple[QPointF, float]:
+        """The point of the segment a-b nearest `point`, and how far along it (0-1)."""
+        ab = b - a
+        length_squared = ab.x() ** 2 + ab.y() ** 2
+        if length_squared <= 1e-9:
+            return QPointF(a), 0.0
+        t = ((point.x() - a.x()) * ab.x() + (point.y() - a.y()) * ab.y()) / length_squared
+        t = min(1.0, max(0.0, t))
+        return QPointF(a.x() + t * ab.x(), a.y() + t * ab.y()), t
+
+    def hit_test_outline(self, scene_pos: QPointF) -> tuple | None:
+        """What a press at `scene_pos` would grab: ("vertex", i), ("edge", i) (the edge from point i to the next), or None."""
+        if not self._edit_points:
+            return None
+        reach = self._reach()
+        best_vertex, best_distance = None, reach
+        for index, point in enumerate(self._edit_points):
+            distance = float(np.hypot(point.x() - scene_pos.x(), point.y() - scene_pos.y()))
+            if distance <= best_distance:
+                best_vertex, best_distance = index, distance
+        if best_vertex is not None:
+            return ("vertex", best_vertex)
+        best_edge, best_distance = None, reach
+        count = len(self._edit_points)
+        for index in range(count):
+            nearest, _t = self._nearest_on_segment(scene_pos, self._edit_points[index], self._edit_points[(index + 1) % count])
+            distance = float(np.hypot(nearest.x() - scene_pos.x(), nearest.y() - scene_pos.y()))
+            if distance <= best_distance:
+                best_edge, best_distance = index, distance
+        return ("edge", best_edge) if best_edge is not None else None
+
+    def _remember_edit(self) -> None:
+        self._edit_history.append([QPointF(p) for p in self._edit_points])
+        del self._edit_history[:-_MAX_UNDO]
+
+    def begin_outline_drag(self, scene_pos: QPointF) -> bool:
+        """Grab a corner (to move it) or an edge (to push it in or out); False if the press was on neither."""
+        hit = self.hit_test_outline(scene_pos) if self._edit_outline else None
+        if hit is None:
+            return False
+        self._remember_edit()
+        if hit[0] == "vertex":
+            self._edit_grab = ("vertex", hit[1])
+        else:
+            first, second = hit[1], (hit[1] + 1) % len(self._edit_points)
+            self._edit_grab = ("edge", hit[1], QPointF(scene_pos), QPointF(self._edit_points[first]), QPointF(self._edit_points[second]))
+        return True
+
+    def update_outline_drag(self, scene_pos: QPointF) -> None:
+        if self._edit_grab is None:
+            return
+        if self._edit_grab[0] == "vertex":
+            self._edit_points[self._edit_grab[1]] = self._clamp_to_image(scene_pos)
+        else:
+            _kind, index, start, first, second = self._edit_grab
+            delta = scene_pos - start
+            self._edit_points[index] = self._clamp_to_image(first + delta)
+            self._edit_points[(index + 1) % len(self._edit_points)] = self._clamp_to_image(second + delta)
+        self._refresh_outline(emit=False)
+
+    def end_outline_drag(self, scene_pos: QPointF) -> None:
+        if self._edit_grab is None:
+            return
+        self.update_outline_drag(scene_pos)
+        self._edit_grab = None
+        self._refresh_outline(emit=True)
+
+    def insert_outline_point(self, scene_pos: QPointF) -> bool:
+        """Add a corner on the edge nearest `scene_pos` (so it can be dragged there); False if no edge is close enough."""
+        hit = self.hit_test_outline(scene_pos) if self._edit_outline else None
+        if hit is None or hit[0] != "edge":
+            return False
+        index = hit[1]
+        count = len(self._edit_points)
+        nearest, _t = self._nearest_on_segment(scene_pos, self._edit_points[index], self._edit_points[(index + 1) % count])
+        self._remember_edit()
+        self._edit_points.insert(index + 1, nearest)
+        self._refresh_outline(emit=True)
+        return True
+
+    def remove_outline_point(self, scene_pos: QPointF) -> bool:
+        """Take away the corner at `scene_pos`; False if there is none there or the outline is down to a triangle."""
+        hit = self.hit_test_outline(scene_pos) if self._edit_outline else None
+        if hit is None or hit[0] != "vertex" or len(self._edit_points) <= _MIN_EDIT_POINTS:
+            return False
+        self._remember_edit()
+        del self._edit_points[hit[1]]
+        self._refresh_outline(emit=True)
+        return True
+
+    def undo_outline_edit(self) -> bool:
+        if not self._edit_history:
+            return False
+        self._edit_points = self._edit_history.pop()
+        self._refresh_outline(emit=True)
+        return True
 
     # -- press and hold to lift ------------------------------------------------------
     def set_hold_timing(self, hold_ms: int, slop_px: int) -> None:
@@ -899,6 +1102,10 @@ class InteractiveCanvas(QGraphicsView):
                 self.nudge_overlay(*moves[event.key()])
                 event.accept()
                 return
+        if self.tool == IsolationTool.LIFT_SUBJECT and self._edit_outline and event.matches(QKeySequence.StandardKey.Undo):
+            self.undo_outline_edit()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Delete) and self.tool == IsolationTool.CROP:
             if self._crop_editor.rect is not None:
                 self.clear_crop()
@@ -930,6 +1137,11 @@ class InteractiveCanvas(QGraphicsView):
         elif self.tool == IsolationTool.CROP:
             grab = self.hit_test_crop(scene_pos) if scene_pos is not None else None
             self.viewport().setCursor(_CURSORS.get(grab, Qt.CursorShape.CrossCursor))
+        elif self.tool == IsolationTool.LIFT_SUBJECT and self._edit_outline:
+            hit = self.hit_test_outline(scene_pos) if scene_pos is not None else None
+            self.viewport().setCursor(
+                Qt.CursorShape.SizeAllCursor if hit is not None else Qt.CursorShape.ArrowCursor
+            )
         elif self.tool == IsolationTool.LIFT_SUBJECT:
             self.viewport().setCursor(Qt.CursorShape.CrossCursor if self._brush_mode else Qt.CursorShape.PointingHandCursor)
         elif self.tool == IsolationTool.PLACE_OUTLINE:
@@ -948,6 +1160,10 @@ class InteractiveCanvas(QGraphicsView):
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
             event.accept()
             return
+        if event.button() == Qt.MouseButton.RightButton and self.tool == IsolationTool.LIFT_SUBJECT and self._edit_outline:
+            self.remove_outline_point(self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
@@ -955,7 +1171,9 @@ class InteractiveCanvas(QGraphicsView):
         if self.tool == IsolationTool.CROP:
             self.begin_crop_drag(pos)
         elif self.tool == IsolationTool.LIFT_SUBJECT:
-            if self._brush_mode is not None:
+            if self._edit_outline:
+                self.begin_outline_drag(pos)
+            elif self._brush_mode is not None:
                 self.begin_hint(pos)
             else:
                 self.begin_hold(pos, event.position())
@@ -975,7 +1193,9 @@ class InteractiveCanvas(QGraphicsView):
         if self.tool == IsolationTool.CROP:
             self.update_crop_drag(pos)
         elif self.tool == IsolationTool.LIFT_SUBJECT:
-            if self._hint_path is not None:
+            if self._edit_grab is not None:
+                self.update_outline_drag(pos)
+            elif self._hint_path is not None:
                 self.update_hint(pos)
             elif self.holding:
                 self.move_hold(event.position())
@@ -995,7 +1215,9 @@ class InteractiveCanvas(QGraphicsView):
         if self.tool == IsolationTool.CROP:
             self.end_crop_drag(pos)
         elif self.tool == IsolationTool.LIFT_SUBJECT:
-            if self._hint_path is not None:
+            if self._edit_grab is not None:
+                self.end_outline_drag(pos)
+            elif self._hint_path is not None:
                 self.end_hint()
             else:
                 self.cancel_hold()  # let go before the hold completed: not a lift
@@ -1003,3 +1225,10 @@ class InteractiveCanvas(QGraphicsView):
             self.end_erase_drag(pos)
         self._update_cursor(pos)
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.tool == IsolationTool.LIFT_SUBJECT and self._edit_outline:
+            if self.insert_outline_point(self.mapToScene(event.position().toPoint())):
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)

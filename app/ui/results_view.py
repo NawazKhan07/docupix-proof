@@ -73,6 +73,8 @@ class ResultsView(QWidget):
         self.panel.clusterSelected.connect(self._on_finding_selected)
         self.symbol_panel.symbolSelected.connect(self.viewport.focus_box)
         self.viewport.markerClicked.connect(self._on_marker_clicked)
+        self.viewport.mergeRegionSelected.connect(self._on_merge_region)
+        self.viewport.undoMergeRequested.connect(self._on_undo_merge)
 
     def show_outcome(
         self,
@@ -93,6 +95,9 @@ class ResultsView(QWidget):
         self.viewport.set_sources(original, suspect, outcome.alignment.transform)
         self.viewport.set_compared_area(outcome.compared_outline)
         self.panel.set_result(outcome.clusters, outcome.alignment, outcome.warnings)
+        self.viewport.set_merge_mode(False)
+        self.viewport.set_can_undo_merge(False)
+        self.viewport.show_merge_notice("")
         self._show_mode_panels(outcome)
         self._sync_markers()
 
@@ -132,3 +137,42 @@ class ResultsView(QWidget):
     def _on_marker_clicked(self, cluster_id: int) -> None:
         self.viewport.set_selected(cluster_id)
         self.panel.select(cluster_id)
+
+    # -- merging findings ------------------------------------------------------------
+    def _on_merge_region(self, region) -> None:
+        """The reviewer drew a rectangle: the findings in it (mostly inside it) become one."""
+        inside = [
+            cluster
+            for cluster in self.panel.marker_clusters()
+            if _mostly_inside(cluster.bbox_in_original, region)
+        ]
+        if len(inside) < 2:
+            self.viewport.show_merge_notice(
+                "That rectangle holds "
+                + ("one finding" if inside else "no findings")
+                + ": drag round two or more to merge them."
+            )
+            return
+        merged = self.panel.merge([cluster.id for cluster in inside])
+        self.viewport.set_can_undo_merge(self.panel.can_undo_merge)
+        self._sync_markers()
+        if merged is not None:
+            self.viewport.set_selected(merged.id)
+            self.viewport.show_merge_notice(f"Merged {len(inside)} findings into #{merged.id}.")
+
+    def _on_undo_merge(self) -> None:
+        if self.panel.undo_merge():
+            self.viewport.set_can_undo_merge(self.panel.can_undo_merge)
+            self.viewport.set_selected(self.panel._selected_id)
+            self._sync_markers()
+            self.viewport.show_merge_notice("Split the last merge.")
+
+
+_MERGE_MIN_INSIDE = 0.5  # a finding is in the rectangle if at least this much of it is
+
+
+def _mostly_inside(box, region) -> bool:
+    """Whether at least half of `box` (a finding) lies inside `region` (the rectangle drawn)."""
+    if box.area <= 0:
+        return region.x0 <= box.center[0] <= region.x1 and region.y0 <= box.center[1] <= region.y1
+    return box.intersection_area(region) >= _MERGE_MIN_INSIDE * box.area

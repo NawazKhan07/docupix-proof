@@ -6,6 +6,8 @@ import numpy as np
 import pytesseract
 import pytest
 
+from dataclasses import replace
+
 from app.config import AppConfig
 from app.engine.alignment.homography import warp_validity_mask
 from app.engine.worker import run_comparison
@@ -14,6 +16,7 @@ from app.models.isolation import IsolationGeometry, NormalizedPolygon
 from app.models.job import ComparisonMode
 
 CONFIG = AppConfig()
+GRAPHICS = replace(CONFIG, detection=replace(CONFIG.detection, scan_compare_graphics=True))
 
 
 def _artwork(width: int = 600, height: int = 400) -> np.ndarray:
@@ -112,7 +115,7 @@ def test_scan_mode_still_sees_a_structural_change():
     suspect = original.copy()
     cv2.circle(suspect, (430, 240), 50, (255, 255, 255), -1)  # remove the roundel
 
-    outcome = run_comparison(original, suspect, ComparisonMode.SCAN_VS_DIGITAL, CONFIG)
+    outcome = run_comparison(original, suspect, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
 
     assert any(c.type is DiffType.GRAPHICS for c in outcome.candidates)
 

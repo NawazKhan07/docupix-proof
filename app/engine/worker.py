@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 from dataclasses import dataclass, field, replace
 
@@ -25,7 +26,7 @@ import numpy as np
 
 from app.config import AppConfig, DetectionConfig
 from app.engine.alignment.aligner import align
-from app.engine.aggregation.aggregator import build_clusters
+from app.engine.aggregation.aggregator import add_member, build_clusters
 from app.engine.alignment.homography import warp_to_reference, warp_validity_mask
 from app.engine.detectors import (
     barcode_diff,
@@ -34,6 +35,7 @@ from app.engine.detectors import (
     graphics_diff,
     structure_diff,
     text_diff,
+    verify,
 )
 from app.engine.detectors.change_regions import ChangeRegion, find_change_regions
 from app.engine.detectors.text_diff import OcrUnavailableError
@@ -138,9 +140,11 @@ def run_comparison(
     ink_original = ink_suspect = None
     if options.normalize_scan:
         say("Removing the background colour…")
-        with StageTimer(logger, "ink_pictures"):
+        with StageTimer(logger, "ink_pictures"), ThreadPoolExecutor(max_workers=2) as pool:
+            # (OpenCV and NumPy release the interpreter lock, so the two files are done side by side)
+            pending = pool.submit(ink_image, masked_suspect, detection_config, compare_mask)
             ink_original = ink_image(masked_original, detection_config, compare_mask)
-            ink_suspect = ink_image(masked_suspect, detection_config, compare_mask)
+            ink_suspect = pending.result()
 
     used_regions = False
     # Graphics of files that do not register exactly are compared by where INK is, within
@@ -148,20 +152,44 @@ def run_comparison(
     # erase thin real changes (a missing line of small print scored 0.07 IoU).
     misregistered = options.normalize_scan or profile != "exact"
     graphics_mode = detection_config.graphics_when_misregistered if misregistered else "ssim"
-    use_structure = options.compare_graphics and graphics_mode in ("structure", "both")
-    use_ssim = options.compare_graphics and graphics_mode in ("ssim", "both") and not options.normalize_scan
+    # What a scan compares is TEXT: its graphics are only compared if asked for (`scan_compare_graphics`): a scan
+    # changes every colour, blurs every edge and never registers exactly, and comparing the pictures gave dozens
+    # of false 'graphics' differences (fold lines, the scanner's own edge, every dark block) round the few real ones.
+    # Barcodes are compared as marks either way (below).
+    graphics_wanted = options.compare_graphics and (not options.normalize_scan or detection_config.scan_compare_graphics)
+    use_structure = graphics_wanted and graphics_mode in ("structure", "both")
+    use_ssim = graphics_wanted and graphics_mode in ("ssim", "both") and not options.normalize_scan
     unverifiable_area: np.ndarray | None = None
-    if use_structure:
-        # Compare where INK is, at full resolution, tolerating the registration error
-        # we measured (FR-6.3 for scans: colour is ignored there).
-        structure = structure_diff.detect(
-            masked_original,
-            masked_suspect,
-            detection_config,
-            structure_diff.slack_for(alignment.residual_error_px, detection_config),
-            compare_mask,
+    structure_slack = structure_diff.slack_for(alignment.residual_error_px, detection_config)
+    if options.normalize_scan and not use_structure:
+        # The scan's softness still tells the reviewer how much small print can be trusted.
+        _matched_original, _matched_suspect, softness = structure_diff.match_softness(
+            masked_original, masked_suspect, detection_config, compare_mask
         )
-        candidates += structure.candidates
+        if softness >= detection_config.structure_soft_warning_sigma_px:
+            warnings.append(
+                f"The scan is much softer than the original (about {softness:.1f} px of blur at 300 DPI), so the "
+                "finest print cannot be verified. Rescan at 300 DPI or higher."
+            )
+    # Compare where INK is, at full resolution, tolerating the registration error we measured (FR-6.3 for scans:
+    # colour is ignored there). It is independent of the colour, similarity and text work below (and mostly NumPy and
+    # OpenCV, which release the interpreter lock), so it runs beside them and is collected when its result is needed.
+    structure_pool = ThreadPoolExecutor(max_workers=1)
+    structure_job = (
+        structure_pool.submit(structure_diff.detect, masked_original, masked_suspect, detection_config, structure_slack, compare_mask)
+        if use_structure
+        else None
+    )
+    structure_collected = False
+
+    def collect_structure() -> np.ndarray | None:
+        """Add what the structural comparison found (once) and return where it could not compare (or None)."""
+        nonlocal structure_collected, unverifiable_area
+        if structure_job is None or structure_collected:
+            return unverifiable_area
+        structure_collected = True
+        structure = structure_job.result()
+        candidates.extend(structure.candidates)
         unverifiable_area = structure.unverifiable_mask
         if structure.matched_softness_px >= detection_config.structure_soft_warning_sigma_px:
             warnings.append(
@@ -174,6 +202,7 @@ def run_comparison(
                 "text) that one file is too soft to show, so those areas could not be compared. "
                 "Rescan at a higher resolution to check them."
             )
+        return unverifiable_area
 
     pixel_detectors = options.compare_color or options.compare_graphics
     regions = None
@@ -220,18 +249,15 @@ def run_comparison(
                 working_candidates += graphics_diff.detect(
                     small_original, small_suspect, detection_config, small_mask
                 )
-            if options.compare_text:
+            if options.compare_text and options.normalize_scan:
                 try:
-                    if options.normalize_scan:
-                        scan_text = text_diff.detect_scan(small_original, small_suspect, detection_config)
-                        working_candidates += scan_text.candidates
-                        if scan_text.unreadable_lines:
-                            warnings.append(
-                                f"{scan_text.unreadable_lines} line(s) of small print are in the scan but too soft to "
-                                "read, so their text was not compared. Rescan at a higher resolution to check them."
-                            )
-                    else:
-                        working_candidates += text_diff.detect(small_original, small_suspect, detection_config)
+                    scan_text = text_diff.detect_scan(small_original, small_suspect, detection_config)
+                    working_candidates += scan_text.candidates
+                    if scan_text.unreadable_lines:
+                        warnings.append(
+                            f"{scan_text.unreadable_lines} line(s) of small print are in the scan but too soft to "
+                            "read, so their text was not compared. Rescan at a higher resolution to check them."
+                        )
                 except OcrUnavailableError as exc:
                     logger.warning("text detection skipped: %s", exc)
                     warnings.append(str(exc))
@@ -239,8 +265,17 @@ def run_comparison(
             working_candidates = [_rescaled(candidate, 1 / scale) for candidate in working_candidates]
             if options.normalize_scan:
                 # A scan too soft to hold small print cannot be read there either: not a difference.
-                working_candidates = _readable_only(working_candidates, unverifiable_area)
+                working_candidates = _readable_only(working_candidates, collect_structure())
             candidates += working_candidates
+
+    collect_structure()
+    structure_pool.shutdown()
+
+    if options.normalize_scan:
+        # A barcode is not decoded here (a scan of one rarely reads the same), but where the digital file has one the
+        # scan's bars are compared with its as marks.
+        say("Comparing the barcodes…")
+        candidates += barcode_diff.compare_physical(masked_original, masked_suspect, detection_config, structure_slack)
 
     # Symbols and Braille dots run at full resolution: a small barcode or a
     # 1 mm Braille dot does not survive the detection downscale.
@@ -268,8 +303,22 @@ def run_comparison(
                 "configurable assumption pending sign-off, so check it matches this artwork."
             )
 
+    if pixel_detectors and not options.normalize_scan:
+        # A difference in the pixels is a change only if the two files really differ in its box, not merely along
+        # an edge one of them draws a little differently (see `verify`).
+        candidates = verify.drop_residue(candidates, original_image, warped_suspect, detection_config)
+
     say("Grouping the differences\u2026")
     clusters = build_clusters(candidates, alignment.transform, config.clustering)
+
+    if options.compare_text and not options.normalize_scan:
+        # What a difference says is READ from its own box in each file, never found by comparing two readings of a page.
+        say("Reading the words in each difference\u2026")
+        try:
+            _describe_clusters(clusters, masked_original, masked_suspect, detection_config, warnings)
+        except OcrUnavailableError as exc:
+            logger.warning("text description skipped: %s", exc)
+            warnings.append(str(exc))
 
     logger.info(
         "comparison finished",
@@ -397,6 +446,21 @@ def _detect_in_regions(
             found += graphics_diff.detect(original_crop, suspect_crop, config, mask_crop)
         candidates += [_shifted(candidate, region.x0, region.y0) for candidate in found]
     return candidates
+
+
+def _describe_clusters(
+    clusters: list[DiffCluster], original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, warnings: list[str]
+) -> None:
+    """Give each finding the text change its own box shows (its type, severity and description follow)."""
+    chosen = clusters[: config.text_describe_max_findings]
+    for cluster, described in zip(chosen, text_diff.describe([c.bbox_in_original for c in chosen], original, suspect, config)):
+        if described is not None:
+            add_member(cluster, described)
+    if len(clusters) > len(chosen):
+        warnings.append(
+            f"There are {len(clusters)} differences; the words were read in the first {len(chosen)} only, "
+            "so the rest are rated as artwork changes rather than text changes."
+        )
 
 
 def _shifted(candidate: DiffCandidate, dx: float, dy: float) -> DiffCandidate:

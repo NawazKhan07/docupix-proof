@@ -47,6 +47,11 @@ def build_clusters(
             config.distance_px,
             config.merge_overlap_ratio,
             config.merge_max_area_ratio,
+            (config.moved_displacement_tolerance_px, config.moved_displacement_tolerance_share),
+            config.min_fill_ratio,
+            config.split_min_area_px,
+            config.min_link_px,
+            config.huge_candidate_area_px,
         ):
             box = union_box(members)
             clusters.append(
@@ -71,6 +76,43 @@ def build_clusters(
         extra={"candidates": len(candidates), "clusters": len(clusters)},
     )
     return clusters
+
+
+def add_member(
+    cluster: DiffCluster, member: DiffCandidate, rules: tuple[SeverityRule, ...] = DEFAULT_RULES
+) -> None:
+    """Add what a detector found about a finding after it was clustered (the words its pixels show, say):
+    its type, severity and one-line description are worked out again with the new member in."""
+    cluster.members.append(member)
+    cluster.type = _dominant_type(cluster.members)
+    cluster.severity = worst_severity(cluster.members, rules)
+    cluster.detail = _summarise(cluster.members)
+
+
+def merge_clusters(clusters: list[DiffCluster], rules: tuple[SeverityRule, ...] = DEFAULT_RULES) -> DiffCluster:
+    """One finding from several the reviewer chose to treat as one (the bars of a barcode, a cluster of small changes).
+
+    It has the members of all of them, a box that covers them all in both files, the type the most specific of them
+    gives it and the severity of the worst; it keeps the lowest number, so the numbering the reviewer has been reading
+    does not shift under them.
+    """
+    if len(clusters) < 2:
+        raise ValueError("merging takes at least two findings")
+    ordered = sorted(clusters, key=lambda cluster: cluster.id)
+    members = [member for cluster in ordered for member in cluster.members]
+    original_box, suspect_box = ordered[0].bbox_in_original, ordered[0].bbox_in_suspect
+    for cluster in ordered[1:]:
+        original_box = original_box.union(cluster.bbox_in_original)
+        suspect_box = suspect_box.union(cluster.bbox_in_suspect)
+    return DiffCluster(
+        id=ordered[0].id,
+        bbox_in_original=original_box,
+        bbox_in_suspect=suspect_box,
+        type=_dominant_type(members),
+        severity=worst_severity(members, rules),
+        members=members,
+        detail=f"{len(ordered)} findings merged: {_summarise(members)}",
+    )
 
 
 def _dominant_type(members: list[DiffCandidate]) -> DiffType:

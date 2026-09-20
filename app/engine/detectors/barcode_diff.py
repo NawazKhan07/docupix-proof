@@ -24,7 +24,8 @@ from pyzbar import pyzbar
 from app.config import DetectionConfig
 from app.logging_config import StageTimer
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
-from app.engine.detectors import pharmacode
+from app.engine.detectors import pharmacode, structure_diff
+from app.engine.detectors.regions import padded_window
 from app.models.result import PHARMACODE_TYPE, SymbolComparison
 
 logger = logging.getLogger(__name__)
@@ -180,3 +181,67 @@ def compare(
         },
     )
     return candidates, comparisons
+
+
+_MARKS_PAD_PX = 24  # what is compared round a barcode, so a bar at its very edge is inside
+_MARKS_ECC_ITERATIONS = 60
+_MARKS_ECC_EPSILON = 1e-5
+_MARKS_MIN_CORRELATION = 0.5  # below this the scan does not have this barcode (it is blank, or another code): not moved onto it
+
+
+def _registered(original: np.ndarray, suspect: np.ndarray) -> np.ndarray:
+    """The scan's crop moved onto the digital's by the affine transform that best lines their marks up.
+
+    A scan of a carton is bent by its fold lines and never has the sheet's scale exactly: over one barcode the bars
+    drift apart by a few pixels, more than any tolerance that would still see a missing bar. So each barcode is
+    registered on its own (the enhanced correlation coefficient, on blurred greys), unless the scan does not have it.
+    """
+    a = cv2.GaussianBlur(cv2.cvtColor(original, cv2.COLOR_RGB2GRAY), (0, 0), 1.0).astype(np.float32)
+    b = cv2.GaussianBlur(cv2.cvtColor(suspect, cv2.COLOR_RGB2GRAY), (0, 0), 1.0).astype(np.float32)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, _MARKS_ECC_ITERATIONS, _MARKS_ECC_EPSILON)
+    try:
+        correlation, warp = cv2.findTransformECC(a, b, warp, cv2.MOTION_AFFINE, criteria, None, 5)
+    except cv2.error:
+        return suspect
+    if correlation < _MARKS_MIN_CORRELATION:
+        return suspect
+    height, width = suspect.shape[:2]
+    return cv2.warpAffine(
+        suspect, warp, (width, height), flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE
+    )
+
+
+def compare_physical(
+    original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, slack_px: int
+) -> list[DiffCandidate]:
+    """Where the digital file has a barcode, whether the scan has the same bars: compared as marks, not decoded.
+
+    A scan of a barcode rarely reads back the same (a soft, fat print), and Scan vs Digital does not decode. The
+    digital file's barcodes are found (they are crisp), and the ink in each one's box is compared with the scan's
+    where the files are registered, so a missing bar or a different one is a finding at the barcode.
+    """
+    found: list[DiffCandidate] = []
+    with StageTimer(logger, "barcode_marks"):
+        for reading in decode_symbols(original, config):
+            x0, y0, x1, y1 = padded_window(reading.bbox, _MARKS_PAD_PX, original.shape)
+            result = structure_diff.detect(
+                original[y0:y1, x0:x1], _registered(original[y0:y1, x0:x1], suspect[y0:y1, x0:x1]), config, slack_px
+            )
+            if not result.candidates:
+                continue
+            box = result.candidates[0].bbox
+            for candidate in result.candidates[1:]:
+                box = box.union(candidate.bbox)
+            found.append(
+                DiffCandidate(
+                    bbox=BoundingBox(box.x0 + x0, box.y0 + y0, box.x1 + x0, box.y1 + y0),
+                    type=DiffType.BARCODE,
+                    subtype=DiffSubtype.CHANGED,
+                    confidence=0.9,
+                    detail=f"{reading.symbol_type} bars differ from the digital file (compared as marks, not decoded)",
+                    magnitude=float(sum(candidate.magnitude for candidate in result.candidates)),
+                )
+            )
+    logger.info("barcode marks compared", extra={"differing": len(found)})
+    return found

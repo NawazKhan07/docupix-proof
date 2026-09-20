@@ -75,6 +75,8 @@ class ComparisonViewport(QWidget):
     markerClicked = Signal(int)  # cluster id
     zoomChanged = Signal(float)
     viewModeChanged = Signal(object)  # ViewMode
+    mergeRegionSelected = Signal(object)  # BoundingBox (shared space): the reviewer drew a rectangle to merge findings in
+    undoMergeRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -102,6 +104,7 @@ class ComparisonViewport(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addLayout(self._build_toolbar())
+        layout.addWidget(self.merge_row)
 
         self.original_pane = PaneView(self)
         self.suspect_pane = PaneView(self)
@@ -133,6 +136,7 @@ class ComparisonViewport(QWidget):
 
         for pane in (self.original_pane, self.suspect_pane):
             pane.markerClicked.connect(self.markerClicked)
+            pane.regionSelected.connect(self._on_region_selected)
             pane.zoomStepRequested.connect(self._on_wheel_zoom)
             pane.zoomRequested.connect(self._on_zoom_requested)
         self.original_pane.resized.connect(self._on_pane_resized)
@@ -183,6 +187,34 @@ class ComparisonViewport(QWidget):
         self.compared_area_check.setVisible(False)  # only when part of the page was left out
         self.compared_area_check.toggled.connect(self._on_compared_area_toggled)
         row.addWidget(self.compared_area_check)
+
+        row.addSpacing(16)
+        self.merge_button = QPushButton("Merge findings")
+        self.merge_button.setCheckable(True)
+        self.merge_button.setProperty("variant", "segment")
+        self.merge_button.setToolTip(
+            "Where several small differences are really one (the bars of a barcode, the letters of a changed word): "
+            "drag a rectangle round them on the page and they become one finding."
+        )
+        self.merge_button.setMinimumWidth(self.merge_button.sizeHint().width())  # the label is never clipped
+        # What the merge tool has to say (and Undo) sits on a slim row of its own, only while there is something on it.
+        self.undo_merge_button = QPushButton("Undo merge")
+        self.undo_merge_button.setToolTip("Split the last merged finding back into the findings it was made of.")
+        self.undo_merge_button.setVisible(False)
+        self.merge_notice = QLabel("")
+        self.merge_notice.setProperty("secondary", "true")
+        self.merge_row = QWidget()
+        merge_layout = QHBoxLayout(self.merge_row)
+        merge_layout.setContentsMargins(0, 0, 0, 0)
+        merge_layout.setSpacing(8)
+        merge_layout.addWidget(self.merge_notice)
+        merge_layout.addWidget(self.undo_merge_button)
+        merge_layout.addStretch(1)
+        self.merge_row.setVisible(False)
+        self.merge_button.toggled.connect(self.set_merge_mode)
+        self.undo_merge_button.clicked.connect(self.undoMergeRequested)
+        for widget in (self.merge_button,):
+            row.addWidget(widget)
 
         row.addStretch(1)
         self.zoom_out_button = QPushButton("−")
@@ -397,6 +429,38 @@ class ComparisonViewport(QWidget):
     @property
     def is_animating(self) -> bool:
         return self._timer.isActive()
+
+    # -- merging findings --------------------------------------------------------
+    def set_merge_mode(self, on: bool) -> None:
+        """While on, dragging on the page draws a rectangle to merge the findings in, instead of panning."""
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_region_selection(on)
+        if self.merge_button.isChecked() != on:
+            self.merge_button.blockSignals(True)
+            self.merge_button.setChecked(on)
+            self.merge_button.blockSignals(False)
+        self.merge_notice.setText("Drag a rectangle round the findings to merge." if on else "")
+        self._show_merge_row()
+
+    @property
+    def merge_mode(self) -> bool:
+        return self.merge_button.isChecked()
+
+    def set_can_undo_merge(self, can: bool) -> None:
+        self.undo_merge_button.setVisible(can)
+        self._show_merge_row()
+
+    def show_merge_notice(self, text: str) -> None:
+        self.merge_notice.setText(text)
+        self._show_merge_row()
+
+    def _show_merge_row(self) -> None:
+        """The merge row is there while it has a message or an Undo to offer, and out of the way otherwise."""
+        self.merge_row.setVisible(bool(self.merge_notice.text()) or not self.undo_merge_button.isHidden())
+
+    def _on_region_selected(self, rect) -> None:
+        self.set_merge_mode(False)  # one rectangle at a time: a stray drag afterwards should pan, not merge
+        self.mergeRegionSelected.emit(BoundingBox(rect.left(), rect.top(), rect.right(), rect.bottom()))
 
     # -- markers -------------------------------------------------------------
     def set_marker_clusters(self, clusters: list[DiffCluster]) -> None:

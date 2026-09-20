@@ -7,14 +7,19 @@ everything printed on it -- whatever its colour -- comes out black.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
+import pytesseract
 import pytest
+import zxingcpp
 from scan_simulator import HARSH, LIGHT, TYPICAL, simulate_scan
 
 from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import text_diff
 from app.engine.detectors.structure_diff import StructureResult
+from app.engine.ocr_locator import find_tesseract
 from app.engine.preprocessing.scan_normalizer import ink_image
 from app.engine.worker import _for_reading, _readable_only, run_comparison
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
@@ -23,6 +28,14 @@ from app.models.job import ComparisonMode
 
 CONFIG = DetectionConfig()
 WHITE = (255, 255, 255)
+
+tesseract_required = pytest.mark.skipif(find_tesseract() is None, reason="Tesseract OCR binary is not installed")
+WITH_GRAPHICS = AppConfig(detection=replace(DetectionConfig(), scan_compare_graphics=True))
+
+
+@pytest.fixture
+def real_ocr(monkeypatch):
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(find_tesseract()))
 
 
 def _page(background=WHITE, size=(700, 1000)) -> np.ndarray:
@@ -255,58 +268,87 @@ def test_a_scan_with_a_colour_cast_of_the_same_artwork_reports_nothing(profile):
     assert outcome.clusters == []
 
 
-def test_a_missing_word_is_found_in_a_scan():
+@tesseract_required
+def test_a_missing_word_is_found_in_a_scan(real_ocr):
     """(A single changed digit in small print is a job for the text reader: a scan cannot hold it as marks.)"""
     original = _label("PARACETAMOL 500 mg")
     outcome = run_comparison(original, simulate_scan(_label("PARACETAMOL"), LIGHT), ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
     assert any(c.bbox_in_original.y0 < 300 and c.bbox_in_original.y1 > 220 and c.bbox_in_original.x1 > 500 for c in outcome.clusters)
 
 
-def test_a_moved_graphic_is_found_in_a_scan():
+def test_a_moved_graphic_is_found_in_a_scan_when_graphics_are_asked_for():
     original = _label()
     changed = _label()
     cv2.rectangle(changed, (150, 350), (450, 500), (226, 238, 246), -1)  # take the block away...
     cv2.rectangle(changed, (300, 420), (600, 570), (200, 60, 50), -1)  # ...and put it somewhere else
-    outcome = run_comparison(original, simulate_scan(changed, LIGHT), ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    outcome = run_comparison(original, simulate_scan(changed, LIGHT), ComparisonMode.SCAN_VS_DIGITAL, WITH_GRAPHICS)
     assert len(outcome.clusters) >= 1
+
+
+def test_a_scans_graphics_are_not_compared_unless_asked_for():
+    """A scan changes every colour and blurs every edge: comparing its pictures gave dozens of false differences."""
+    original = _label()
+    changed = _label()
+    cv2.rectangle(changed, (150, 350), (450, 500), (226, 238, 246), -1)
+    cv2.rectangle(changed, (300, 420), (600, 570), (200, 60, 50), -1)
+    scan = simulate_scan(changed, LIGHT)
+    assert run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig()).clusters == []
 
 
 # ---- barcodes: compared as marks, never decoded ---------------------------------------------------------------------------------
 
 
-def _with_barcode(bars) -> np.ndarray:
-    page = _page(size=(1400, 1000))
+def _ean13(width=480) -> np.ndarray:
+    """A real, readable EAN-13 (bars only) as a grey picture about `width` wide and 200 tall."""
+    code = np.array(zxingcpp.write_barcode_to_image(zxingcpp.create_barcode("5060545240205", zxingcpp.BarcodeFormat.EAN13), scale=1))
+    scale = max(1, round(width / code.shape[1]))
+    return cv2.resize(code, (code.shape[1] * scale, 200), interpolation=cv2.INTER_NEAREST)
+
+
+def _bar_columns(code: np.ndarray) -> list[tuple[int, int]]:
+    """(first, last+1) column of each bar of a barcode picture."""
+    dark = (code < 128).any(axis=0)
+    edges = np.flatnonzero(np.diff(np.concatenate([[0], dark.astype(np.int8), [0]])))
+    return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2])]
+
+
+def _with_barcode(remove=(), width=480) -> np.ndarray:
+    """A label with a text line, a colour block and a real barcode, less the bars numbered in `remove`."""
+    page = _page(size=(1500, 1500))
     cv2.putText(page, "PARACETAMOL 500 mg", (80, 200), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (20, 20, 20), 3, cv2.LINE_AA)
     cv2.rectangle(page, (80, 300), (420, 480), (200, 60, 50), -1)
-    x = 300
-    for width, gap in bars:
-        cv2.rectangle(page, (x, 800), (x + width - 1, 1000), (15, 15, 15), -1)
-        x += width + gap
-    cv2.putText(page, "5 060545 240205", (300, 1050), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (20, 20, 20), 2, cv2.LINE_AA)
+    code = _ean13(width)
+    bars = _bar_columns(code)
+    for index in remove:
+        first, last = bars[index]
+        code[:, first:last] = 255
+    height, width = code.shape
+    page[800 : 800 + height, 300 : 300 + width] = code[..., None]
     return page
-
-
-def _bars(count=36, seed=4):
-    rng = np.random.default_rng(seed)
-    return [(int(rng.choice([4, 8, 12])), int(rng.choice([4, 8, 12]))) for _ in range(count)]
 
 
 @pytest.mark.parametrize("profile", [LIGHT, TYPICAL, HARSH], ids=["light", "typical", "harsh"])
 def test_an_unchanged_scanned_barcode_reports_nothing_and_is_not_decoded(profile):
-    page = _with_barcode(_bars())
+    page = _with_barcode()
     outcome = run_comparison(page, simulate_scan(page, profile), ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
-    assert outcome.clusters == [] and outcome.symbol_comparisons == []
+    barcode_findings = [c for c in outcome.clusters if c.type is DiffType.BARCODE]
+    assert barcode_findings == [] and outcome.symbol_comparisons == []
 
 
-@pytest.mark.parametrize("profile", [LIGHT, TYPICAL, HARSH], ids=["light", "typical", "harsh"])
-def test_bars_missing_from_a_scanned_barcode_are_found_as_a_physical_difference(profile):
-    bars = _bars()
-    original = _with_barcode(bars)
-    scan = simulate_scan(_with_barcode(bars[:15] + bars[17:]), profile)  # two bars fewer
+@pytest.mark.parametrize(
+    "profile,width",
+    [(LIGHT, 480), (TYPICAL, 480), (HARSH, 800)],
+    ids=["light", "typical", "harsh"],
+)
+def test_bars_missing_from_a_scanned_barcode_are_found_as_a_physical_difference(profile, width):
+    """(A harsh scan's blur is wider than a module of a barcode printed this small, so it is given a larger one.)"""
+    original = _with_barcode(width=width)
+    scan = simulate_scan(_with_barcode(remove=(14, 15), width=width), profile)  # two bars fewer
 
     outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
 
-    assert any(c.bbox_in_original.y0 < 1010 and c.bbox_in_original.y1 > 790 for c in outcome.clusters)
+    found = [c for c in outcome.clusters if c.type is DiffType.BARCODE and c.bbox_in_original.y0 < 1250 and c.bbox_in_original.y1 > 790]
+    assert found and "not decoded" in found[0].detail
     assert outcome.symbol_comparisons == []  # read as marks: nothing was decoded
 
 

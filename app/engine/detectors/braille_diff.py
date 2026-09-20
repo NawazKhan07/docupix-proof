@@ -6,8 +6,8 @@ files (already in the shared aligned space) and match them by nearest
 neighbour.
 
 PENDING SIGN-OFF (SRS §7): the dot colour convention used in our source
-artwork is an open item, so the HSV range lives in `DetectionConfig` and its
-default is an assumption, not a validated value.
+artwork is an open item, so the HSV ranges live in `DetectionConfig`. The default is red
+(measured on the only real Braille files so far) and magenta/pink, not a signed-off value.
 """
 
 from __future__ import annotations
@@ -26,17 +26,38 @@ logger = logging.getLogger(__name__)
 
 
 def detect_dots(image: np.ndarray, config: DetectionConfig) -> np.ndarray:
-    """Centroids of the coloured Braille dots, as an (N, 2) array."""
+    """Centroids of the coloured Braille dots, as an (N, 2) array.
+
+    A dot is a blob in the dot colour that is small and roundish; a letter, a logo or a panel in the same
+    colour is not one.
+    """
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(
-        hsv, np.array(config.braille_hsv_lower, np.uint8), np.array(config.braille_hsv_upper, np.uint8)
-    )
+    mask = np.zeros(hsv.shape[:2], np.uint8)
+    for lower, upper in config.braille_hsv_ranges:
+        mask |= cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
     count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    dots = [
-        centroids[index]
-        for index in range(1, count)  # 0 is the background
-        if stats[index, cv2.CC_STAT_AREA] >= config.braille_dot_min_area_px
-    ]
+    blobs = []
+    for index in range(1, count):  # 0 is the background
+        area = stats[index, cv2.CC_STAT_AREA]
+        width, height = stats[index, cv2.CC_STAT_WIDTH], stats[index, cv2.CC_STAT_HEIGHT]
+        if not config.braille_dot_min_area_px <= area <= config.braille_dot_max_area_px:
+            continue
+        if max(width, height) > config.braille_dot_max_aspect * min(width, height):
+            continue
+        if area < config.braille_dot_min_fill * width * height:
+            continue
+        x, y = stats[index, cv2.CC_STAT_LEFT], stats[index, cv2.CC_STAT_TOP]
+        blob = (_labels[y : y + height, x : x + width] == index).astype(np.uint8)
+        contours, _ = cv2.findContours(blob, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        perimeter = cv2.arcLength(max(contours, key=cv2.contourArea), True) if contours else 0.0
+        if perimeter <= 0 or 4 * np.pi * area / perimeter**2 < config.braille_dot_min_circularity:
+            continue
+        blobs.append((area, centroids[index]))
+    if len(blobs) >= config.braille_dot_min_count_for_size:
+        median = float(np.median([area for area, _centre in blobs]))
+        factor = config.braille_dot_size_factor
+        blobs = [(area, centre) for area, centre in blobs if median / factor <= area <= median * factor]
+    dots = [centre for _area, centre in blobs]
     return np.array(dots, dtype=np.float64) if dots else np.empty((0, 2))
 
 

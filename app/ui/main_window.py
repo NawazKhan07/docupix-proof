@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from time import monotonic
 
 from PySide6.QtCore import QTimer
@@ -72,6 +73,7 @@ class MainWindow(QMainWindow):
         top_row.setSpacing(16)
         self.upload_panel = UploadPanel(central, config=self.config)
         self.mode_selector = ModeSelector(central)
+        self.mode_selector.scan_graphics.setChecked(self.config.detection.scan_compare_graphics)
         top_row.addWidget(self.upload_panel, stretch=1)
         top_row.addWidget(self.mode_selector)
         layout.addLayout(top_row, stretch=1)
@@ -130,11 +132,14 @@ class MainWindow(QMainWindow):
             return
 
         mode = self.mode_selector.mode
+        config = self.config
+        if mode is ComparisonMode.SCAN_VS_DIGITAL and self.mode_selector.compare_scan_graphics != config.detection.scan_compare_graphics:
+            config = replace(config, detection=replace(config.detection, scan_compare_graphics=self.mode_selector.compare_scan_graphics))
         request = ComparisonRequest(
             original_path=original.path,
             suspect_path=suspect.path,
             mode=mode,
-            config=self.config,
+            config=config,
             original_geometry=self.upload_panel.original_slot.geometry,
             suspect_geometry=self.upload_panel.suspect_slot.geometry,
         )

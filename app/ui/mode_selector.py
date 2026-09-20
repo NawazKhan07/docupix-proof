@@ -6,6 +6,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QFrame,
     QGroupBox,
     QLabel,
@@ -18,7 +19,7 @@ from app.ui.theme import set_variant
 
 _MODE_DESCRIPTIONS = {
     ComparisonMode.AUTOMATIC: "Auto-detects the artwork area and compares every difference category.",
-    ComparisonMode.SCAN_VS_DIGITAL: "Ignores colour differences; compares text, numbers, graphics, and barcodes only.",
+    ComparisonMode.SCAN_VS_DIGITAL: "Ignores colour: both files become black ink on white, and their text and numbers are read and compared, with barcode bars as marks.",
     ComparisonMode.BARCODE: "Restricts comparison to detected barcode/pharmacode/QR symbols, decoded and compared.",
     ComparisonMode.BRAILLE: "Restricts comparison to the coloured dot-matrix representing Braille content.",
 }
@@ -85,6 +86,16 @@ class ModeSelector(QGroupBox):
             self._cards[mode] = card
             card.radio.toggled.connect(self._on_toggled(mode))
 
+        # A scan changes every colour and blurs every edge, so comparing its graphics gives false differences round the
+        # real ones: text is what this mode compares, and graphics are an option.
+        self.scan_graphics = QCheckBox("Also compare graphics (a scan can show false differences)")
+        self.scan_graphics.setToolTip(
+            "Scan vs Digital compares text, numbers and barcode bars. Tick this to compare logos and other artwork too."
+        )
+        self.scan_graphics.setVisible(False)
+        layout.addWidget(self.scan_graphics)
+        self.modeChanged.connect(lambda mode: self.scan_graphics.setVisible(mode is ComparisonMode.SCAN_VS_DIGITAL))
+
         self._cards[ComparisonMode.AUTOMATIC].radio.setChecked(True)
 
     def _on_toggled(self, mode: ComparisonMode):
@@ -103,3 +114,8 @@ class ModeSelector(QGroupBox):
 
     def set_mode(self, mode: ComparisonMode) -> None:
         self._cards[mode].radio.setChecked(True)
+
+    @property
+    def compare_scan_graphics(self) -> bool:
+        """Whether a Scan vs Digital comparison should also compare graphics."""
+        return self.scan_graphics.isChecked()

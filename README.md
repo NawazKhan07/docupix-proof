@@ -36,35 +36,76 @@ stays responsive and **Cancel** stops it at once.
 | Mode | Compares |
 | --- | --- |
 | Automatic | Text, colour and graphics of two digital files (barcodes and Braille as pixels) |
-| Scan vs Digital | What is *printed* -- text, graphics and barcodes -- not its colour; see below |
+| Scan vs Digital | What is *printed* -- above all its text, and barcode bars as marks -- not its colour; graphics on request; see below |
 | Barcode / Pharmacode / QR | Only the decoded symbols, grouped by type with a pass/fail mark each |
-| Braille | Only the coloured Braille dots: missing, added, moved |
+| Braille | Only the coloured Braille dots (red or magenta by default, and round and dot-sized): missing, added, moved |
 
-**Scan vs Digital** ignores colour completely, because a scan changes every colour. Each file (inside
-the area you lifted) is turned into *ink on paper*: every background colour -- a tint, a gradient, the
-scan's cream paper, uneven lighting -- comes out white, and everything printed on it comes out black,
-whatever its colour (cyan, yellow and orange lettering included; a solid dark bar stays a black bar, its
-white lettering staying white). Then:
+**Automatic** finds differences in the *pixels* and only then reads them. The two aligned files are compared
+pixel by pixel; every difference found is then checked by what is inside its box: if the two files' marks
+(their ink) coincide and their average colour is the same, it is the same artwork drawn a little differently --
+one file softer than the other, a picture of the type against live type, a fraction of a pixel of
+registration -- and it is dropped. (On one real carton pair this removed 14 of 19 "critical colour changes":
+hairlines round letters that were the same in both files.) Reading never *starts* a finding: the words in each
+finding's own box are read in both files, alone, and if they differ the finding says so ("'36' -> '24'",
+"'Feed' missing from suspect") and is rated as a text change. Two readings of a whole page group their lines
+differently, and comparing them reported areas that had not changed; that cannot happen when the pixels are
+the same. A colour finding is rated by how different the area *looks* (its average delta-E), not by its worst
+edge pixel.
 
-* **Text** is read (Tesseract) from those two pictures, anchored on the *digital file's own lines*: each
-  line's window is read again, alone, in both files, so a changed word cannot reshuffle the reading order.
-  Case, punctuation and l/i/1 or o/0 confusions are ignored, and a number must match exactly, so "500 mg"
-  against "250 mg" is one change showing both values. A word the scan reads differently although its ink
-  matches the digital word's is listed but ranked **Minor** ("likely a misread of the scan"), so real changes
-  stay on top without hiding a one-letter change. A line whose ink is in the scan but too soft to read is
-  reported as *unreadable*, not as a change; a line whose ink is gone is *removed*; text only the scan has
-  is *added*. Moves are left to the graphics comparison.
-* **Graphics and barcodes** are compared by where the ink is, tolerating a scan's softness, blur, fatter
-  strokes, tilt and noise. Barcodes are **not decoded** in this mode; a bar added, missing or moved is
-  reported as a physical difference.
+**Scan vs Digital** compares **text** (and barcode bars as marks) and ignores colour completely, because a scan
+changes every colour. Each file (inside the area you lifted) is turned into *ink on paper*: every background
+colour -- a tint, a gradient, the scan's cream paper, uneven lighting -- comes out white, and everything
+printed on it comes out black, whatever its colour (cyan, yellow and orange lettering included). A solid dark
+bar or block stays a black block with its lettering white; whether a region is solid is a smooth function of
+how dark it looks, so a panel a few levels lighter in a scan is a little less black, never the opposite colour.
+Then:
+
+* **Text** is read (Tesseract) from both pictures *in full*, side by side (each page is cut into strips at
+  blank rows and the strips are read one to a core), with lettering reversed out of a dark bar read the right
+  way round and hairline typefaces thickened for reading. The words of the two files are matched **by what
+  they say and where they are**, allowing for how far a scan sits from its digital file *at that place* (a
+  scanned carton is bent and can be tens of pixels out). Only lines where words do not match are read again --
+  one window per line, stacked into a single picture -- and a line counts as different only if none of its
+  readings (the window, the page reading, both together) agree. Case, punctuation and l/i/1 or o/0 confusions
+  are ignored, and a number must match exactly, so "500 mg" against "250 mg" is one change showing both
+  values. A difference that is probably the reading's, not the artwork's, is listed but ranked **Minor**: a
+  word the scan reads differently although its ink matches, a word read shakily on the digital side, a word
+  "missing" or "new" where the other file has ink. A line whose ink is in the scan but too soft to read is
+  reported as *unreadable*; a line whose ink is gone is *removed*; text only the scan has is *added*. Text on
+  its side is not read (upright it is junk).
+* **Barcodes** are not decoded. Where the digital file has one, each is registered on its own against the scan
+  (scans are bent by their fold lines) and its bars are compared as marks: a bar added, missing or moved is
+  reported as a physical difference at the barcode.
+* **Graphics** are not compared by default: a scan changes every colour, blurs every edge and never registers
+  exactly, and comparing the pictures gave dozens of false differences (fold lines, the scanner's own edge,
+  every dark block) round the few real ones. Tick **Also compare graphics** under the mode to include logos
+  and other artwork (or set `detection.scan_compare_graphics` in `config.json`).
 * The results page shows the two **black-and-white** pictures (untick *Black && white* for the colour
-  files). These are what was read for text; the graphics comparison works from the files' own grey
-  levels, because thresholding first would throw away the softness that tells a scan from a real change.
+  files). These are what was read for text.
+* A typical A4 or carton pair takes 3-4.5 s (it took 19-25 s when every line was read twice, one Tesseract
+  call each).
 
 Viewing: side-by-side, flicker, overlay and grayscale views from one aligned pair, with
 scroll lock; pinch or Ctrl + wheel to zoom about the cursor; PDFs stay sharp at any zoom.
 In the crop dialog, drag any edge or corner of the selection to resize it, drag inside to
 move it, Space + drag (or middle-drag) to pan, and confirm the crop when saving.
+
+## How differences are grouped and mapped
+
+Every detector reports small *candidates*; they are grouped into the *findings* you review, each with a box in
+both files. Nearby differences of one kind are one finding (the words of a missing sentence), and boxes that
+overlap are one change seen by two detectors. Where two layouts differ, differences are everywhere and plain
+grouping chains them into one finding the size of the carton, so a finding whose members fill little of its
+box is grouped again more tightly until it falls into its pieces; words that moved are grouped only with words
+that moved alike; a single object the size of a panel (differing ink chained across a sheet) is grouped again
+more tightly, and a panel-sized candidate that remains is a finding of its own. All of these limits are in
+`config.json` (`clustering`, `detection`).
+
+**Merging findings.** Where several small differences are really one -- the bars of a barcode, the letters
+of a changed word -- press **Merge findings** above the page and drag a rectangle round them (the findings
+mostly inside it are merged). They become one finding with the members of all, a box covering them in both
+files, the worst severity and the lowest number (the numbering does not shift). **Undo merge** splits the
+last one; merging is logged, and a merged finding can be ignored like any other.
 
 ## Comparing only the artwork
 
@@ -79,8 +120,12 @@ outline is artwork. In **Edit Artwork Area**:
   spot colour); otherwise the dark lines of the picture. A photograph of artwork on a surface is
   lifted by colour and background instead. *Method* forces one or the other; *Auto-detect artwork*
   lifts the largest closed border without a press. **+ Keep / - Drop** paint corrections over what the
-  outline missed or wrongly took. **Save cutout...** writes the lifted artwork as a lossless PNG with a
-  transparent background.
+  outline missed or wrongly took (they lift again). **Edit outline** reshapes the outline by hand: drag a
+  corner to move it, drag an *edge* to push it out (taking in what the lift left) or in (dropping what it
+  took), double-click an edge to add a corner, right-click a corner to remove it, Ctrl+Z to undo; an outline
+  with many corners is simplified to at most 100 so the handles are usable, and what is saved (and offered
+  to the other file) is the outline as you left it -- so do this after Keep / Drop. **Save cutout...** writes
+  the lifted artwork as a lossless PNG with a transparent background.
 * **Place Subject** lays the artwork lifted from the *other* file over this one, so this file is
   trimmed to the same area. It is the way to handle a **scan or photo**: a scan of a die-cut sheet has
   no outline to find (its flaps are the colour of the paper), and colour alone lifts only the printed
@@ -154,9 +199,12 @@ folder instead of one file (faster to start).
 ## Known limits and open items
 
 * **Text comparison needs Tesseract** (the UB-Mannheim Windows installer, default folder; `pip install tesseract`
-  is an unrelated package). On a real digital-vs-scan pair (Amphotret) it finds a changed digit or word and ranks
-  its own misreads of soft small print as Minor, but a few false *serious* findings can remain around tiny,
-  condensed print; rescan at a higher resolution to check such lines.
+  is an unrelated package). Without it Automatic mode still finds every pixel difference (it just cannot say what
+  the words were) and Scan vs Digital reports that text was not compared. Words are read from the finding's own
+  box, so a change to text set as a picture, over a gradient, or in white on a colour can be found in the pixels
+  and rated as an artwork change (Major) rather than a text change (Critical) if the reader cannot read it.
+  On a real digital-vs-scan pair a few *serious* text findings can remain around hairline or tiny print; rescan
+  at a higher resolution to check such lines. Text turned on its side is not read in Scan vs Digital.
 * **Scans:** detection thresholds are measured from each image (noise, softness,
   registration), but have been validated on *simulated* scans, not a range of real
   scanners. Fine print softer than the scan can hold is reported as unverifiable rather

@@ -170,6 +170,34 @@ def run(report_path: Path | None = None) -> int:
         except Exception as exc:
             record("black-and-white ink pictures (Scan vs Digital)", False, f"{type(exc).__name__}: {exc}")
 
+        # Automatic mode finds differences in the pixels and drops what is only how a softer file draws the same
+        # artwork: a softened copy of the page has NO finding, and the same page with a digit changed has one.
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            def _line(text):
+                page = np.full((220, 900, 3), 255, np.uint8)
+                cv2.putText(page, text, (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (20, 20, 20), 4, cv2.LINE_AA)
+                return page
+
+            same, softer, edited = (Path(tmp) / name for name in ("same.png", "softer.png", "edited.png"))
+            Image.fromarray(_line("Take 500 mg daily")).save(same)
+            Image.fromarray(cv2.GaussianBlur(_line("Take 500 mg daily"), (0, 0), 1.3)).save(softer)
+            Image.fromarray(cv2.GaussianBlur(_line("Take 250 mg daily"), (0, 0), 1.3)).save(edited)
+            softened, error = _run_job(ComparisonRequest(same, softer, ComparisonMode.AUTOMATIC, AppConfig()))
+            changed, error2 = _run_job(ComparisonRequest(same, edited, ComparisonMode.AUTOMATIC, AppConfig()))
+            ok = softened is not None and not softened.clusters and changed is not None and len(changed.clusters) == 1
+            record(
+                "pixel comparison ignores a softer copy",
+                ok,
+                f"{len(softened.clusters) if softened else error} finding(s) on a softened copy, "
+                f"{len(changed.clusters) if changed else error2} with a digit changed",
+            )
+        except Exception as exc:
+            record("pixel comparison ignores a softer copy", False, f"{type(exc).__name__}: {exc}")
+
         # Symbol decoding: a Pharmacode drawn here must be read back by the bundled decoders.
         try:
             import cv2
@@ -205,6 +233,33 @@ def run(report_path: Path | None = None) -> int:
             record("reading text (Tesseract)", "PARACETAMOL" in text.upper(), f"read {text!r}")
         except Exception as exc:
             record("reading text (Tesseract)", False, f"{type(exc).__name__}: {exc}")
+
+        # A changed number is found by Scan vs Digital, in the worker, with both values in the finding.
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            with tempfile.TemporaryDirectory(prefix="artwork-selftest-scan-") as scan_tmp:
+                def _leaflet(figure):
+                    page = np.full((900, 1300, 3), 255, np.uint8)
+                    cv2.rectangle(page, (60, 60), (1240, 840), (226, 238, 246), -1)
+                    for row, text in enumerate(("PARACETAMOL 500 mg TABLETS", f"Each tablet contains {figure} mg")):
+                        cv2.putText(page, text, (110, 200 + row * 130), cv2.FONT_HERSHEY_SIMPLEX, 1.7, (20, 20, 20), 3, cv2.LINE_AA)
+                    return page
+
+                digital, scanned = Path(scan_tmp) / "digital.png", Path(scan_tmp) / "scanned.png"
+                Image.fromarray(_leaflet(500)).save(digital)
+                Image.fromarray(cv2.GaussianBlur(_leaflet(250), (0, 0), 1.2)).save(scanned)
+                found, error = _run_job(ComparisonRequest(digital, scanned, ComparisonMode.SCAN_VS_DIGITAL, AppConfig()))
+                ok = found is not None and any("500" in c.detail and "250" in c.detail for c in found.clusters)
+                record(
+                    "text change found in Scan vs Digital",
+                    ok,
+                    "; ".join(c.detail for c in found.clusters)[:100] if found else f"{error}",
+                )
+        except Exception as exc:
+            record("text change found in Scan vs Digital", False, f"{type(exc).__name__}: {exc}")
 
     failed = [name for name, ok, _detail in checks if not ok]
     say("PASSED" if not failed else f"FAILED: {', '.join(failed)}")
