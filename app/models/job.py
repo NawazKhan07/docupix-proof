@@ -19,6 +19,8 @@ class ComparisonMode(Enum):
     SCAN_VS_DIGITAL = "scan_vs_digital"
     BARCODE = "barcode"
     BRAILLE = "braille"
+    SERIES = "series"
+    LEAFLET = "leaflet"
 
 
 MODE_DISPLAY_NAMES: dict[ComparisonMode, str] = {
@@ -26,6 +28,8 @@ MODE_DISPLAY_NAMES: dict[ComparisonMode, str] = {
     ComparisonMode.SCAN_VS_DIGITAL: "Scan vs Digital",
     ComparisonMode.BARCODE: "Barcode / Pharmacode / QR",
     ComparisonMode.BRAILLE: "Braille",
+    ComparisonMode.SERIES: "Series (repeated artwork)",
+    ComparisonMode.LEAFLET: "Leaflet (multi-page)",
 }
 
 
@@ -82,6 +86,26 @@ _MODE_OPTIONS = {
         compare_graphics=False,
         decode_symbols=False,
         compare_braille_dots=True,
+        normalize_scan=False,
+    ),
+    # Every repeat is compared exactly as Automatic mode compares a single pair (`app/engine/series.py` is what finds
+    # the repeats and runs one such comparison per repeat; this is only what each of those comparisons checks).
+    ComparisonMode.SERIES: DetectorOptions(
+        compare_color=True,
+        compare_text=True,
+        compare_graphics=True,
+        decode_symbols=False,
+        compare_braille_dots=False,
+        normalize_scan=False,
+    ),
+    # Every page is compared exactly as Automatic mode compares a single pair (`app/engine/leaflet.py` is what pairs
+    # the pages and runs one such comparison per pair; this is only what each of those comparisons checks).
+    ComparisonMode.LEAFLET: DetectorOptions(
+        compare_color=True,
+        compare_text=True,
+        compare_graphics=True,
+        decode_symbols=False,
+        compare_braille_dots=False,
         normalize_scan=False,
     ),
 }

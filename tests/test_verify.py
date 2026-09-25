@@ -17,11 +17,10 @@ import pytesseract
 import pytest
 
 from app.config import AppConfig, DetectionConfig
-from app.engine.aggregation.severity import severity_for
 from app.engine.detectors import text_diff, verify
 from app.engine.ocr_locator import find_tesseract
 from app.engine.worker import run_comparison
-from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType, Severity
+from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 from app.models.job import ComparisonMode
 
 CONFIG = DetectionConfig()
@@ -160,7 +159,7 @@ def test_a_recoloured_panel_keeps_its_full_delta():
     b = np.full((200, 200, 3), (40, 40, 200), np.uint8)
     (kept,) = _kept(_candidate((0, 0, 200, 200), magnitude=90.0), a, b)
     assert kept.magnitude > 40.0
-    assert severity_for(kept) is Severity.CRITICAL
+    assert kept.type is DiffType.COLOUR
 
 
 def test_a_shape_that_differs_in_position_only_is_reported_as_a_shape_not_a_colour():
@@ -182,7 +181,7 @@ def test_a_changed_number_is_described_with_its_old_and_new_words(real_ocr):
     (found,) = text_diff.describe([_span("Take ", "500")], a, b, CONFIG)
     assert found.type is DiffType.NUMBER and found.subtype is DiffSubtype.CHANGED
     assert "500" in found.detail and "250" in found.detail
-    assert severity_for(found) is Severity.CRITICAL
+    assert found.type is DiffType.NUMBER
 
 
 @tesseract_required
@@ -313,7 +312,7 @@ def test_a_real_text_change_is_found_in_the_pixels_and_described_by_reading(real
 
     assert len(outcome.clusters) == 1
     (cluster,) = outcome.clusters
-    assert cluster.type is DiffType.NUMBER and cluster.severity is Severity.CRITICAL
+    assert cluster.type is DiffType.NUMBER and cluster.category == "text"
     assert "500" in cluster.detail and "250" in cluster.detail
     assert cluster.bbox_in_original.area < 0.3 * a.shape[0] * a.shape[1]
 

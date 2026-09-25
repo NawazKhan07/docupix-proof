@@ -29,12 +29,15 @@ import numpy as np
 import pytesseract
 
 from app.config import DetectionConfig
-from app.engine.aggregation.severity import LIKELY_MISREAD_CONFIDENCE
 from app.engine.detectors.verify import marks_agreement
 from app.logging_config import StageTimer
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 logger = logging.getLogger(__name__)
+
+# A reading of a scan that the pixels do not bear out is marked with this confidence and `uncertain`: it is listed apart and
+# shown only on request, so a real change in small print is not hidden but the reviewer is not shouted at.
+LIKELY_MISREAD_CONFIDENCE = 0.25
 
 
 class OcrUnavailableError(RuntimeError):
@@ -48,16 +51,33 @@ class OcrWord:
     confidence: float
 
 
-def _ocr_data(image: np.ndarray, page_segmentation: str | None = None) -> dict:
+_OCR_UNAVAILABLE = (
+    "Tesseract OCR is not installed or not on PATH, so text and number "
+    "differences could not be checked. Install Tesseract and restart."
+)
+
+
+def ocr_available() -> bool:
+    """Whether the reader (Tesseract) can be run at all."""
+    try:
+        pytesseract.get_tesseract_version()
+    except pytesseract.TesseractNotFoundError:
+        return False
+    except Exception:  # noqa: BLE001 -- an odd version string is still an engine that runs
+        return True
+    return True
+
+
+def _ocr_data(image: np.ndarray, page_segmentation: str | None = None, lang: str | None = None) -> dict:
     try:
         return pytesseract.image_to_data(
-            image, output_type=pytesseract.Output.DICT, **({"config": page_segmentation} if page_segmentation else {})
+            image,
+            output_type=pytesseract.Output.DICT,
+            **({"config": page_segmentation} if page_segmentation else {}),
+            **({"lang": lang} if lang else {}),
         )
     except pytesseract.TesseractNotFoundError as exc:
-        raise OcrUnavailableError(
-            "Tesseract OCR is not installed or not on PATH, so text and number "
-            "differences could not be checked. Install Tesseract and restart."
-        ) from exc
+        raise OcrUnavailableError(_OCR_UNAVAILABLE) from exc
 
 
 def _words_of(data: dict, floor: float) -> list[tuple[tuple[int, int, int], OcrWord]]:
@@ -79,7 +99,7 @@ def _words_of(data: dict, floor: float) -> list[tuple[tuple[int, int, int], OcrW
 
 
 def _ocr_words(image: np.ndarray, config: DetectionConfig, floor: float | None = None) -> list[OcrWord]:
-    data = _ocr_data(image)
+    data = _ocr_data(image, lang=config.ocr_language)
     return [word for _line, word in _words_of(data, config.ocr_min_confidence if floor is None else floor)]
 
 
@@ -180,11 +200,12 @@ def _candidate(
     confidence: float,
     detail: str,
     magnitude: float = 0.0,
+    uncertain: bool = False,
 ) -> DiffCandidate | None:
     if bbox is None:
         return None
     return DiffCandidate(
-        bbox=bbox, type=diff_type, subtype=subtype, confidence=confidence, detail=detail, magnitude=magnitude
+        bbox=bbox, type=diff_type, subtype=subtype, confidence=confidence, detail=detail, magnitude=magnitude, uncertain=uncertain
     )
 
 
@@ -303,6 +324,7 @@ def _findings(gone: list[OcrWord], new: list[OcrWord]) -> list[DiffCandidate]:
                     DiffSubtype.CHANGED,
                     LIKELY_MISREAD_CONFIDENCE if unsure else _mean_confidence(both),
                     f"'{_join(gone)}' -> '{_join(new)}'" + (" (the digital file's reading is unsure: likely a misread)" if unsure else ""),
+                    uncertain=unsure,
                 )
             ]
     findings = []
@@ -428,7 +450,7 @@ def _cut_rows(picture: np.ndarray, parts: int) -> list[int]:
     return cuts
 
 
-def read_pages(pictures: list[np.ndarray], floor: float) -> list[list[tuple[tuple, OcrWord]]]:
+def read_pages(pictures: list[np.ndarray], floor: float, lang: str | None = None) -> list[list[tuple[tuple, OcrWord]]]:
     """Every word read on each picture, as (line, word): each page is cut into strips read side by side.
 
     Reading a page is by far the slowest step of Scan vs Digital (a text-dense sheet takes a few seconds on one
@@ -444,7 +466,7 @@ def read_pages(pictures: list[np.ndarray], floor: float) -> list[list[tuple[tupl
     def read(job) -> list[tuple[tuple, OcrWord]]:
         number, strip, first, last = job
         found = []
-        for line, word in _words_of(_ocr_data(pictures[number][first:last]), floor):
+        for line, word in _words_of(_ocr_data(pictures[number][first:last], lang=lang), floor):
             b = word.bbox
             moved = OcrWord(word.text, BoundingBox(b.x0, b.y0 + first, b.x1, b.y1 + first), word.confidence)
             found.append(((strip, *line), moved))
@@ -511,7 +533,7 @@ def read_windows(picture: np.ndarray, boxes: list[BoundingBox], config: Detectio
             return []
         montage, rows = _stack([prepared[i][3] for i in batch])
         placed = {i: [] for i in batch}
-        for _line, word in _words_of(_ocr_data(montage, _BLOCK_PAGE_SEGMENTATION), config.ocr_min_confidence):
+        for _line, word in _words_of(_ocr_data(montage, _BLOCK_PAGE_SEGMENTATION, config.ocr_language), config.ocr_min_confidence):
             b = word.bbox
             middle = (b.y0 + b.y1) / 2
             for i, (top, bottom) in zip(batch, rows):
@@ -640,7 +662,13 @@ def _is_upright_unreadable(words: list[OcrWord]) -> bool:
     return tall * 2 > len(words)
 
 
-def detect_scan(original: np.ndarray, suspect: np.ndarray, config: DetectionConfig) -> TextScanResult:
+def detect_scan(
+    original: np.ndarray,
+    suspect: np.ndarray,
+    config: DetectionConfig,
+    reading: tuple[np.ndarray, np.ndarray] | None = None,
+    alternate: tuple[np.ndarray, np.ndarray] | None = None,
+) -> TextScanResult:
     """Text differences between a digital file and a scan of it, both as ink pictures in the shared frame.
 
     Both files are read whole (in strips, side by side) and their words matched by what they say and where they
@@ -650,10 +678,14 @@ def detect_scan(original: np.ndarray, suspect: np.ndarray, config: DetectionConf
     scan actually is (judged from the words that matched nearby), and every way the line was read -- its window,
     the whole-page reading -- is tried: only if none of them agree is it a difference. See
     `DetectionConfig.ocr_min_confidence_scan` for what is ignored and why.
+
+    `original` and `suspect` are the ink pictures (what the ink agreement of a difference is judged on); `reading` is
+    the pair of pictures the words are read from, if not those (see `DetectionConfig.scan_reading_scan`), and `alternate`
+    another pair the lines that differ are read from as well (see `DetectionConfig.scan_reading_alternate`).
     """
     with StageTimer(logger, "detector_text"):
-        reading_original, reading_suspect = reading_picture(original), reading_picture(suspect)
-        digital_page, scan_page = read_pages([reading_original, reading_suspect], config.ocr_min_confidence)
+        reading_original, reading_suspect = (reading_picture(picture) for picture in (reading or (original, suspect)))
+        digital_page, scan_page = read_pages([reading_original, reading_suspect], config.ocr_min_confidence, config.ocr_language)
 
         lines: dict[tuple, list[OcrWord]] = {}
         for line, word in digital_page:
@@ -680,9 +712,14 @@ def detect_scan(original: np.ndarray, suspect: np.ndarray, config: DetectionConf
         if boxes:
             digital_readings = read_windows(reading_original, boxes, config)
             scan_readings = read_windows(reading_suspect, scan_boxes, config)
+            digital_second = scan_second = [[] for _ in boxes]
+            if alternate is not None:
+                second_original, second_suspect = (reading_picture(picture) for picture in alternate)
+                digital_second = read_windows(second_original, boxes, config)
+                scan_second = read_windows(second_suspect, scan_boxes, config)
             pad = config.text_line_pad_px
-            for number, box, offset, scan_box, digital_reading, scan_reading in zip(
-                suspicious, boxes, offsets, scan_boxes, digital_readings, scan_readings
+            for number, box, offset, scan_box, digital_reading, scan_reading, digital_other, scan_other in zip(
+                suspicious, boxes, offsets, scan_boxes, digital_readings, scan_readings, digital_second, scan_second
             ):
                 # everything in the digital file's frame: the scan's words are moved back by how far the scan is off here
                 back = (-offset[0], -offset[1])
@@ -693,7 +730,11 @@ def detect_scan(original: np.ndarray, suspect: np.ndarray, config: DetectionConf
                     and scan_box.y0 - pad <= word.bbox.center[1] <= scan_box.y1 + pad
                 ]
                 scan_variants = [_moved(scan_reading, back), _moved(on_page, back)]
-                scan_variants.append(_union_of_readings(*scan_variants))
+                if scan_other:
+                    scan_variants.append(_moved(scan_other, back))
+                scan_variants.append(_union_of_readings(*scan_variants[:2]))
+                if scan_other:
+                    scan_variants.append(_union_of_readings(scan_variants[-1], scan_variants[2]))
                 if not any(scan_variants):
                     if ink_agreement(original, suspect, box, offset) < config.text_present_ink_agreement:
                         anchor = digital_reading or anchors[number]
@@ -710,8 +751,14 @@ def detect_scan(original: np.ndarray, suspect: np.ndarray, config: DetectionConf
                         unreadable += 1  # the ink is there, but too soft to read: say so, do not call it a change
                     continue
                 digital_variants = [digital_reading, anchors[number], _union_of_readings(digital_reading, anchors[number])]
+                if digital_other:
+                    digital_variants += [digital_other, _union_of_readings(digital_variants[2], digital_other)]
                 found = _fewest_differences(digital_variants, scan_variants)
-                candidates += [_marked_if_misread(candidate, original, suspect, config, offset) for candidate in found]
+                candidates += [
+                    marked
+                    for marked in (_marked_if_misread(candidate, original, suspect, config, offset) for candidate in found)
+                    if marked is not None
+                ]
 
         windows = [_span_bbox(words) for words in anchors]
         added = [scan_words[i] for i in sorted(extra)]
@@ -799,7 +846,8 @@ def ink_agreement(
     has none there. `offset` is where the scan sits relative to the digital file here (a scan is never registered
     exactly): its window is `box` moved by that much."""
     x0, y0, x1, y1 = _padded(box, _AGREEMENT_PAD_PX, original.shape)
-    sx0, sy0, sx1, sy1 = (int(round(v)) for v in (x0 + offset[0], y0 + offset[1], x1 + offset[0], y1 + offset[1]))
+    sx0, sy0 = int(round(x0 + offset[0])), int(round(y0 + offset[1]))
+    sx1, sy1 = sx0 + (x1 - x0), sy0 + (y1 - y0)  # (rounded together: the two windows must be the same size)
     a = original[y0:y1, x0:x1] < _DARK
     height, width = suspect.shape[:2]
     window = np.full(a.shape, 255, np.uint8)  # (what lies beyond the scan's edge is blank)
@@ -816,6 +864,70 @@ def ink_agreement(
     return float(min(a_in_b, b_in_a))
 
 
+_CORRELATION_BLUR_PX = 0.8  # both pictures are softened a little before they are correlated: a scan is softer than the file
+_CORRELATION_PAD_PX = 2
+_CORRELATION_MIN_WINDOW_PX = 10
+_CORRELATION_BLANK = 4.0  # a window whose ink strength varies by less than this (standard deviation) is blank
+_CORRELATION_LOCAL_SLACK_PX = 6  # a window may re-settle this far from the box's own shift (a scan warps a little along a line)
+
+
+def _ncc(a: np.ndarray, b: np.ndarray) -> float | None:
+    """Normalised correlation of two equal crops; None where both are blank, 0 where only one has ink."""
+    a_ink, b_ink = float(a.std()) >= _CORRELATION_BLANK, float(b.std()) >= _CORRELATION_BLANK
+    if not a_ink and not b_ink:
+        return None
+    if a_ink != b_ink:
+        return 0.0
+    return float(cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+
+def ink_correlation(
+    original: np.ndarray,
+    suspect: np.ndarray,
+    box: BoundingBox,
+    search_px: int = 10,
+    window_share: float = 0.8,
+    offset: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float]:
+    """(as a whole, in its worst stretch) how closely the ink in `box` of the original is the ink of the suspect, wherever
+    the suspect has it within `search_px` of where `offset` says the scan sits: the normalised correlation of the two ink pictures, whole and along windows about
+    a letter wide. A word the reading got wrong over ink that is the same correlates well everywhere; a letter that was
+    changed leaves one stretch that does not, however well the rest of the word does. (0, 0) where there is nothing to compare."""
+    x0, y0, x1, y1 = _padded(box, _CORRELATION_PAD_PX, original.shape)
+    if x1 - x0 < 6 or y1 - y0 < 6:
+        return 0.0, 0.0
+    a = cv2.GaussianBlur(255.0 - original[y0:y1, x0:x1].astype(np.float32), (0, 0), _CORRELATION_BLUR_PX)
+    sx0, sy0, sx1, sy1 = _padded(_shifted_box(BoundingBox(x0, y0, x1, y1), offset), search_px, suspect.shape)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return 0.0, 0.0
+    b = cv2.GaussianBlur(255.0 - suspect[sy0:sy1, sx0:sx1].astype(np.float32), (0, 0), _CORRELATION_BLUR_PX)
+    height, width = a.shape
+    if b.shape[0] < height or b.shape[1] < width or float(a.std()) < _CORRELATION_BLANK:
+        return 0.0, 0.0
+    fit = cv2.matchTemplate(b, a, cv2.TM_CCOEFF_NORMED)
+    _low, best, _low_at, (left, top) = cv2.minMaxLoc(fit)
+    # A long line of a scan can warp a little along its length (it is never quite flat under the platen), so the one
+    # shift that fits the box as a whole can be a few pixels out partway along it. Each window is let re-settle on its
+    # own, within a few pixels of that shift, rather than being judged at the whole box's shift alone.
+    window = max(_CORRELATION_MIN_WINDOW_PX, int(window_share * height))
+    local_radius = min(_CORRELATION_LOCAL_SLACK_PX, max(0, (b.shape[1] - width) // 2), max(0, (b.shape[0] - height) // 2))
+    scores = []
+    for start in range(0, max(1, width - window + 1), max(1, window // 2)):
+        piece = a[:, start : start + window]
+        aligned_at_start = b[top : top + height, left + start : left + start + window]
+        if local_radius <= 0 or float(piece.std()) < _CORRELATION_BLANK:
+            score = _ncc(piece, aligned_at_start)
+        else:
+            wleft, wtop = max(0, left + start - local_radius), max(0, top - local_radius)
+            wright = min(b.shape[1], left + start + window + local_radius)
+            wbottom = min(b.shape[0], top + height + local_radius)
+            local = b[wtop:wbottom, wleft:wright]
+            score = float(cv2.matchTemplate(local, piece, cv2.TM_CCOEFF_NORMED).max()) if local.shape[0] >= piece.shape[0] and local.shape[1] >= piece.shape[1] else _ncc(piece, aligned_at_start)
+        if score is not None:
+            scores.append(score)
+    return float(best), (min(scores) if scores else float(best))
+
+
 def _ranked_down(candidate: DiffCandidate, why: str) -> DiffCandidate:
     return DiffCandidate(
         bbox=candidate.bbox,
@@ -824,7 +936,21 @@ def _ranked_down(candidate: DiffCandidate, why: str) -> DiffCandidate:
         confidence=min(candidate.confidence, LIKELY_MISREAD_CONFIDENCE),
         detail=f"{candidate.detail} ({why})",
         magnitude=candidate.magnitude,
+        uncertain=True,
     )
+
+
+def _same_ink(
+    candidate: DiffCandidate, original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, offset: tuple[float, float]
+) -> bool:
+    """Whether the two files' ink pictures are the same picture in the difference's box (see `text_same_ink_worst`).
+
+    `worst` (every window re-settled on its own, so a line's warp along a scan does not count against it) is what
+    decides it; `whole` (one shift for the box) only rules out an accident of many small windows each finding
+    something to latch onto in an otherwise unrelated picture.
+    """
+    whole, worst = ink_correlation(original, suspect, candidate.bbox, offset=offset)
+    return whole >= config.text_same_ink_loose_correlation and worst >= config.text_same_ink_worst
 
 
 def _marked_if_misread(
@@ -833,8 +959,9 @@ def _marked_if_misread(
     suspect: np.ndarray,
     config: DetectionConfig,
     offset: tuple[float, float] = (0.0, 0.0),
-) -> DiffCandidate:
-    """A difference that is probably the reading's and not the artwork's, ranked down (still listed).
+) -> DiffCandidate | None:
+    """A difference that is probably the reading's and not the artwork's, ranked down (still listed, hidden by
+    default): the two files' ink pictures are the same picture in the difference's box (`_same_ink`).
 
     * A word the scan reads differently although its ink is the digital word's: a misread of the scan.
     * A word said to be new, or missing, where the other file has the ink all the same: read in one file and not the
@@ -850,7 +977,7 @@ def _marked_if_misread(
         if _ink_in(suspect, here, config.text_ink_reach_px) >= config.text_added_ink_share * _ink_in(original, candidate.bbox, 3):
             return _ranked_down(candidate, "the scan has ink here that was not read: likely a misread")
         return candidate
-    if ink_agreement(original, suspect, candidate.bbox, offset, config.text_misread_slack_px) < config.text_misread_ink_agreement:
+    if not _same_ink(candidate, original, suspect, config, offset):
         return candidate
     return _ranked_down(candidate, "the ink matches: likely a misread of the scan")
 
@@ -895,11 +1022,15 @@ def corroborated(
 # small one reads the finding's own words most surely (over a gradient a wider one lost a '100 g'), and a wide, short one
 # takes in a whole line (a long word cut by the small one, the words a dropped word let move along).
 _DESCRIBE_WINDOWS = ((48, 48), (128, 24))
-_DESCRIBE_UPSCALE = 2.0  # small type is read far more surely enlarged (a real pair: '100g' beside '10' 'g' became '100' 'g')
+_DESCRIBE_UPSCALES = ((24, 4.0), (60, 3.0))  # (finding no bigger than this, enlarge by this): small type is read far more surely
+_DESCRIBE_UPSCALE = 2.0  # enlarged (a real pair: '100g' beside '10' 'g' became '100' 'g'; a 5 px serial number needs 4x)
+_DESCRIBE_ROTATE_MAX_PX = 100  # a finding this small, read as nothing upright, is tried as text on its side
+_DESCRIBE_SIDEWAYS_WINDOW = (24, 128)  # (across, along) padding for text on its side: a serial number runs a long way
 _DESCRIBE_MAX_AREA_PX = 3_500_000  # a finding this big is a panel, not a phrase: not read
 _DESCRIBE_REACH_PX = 24  # the phrase a finding belongs to reaches this far along its line (a word's height and a half, if more)
 _BLOCK_PAGE_SEGMENTATION = "--psm 6"  # a window holds a block of text
 _MAX_DETAIL_CHARS = 70
+_SMALL_FINDING_PX = 24  # a finding no bigger than this either way is a speck (or a glyph), not a phrase
 _DARK_BACKGROUND = 110  # a crop whose median tone is darker than this is light text on dark, and is read reversed
 _MAX_READERS = 8
 
@@ -921,24 +1052,50 @@ def _readable(crop: np.ndarray) -> np.ndarray:
     return gray
 
 
-def _read_around(image: np.ndarray, box: BoundingBox, config: DetectionConfig, pad_x: int, pad_y: int) -> list[OcrWord]:
-    """The words in a window around `box`, in reading order and in the whole picture's pixels."""
+def _enlargement(box: BoundingBox) -> float:
+    """How much to enlarge a window before it is read: type that small is read only when enlarged a good deal."""
+    size = max(box.width, box.height)
+    for limit, factor in _DESCRIBE_UPSCALES:
+        if size <= limit:
+            return factor
+    return _DESCRIBE_UPSCALE
+
+
+def _read_around(
+    image: np.ndarray, box: BoundingBox, config: DetectionConfig, pad_x: int, pad_y: int, rotation: int | None = None
+) -> list[OcrWord]:
+    """The words in a window around `box`, in reading order and in the whole picture's pixels.
+
+    `rotation` (cv2.ROTATE_90_CLOCKWISE / _COUNTERCLOCKWISE) turns the window before it is read, for text that runs up
+    or down the page (a serial number down a flap): the words come back where they lie on the page, not in the turned window.
+    """
     height, width = image.shape[:2]
     x0, x1 = max(0, int(box.x0) - pad_x), min(width, math.ceil(box.x1) + pad_x)
     y0, y1 = max(0, int(box.y0) - pad_y), min(height, math.ceil(box.y1) + pad_y)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return []
-    factor = _DESCRIBE_UPSCALE
-    crop = cv2.resize(_readable(image[y0:y1, x0:x1]), None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+    factor = _enlargement(box)
+    enlarged = cv2.resize(_readable(image[y0:y1, x0:x1]), None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+    enlarged_height, enlarged_width = enlarged.shape[:2]
+    crop = enlarged if rotation is None else cv2.rotate(enlarged, rotation)
     crop_width = crop.shape[1]
     words = []
-    for _line, word in _words_of(_ocr_data(crop, _BLOCK_PAGE_SEGMENTATION), config.ocr_min_confidence):
+    for _line, word in _words_of(_ocr_data(crop, _BLOCK_PAGE_SEGMENTATION, config.ocr_language), config.ocr_min_confidence):
         b = word.bbox
-        # A word touching the window's edge is cut short by it ('Take' read as 'ce'), unless that edge is the picture's own.
-        if (b.x0 <= 2 and x0 > 0) or (b.x1 >= crop_width - 2 and x1 < width):
+        if rotation is None:
+            ex0, ey0, ex1, ey1 = b.x0, b.y0, b.x1, b.y1
+            cut = (b.x0 <= 2 and x0 > 0) or (b.x1 >= crop_width - 2 and x1 < width)
+        elif rotation == cv2.ROTATE_90_CLOCKWISE:  # the window's (x, y) went to (height - y, x): back again
+            ex0, ey0, ex1, ey1 = b.y0, enlarged_height - b.x1, b.y1, enlarged_height - b.x0
+            cut = (b.x0 <= 2 and y1 < height) or (b.x1 >= crop_width - 2 and y0 > 0)
+        else:  # counter-clockwise: (x, y) went to (y, width - x)
+            ex0, ey0, ex1, ey1 = enlarged_width - b.y1, b.x0, enlarged_width - b.y0, b.x1
+            cut = (b.x0 <= 2 and y0 > 0) or (b.x1 >= crop_width - 2 and y1 < height)
+        # A word touching the window's end is cut short by it ('Take' read as 'ce'), unless that edge is the picture's own.
+        if cut:
             continue
         words.append(
-            OcrWord(word.text, BoundingBox(b.x0 / factor + x0, b.y0 / factor + y0, b.x1 / factor + x0, b.y1 / factor + y0), word.confidence)
+            OcrWord(word.text, BoundingBox(ex0 / factor + x0, ey0 / factor + y0, ex1 / factor + x0, ey1 / factor + y0), word.confidence)
         )
     return _trustworthy(words, config)
 
@@ -965,7 +1122,13 @@ def _supported(
     words = gone + new
     if any(word.confidence < config.text_describe_min_confidence for word in words):
         return False
-    if gone and new and any(word.bbox.intersection_area(box) > 0 for word in words):
+    touching = any(word.bbox.intersection_area(box) > 0 for word in words)
+    if box.width <= _SMALL_FINDING_PX and box.height <= _SMALL_FINDING_PX:
+        # A speck is not the words beside it: the enlarged reading of a corner of a line 'read' '38' beside it. A claim on
+        # so small a finding has to be about a word the finding lies on, and a real one (three letters, or a number).
+        if not touching or any(len(canonical(word.text)) < 3 and not canonical(word.text).isdigit() for word in words):
+            return False
+    if gone and new and touching:
         return True
     agreement = marks_agreement(original, suspect, _span_bbox(words), 2, config.residue_slack_px)
     if agreement is None:
@@ -982,23 +1145,35 @@ def _described(
     original: np.ndarray,
     suspect: np.ndarray,
     config: DetectionConfig,
+    sideways: bool = False,
 ) -> DiffCandidate | None:
     """The text change inside `box` that two readings of it show, if they show one and the pixels agree it is one.
+    (`sideways`: the text runs up or down the page, so a line is a column and 'along' is y.)
 
     The words on the finding's line are lined up across the whole window, so a word that was dropped is the one
     that is missing rather than everything after it having 'changed' (the words beside it moved along). Only the
     words that differ AND touch the finding, or lie within a word's height and a half of it, are what it says.
     """
-    heights = [min(word.bbox.height, 3 * box.height + 20) for word in words_original + words_suspect]
-    height = float(np.median(heights)) if heights else box.height
+    def across(b: BoundingBox) -> tuple[float, float]:  # the extent of a line's height (its width, if the text is on its side)
+        return (b.x0, b.x1) if sideways else (b.y0, b.y1)
+
+    def along(b: BoundingBox) -> tuple[float, float]:  # the extent along the line
+        return (b.y0, b.y1) if sideways else (b.x0, b.x1)
+
+    finding_across, finding_along = across(box), along(box)
+    finding_thickness = finding_across[1] - finding_across[0]
+    heights = [min(across(word.bbox)[1] - across(word.bbox)[0], 3 * finding_thickness + 20) for word in words_original + words_suspect]
+    height = float(np.median(heights)) if heights else finding_thickness
     reach = max(float(_DESCRIBE_REACH_PX), 1.5 * height)
-    slack = max(0.75 * box.height, 14.0)
+    slack = max(0.75 * finding_thickness, 14.0)
 
     def on_line(word: OcrWord) -> bool:
-        return box.y0 - slack <= word.bbox.center[1] <= box.y1 + slack
+        first, last = across(word.bbox)
+        return finding_across[0] - slack <= (first + last) / 2 <= finding_across[1] + slack
 
     def at_finding(word: OcrWord) -> bool:
-        return on_line(word) and word.bbox.x1 >= box.x0 - reach and word.bbox.x0 <= box.x1 + reach
+        first, last = along(word.bbox)
+        return on_line(word) and last >= finding_along[0] - reach and first <= finding_along[1] + reach
 
     original_line = [word for word in words_original if on_line(word)]
     suspect_line = [word for word in words_suspect if on_line(word)]
@@ -1007,13 +1182,19 @@ def _described(
     )
     gone: list[OcrWord] = []
     new: list[OcrWord] = []
+    alike: list[tuple[OcrWord, OcrWord]] = []  # the words that read the same, at the finding, each with its counterpart
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag != "equal":
             gone += [word for word in original_line[i1:i2] if at_finding(word)]
             new += [word for word in suspect_line[j1:j2] if at_finding(word)]
+        else:
+            alike += [(a, b) for a, b in zip(original_line[i1:i2], suspect_line[j1:j2]) if at_finding(a) or at_finding(b)]
     other_read_something = bool(suspect_line if gone else original_line)
-    if not (gone or new) or not _supported(box, gone, new, other_read_something, original, suspect, config):
-        return None  # the words are the same, or the pixels do not bear out that they changed
+    if not (gone or new):
+        # The words are the same: what differs, if anything, is how they are set.
+        return _set_differently(box, alike, original, suspect, config)
+    if not _supported(box, gone, new, other_read_something, original, suspect, config):
+        return None  # the pixels do not bear out that the words changed
 
     if gone and new:
         subtype, detail = DiffSubtype.CHANGED, f"'{_clip(_join(gone))}' -> '{_clip(_join(new))}'"
@@ -1022,6 +1203,181 @@ def _described(
     else:
         subtype, detail = DiffSubtype.ADDED, f"'{_clip(_join(new))}' added in suspect"
     return _candidate(box, _span_type([word.text for word in gone + new]), subtype, _mean_confidence(gone + new), detail)
+
+
+_FONT_MIN_INK_PX = 30  # fewer ink pixels than this in a word's crop say nothing about how it is set
+_FONT_COLOUR_DELTA = 9.0  # ink this many CIE76 units apart between the two files is a different colour of type
+_FONT_WEIGHT_RATIO = 1.25  # strokes this many times as thick (for the type's size) in one file are a different weight
+_FONT_SIZE_RATIO = 1.07  # type whose ink is this many times as tall in one file is a different size
+_FONT_BIG_SIZE_RATIO = 1.15  # ... and where the typeface changed too (its height differs of itself), this many
+_FONT_HUE_ANGLE = 22.0  # thin type whose colour lies this many degrees round from the other file's (as seen from the paper) is another colour
+_FONT_HUE_MIN_CONTRAST = 15.0  # ... if it stands out from the paper by at least this much
+_FONT_MAX_WORDS = 12
+_FONT_MOVED_PX = 6.0  # words this far from where they were have moved: the readings' boxes are good to a few px
+_FONT_UNIFORM_SHARE = 0.25  # ... and every word by about the same (a wider typeface moves each word further than the last)
+_FONT_TYPEFACE_AGREEMENT = 0.85  # below this the two files' letters do not coincide (each word cut out, made one size, one weight)
+_FONT_WORD_MIN_INK_PX = 12
+
+
+def _ink_of(crop: np.ndarray) -> np.ndarray:
+    """A boolean mask of the type in an RGB crop: what departs from the paper by half of the crop's own range."""
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if crop.ndim == 3 else crop
+    low, high = np.percentile(gray, (2, 98))
+    if high - low < 30:
+        return np.zeros(gray.shape, bool)
+    rim = np.concatenate([gray[0], gray[-1], gray[:, 0], gray[:, -1]])
+    return np.abs(gray.astype(np.int16) - int(np.median(rim))) > (high - low) / 2
+
+
+def _lab(pixels: np.ndarray) -> np.ndarray:
+    """The average colour of RGB pixels (N x 3), as CIELAB."""
+    average = np.uint8(np.round(pixels.mean(axis=0))).reshape(1, 1, 3)
+    lab = cv2.cvtColor(average, cv2.COLOR_RGB2LAB).reshape(3).astype(np.float32)
+    lab[0] *= 100.0 / 255.0
+    lab[1:] -= 128.0
+    return lab
+
+
+_CORE_KERNEL = np.ones((3, 3), np.uint8)
+
+
+def _type_colour(crop: np.ndarray, ink: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+    """(the type's colour, the paper's, whether the type has a solid core), as CIELAB. Where the strokes are thick enough
+    to have a core, the type's colour is that of the core (the edge pixels are part paper: blur or a coarser scan lightens
+    them); thinner strokes are all edge, and only their direction from the paper's colour can be trusted."""
+    core = cv2.erode(ink.astype(np.uint8), _CORE_KERNEL).astype(bool)
+    solid = int(core.sum()) >= _FONT_MIN_INK_PX
+    rim = np.concatenate([crop[0], crop[-1], crop[:, 0], crop[:, -1]])
+    return _lab(crop[core] if solid else crop[ink]), _lab(rim), solid
+
+
+def _font_colour_change(a_crop: np.ndarray, a_ink: np.ndarray, b_crop: np.ndarray, b_ink: np.ndarray) -> float | None:
+    """How far apart (CIE76) the colours of the type in two crops are -- None if they are not different. Solid type is
+    compared by colour. Thin type only by hue: its strokes are all edge, so blur or a softer render makes black type grey
+    and says nothing about a change of colour, but black and red type lie in different directions from the paper."""
+    (ink_a, paper_a, solid_a), (ink_b, paper_b, solid_b) = _type_colour(a_crop, a_ink), _type_colour(b_crop, b_ink)
+    if solid_a and solid_b:
+        delta = float(np.linalg.norm(ink_a - ink_b))
+        return delta if delta >= _FONT_COLOUR_DELTA else None
+    toward_a, toward_b = ink_a - paper_a, ink_b - paper_b
+    size_a, size_b = float(np.linalg.norm(toward_a)), float(np.linalg.norm(toward_b))
+    if min(size_a, size_b) < _FONT_HUE_MIN_CONTRAST:
+        return None
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, float(toward_a @ toward_b) / (size_a * size_b)))))
+    if angle < _FONT_HUE_ANGLE:
+        return None
+    return float(np.linalg.norm(toward_a / size_a - toward_b / size_b) * (size_a + size_b) / 2)
+
+
+def _ink_extent(ink: np.ndarray) -> int:
+    """How tall the ink is: from its top row to its bottom row."""
+    rows = np.flatnonzero(ink.any(axis=1))
+    return int(rows[-1] - rows[0] + 1) if len(rows) else 0
+
+
+_LETTERS_UPSCALE = 3  # each word is enlarged this much before its letters are compared: the letters differ by less than a pixel
+
+
+def _same_letters(original: np.ndarray, suspect: np.ndarray, pairs: list[tuple[OcrWord, OcrWord]]) -> float | None:
+    """How closely the letters of the words coincide in the two files, whatever their size and weight: each word is cut
+    out of both and enlarged, the suspect's is scaled to the original's box, the thinner strokes are thickened to the
+    thicker, and the share of the ink that lies on the other's (within a third of a pixel) is measured. The same typeface
+    gives 0.9 or more (a bolder cut, a bigger size); another one, 0.85 or less. (The median over the words, so one
+    misread word does not decide it.) None where there is too little ink to say."""
+    scores = []
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for a, b in pairs:
+        ax0, ay0, ax1, ay1 = _padded(a.bbox, 1, original.shape)
+        bx0, by0, bx1, by1 = _padded(b.bbox, 1, suspect.shape)
+        if ax1 - ax0 < 6 or ay1 - ay0 < 6 or bx1 - bx0 < 6 or by1 - by0 < 6:
+            continue
+        a_big = cv2.resize(original[ay0:ay1, ax0:ax1], None, fx=_LETTERS_UPSCALE, fy=_LETTERS_UPSCALE, interpolation=cv2.INTER_CUBIC)
+        b_big = cv2.resize(suspect[by0:by1, bx0:bx1], (a_big.shape[1], a_big.shape[0]), interpolation=cv2.INTER_CUBIC)
+        a_ink, b_ink = _ink_of(a_big), _ink_of(b_big)
+        if a_ink.sum() < 3 * _FONT_WORD_MIN_INK_PX or b_ink.sum() < 3 * _FONT_WORD_MIN_INK_PX:
+            continue
+        a_ink, b_ink = _equal_strokes(a_ink, b_ink)
+        a_in_b = (a_ink & cv2.dilate(b_ink.astype(np.uint8), kernel).astype(bool)).sum() / a_ink.sum()
+        b_in_a = (b_ink & cv2.dilate(a_ink.astype(np.uint8), kernel).astype(bool)).sum() / b_ink.sum()
+        scores.append(float(min(a_in_b, b_in_a)))
+    return float(np.median(scores)) if scores else None
+
+
+def _set_differently(
+    box: BoundingBox,
+    same_words: list[tuple[OcrWord, OcrWord]],
+    original: np.ndarray,
+    suspect: np.ndarray,
+    config: DetectionConfig,
+) -> DiffCandidate | None:
+    """How the words of a finding differ where they read the SAME in both files: where they are, and their colour,
+    typeface, weight and size -- said only from what the pixels of the words themselves show.
+
+    `same_words`: the words of the finding's line that read alike in the two files, each with its counterpart. They MOVED
+    if every one is about the same distance from its counterpart (a wider typeface pushes each further than the last).
+    The words are cut from both files: ink of another colour; letters that do not coincide once made one size and one
+    weight (another typeface); strokes thicker or thinner for the size of the type (another weight); ink taller or
+    shorter (another size). Where none of that shows, nothing is said and the finding stays what its pixels say it is.
+    """
+    pairs = [(a, b) for a, b in same_words if min(a.confidence, b.confidence) >= config.text_describe_min_confidence]
+    if not pairs:
+        return None
+    pairs = pairs[:_FONT_MAX_WORDS]
+    text = " ".join(a.text for a, _b in pairs)
+
+    def crop_of(image: np.ndarray, boxes: list[BoundingBox]) -> np.ndarray | None:
+        union = boxes[0]
+        for other in boxes[1:]:
+            union = union.union(other)
+        x0, y0, x1, y1 = _padded(union, 2, image.shape)
+        return image[y0:y1, x0:x1] if x1 - x0 > 4 and y1 - y0 > 4 else None
+
+    a_crop, b_crop = crop_of(original, [a.bbox for a, _b in pairs]), crop_of(suspect, [b.bbox for _a, b in pairs])
+    if a_crop is None or b_crop is None:
+        return None
+
+    said: list[str] = []
+    subtype, magnitude = DiffSubtype.CHANGED, 0.0
+    across = [b.bbox.x0 - a.bbox.x0 for a, b in pairs]
+    down = [b.bbox.center[1] - a.bbox.center[1] for a, b in pairs]
+    dx, dy = float(np.median(across)), float(np.median(down))
+    uniform = (max(across) - min(across) <= max(3.0, _FONT_UNIFORM_SHARE * abs(dx))) and (
+        max(down) - min(down) <= max(3.0, _FONT_UNIFORM_SHARE * abs(dy))
+    )
+    if uniform and math.hypot(dx, dy) >= _FONT_MOVED_PX:
+        from app.engine.detectors.movement import how_far  # (imported here: movement needs no reader)
+
+        subtype, magnitude = DiffSubtype.MOVED, math.hypot(dx, dy)
+        said.append(f"moved {how_far(dx, dy)}")
+
+    a_ink, b_ink = _ink_of(a_crop), _ink_of(b_crop)
+    if a_ink.sum() >= _FONT_MIN_INK_PX and b_ink.sum() >= _FONT_MIN_INK_PX:
+        colour = _font_colour_change(a_crop, a_ink, b_crop, b_ink)
+        if colour is not None:
+            said.append(f"font colour changed (dE {colour:.0f})")
+        letters = _same_letters(original, suspect, pairs)
+        height_a, height_b = _ink_extent(a_ink), _ink_extent(b_ink)
+        taller = height_b / height_a if height_a and height_b else 1.0
+        if letters is not None and letters < _FONT_TYPEFACE_AGREEMENT:
+            said.append("font changed (a different typeface)")
+            size_limit = _FONT_BIG_SIZE_RATIO
+        else:
+            size_limit = _FONT_SIZE_RATIO
+            thick_a, thick_b = _stroke_width(a_ink), _stroke_width(b_ink)
+            if min(thick_a, thick_b) > 0 and height_a and height_b:
+                ratio = (thick_b / height_b) / (thick_a / height_a)  # (strokes grow with the type: what matters is per size)
+                if ratio >= _FONT_WEIGHT_RATIO:
+                    said.append("font weight changed (bolder in suspect)")
+                elif ratio <= 1 / _FONT_WEIGHT_RATIO:
+                    said.append("font weight changed (lighter in suspect)")
+        if taller >= size_limit:
+            said.append(f"font size changed ({taller - 1:.0%} bigger in suspect)")
+        elif taller <= 1 / size_limit:
+            said.append(f"font size changed ({1 - taller:.0%} smaller in suspect)")
+    if not said:
+        return None
+    detail = "Text " + "; ".join(said) + f": '{_clip(text)}'"
+    return _candidate(box, DiffType.TEXT, subtype, 0.8, detail, magnitude=magnitude)
 
 
 def describe(
@@ -1044,6 +1400,21 @@ def describe(
             )
             if found is not None:
                 return found
+        if max(box.width, box.height) <= _DESCRIBE_ROTATE_MAX_PX:
+            # Nothing read upright: it may be text up or down the page (a serial number down a flap), so it is tried turned.
+            pad_across, pad_along = _DESCRIBE_SIDEWAYS_WINDOW
+            for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
+                found = _described(
+                    box,
+                    _read_around(original, box, config, pad_across, pad_along, rotation),
+                    _read_around(suspect, box, config, pad_across, pad_along, rotation),
+                    original,
+                    suspect,
+                    config,
+                    sideways=True,
+                )
+                if found is not None:
+                    return found
         return None
 
     with StageTimer(logger, "describe_text"):

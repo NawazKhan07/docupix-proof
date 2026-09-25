@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
-from app.engine.aggregation.severity import SEVERITY_COLOURS
+from app.models.categories import category_colour
 from app.models.diff import BoundingBox, DiffCluster
 from app.ui.gestures import enable_zoom_gestures, zoom_from_viewport_event, zoom_from_wheel
 
@@ -329,7 +329,7 @@ class PaneView(QGraphicsView):
 
     # -- markers -------------------------------------------------------------
     def set_markers(self, clusters: list[DiffCluster], selected_id: int | None = None) -> None:
-        """Draw one box per finding, in its severity colour (FR-7.2).
+        """Draw one box per finding, in the colour of its category (text, colour, graphics, barcode, Braille).
 
         Every pane draws the *same* shared-space box: both views are drawn from
         the one aligned pair, so a marker cannot land in different places in
@@ -343,7 +343,7 @@ class PaneView(QGraphicsView):
         for cluster in clusters:
             box = cluster.bbox_in_original
             item = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
-            colour = QColor(SEVERITY_COLOURS[cluster.severity])
+            colour = QColor(category_colour(cluster.category))
             is_selected = cluster.id == selected_id
 
             pen = QPen(colour, 3 if is_selected else 2)
@@ -358,7 +358,7 @@ class PaneView(QGraphicsView):
             self._scene.addItem(item)
             self._marker_items[cluster.id] = item
 
-            # A severity colour alone vanishes over artwork of the same colour
+            # A colour alone vanishes over artwork of the same colour
             # (a red marker on a red block), so each marker sits on a white halo.
             halo = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
             halo_pen = QPen(QColor(255, 255, 255, 230), pen.widthF() + 3)

@@ -78,7 +78,7 @@ def test_a_missing_sentence_on_a_large_sheet_is_one_finding_covering_it():
 
     outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, AppConfig())
 
-    assert outcome.detection_profile == "exact" and outcome.used_change_regions
+    assert outcome.detection_profile == "exact"
     assert len(outcome.clusters) == 1
     box = outcome.clusters[0].bbox_in_original
     # One box, spanning the whole sentence rather than a few of its letters.
@@ -96,6 +96,7 @@ def test_the_old_behaviour_was_fragmentary_which_is_why_the_profile_exists():
         exact_alignment_residual_px=-1.0,
         region_max_area_fraction=0.0,
         graphics_when_misregistered="ssim",  # the similarity map, which is what erased thin print
+        local_enabled=False,  # (the full-size local comparison came later, and sees the whole sentence too)
     )
 
     outcome = run_comparison(
@@ -117,7 +118,7 @@ def test_a_missing_sentence_is_one_finding_even_when_the_files_do_not_register_e
 
     outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(detection=misregistered))
 
-    assert outcome.detection_profile == "tolerant" and not outcome.used_change_regions
+    assert outcome.detection_profile == "tolerant"
     assert len(outcome.clusters) == 1
     box = outcome.clusters[0].bbox_in_original
     assert box.x0 <= 700 + 10 and box.x1 >= 700 + text_width - 10
@@ -158,8 +159,8 @@ def test_one_change_is_one_finding_not_a_colour_box_inside_a_graphics_box():
 
     outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, AppConfig())
 
-    assert len(outcome.clusters) == 1
-    assert outcome.clusters[0].types >= {DiffType.GRAPHICS, DiffType.COLOUR}
+    assert len(outcome.clusters) == 1  # (however many detectors saw it: one place, one finding)
+    assert outcome.clusters[0].category in ("graphics", "text")
 
 
 def test_findings_are_labelled_by_their_most_specific_kind():

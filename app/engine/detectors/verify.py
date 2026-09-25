@@ -33,6 +33,9 @@ _AGREEMENT_SLACK_PX = 2  # ink this close counts as the same ink
 _CONTEXT_PX = 12  # how much wider than a finding its marks are cut (see `_marks_within`)
 _MIN_BACKGROUND_PX = 16  # fewer pixels of background than this say nothing about the tint
 _PIXEL_TYPES = frozenset({DiffType.COLOUR, DiffType.GRAPHICS})
+_THIN_PX = 6  # a difference this thin (and at least `_THIN_ASPECT` times as long) is a line, whose edge residue is a pixel wider than a letter's
+_THIN_ASPECT = 3.0
+_SMALL_REGION_PX = 4000  # a colour region smaller than this (px^2) is a patch, not a panel
 _MAX_CHECKED_AREA_PX = 1_500_000  # a difference this big (a panel) is not a hairline: never checked
 
 
@@ -43,6 +46,8 @@ class Evidence:
     colour_delta: float  # CIEDE2000 between the two files' AVERAGE colour there
     agreement: float | None  # how far the marks coincide (0-1); None where either is blank and they cannot be compared
     background_delta: float = 0.0  # the same, over the part of the box away from any mark: a tint that changed shows here
+    contrast: float = 0.0  # CIEDE2000 between the original's ink and its background there: how much an edge that moved can shift the average
+    extent: int = 1  # the narrower side of the window (px): the narrower it is, the more a moved edge shifts its average
 
 
 def _marks(first: np.ndarray, second: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
@@ -77,12 +82,20 @@ def _mean_delta(a: np.ndarray, b: np.ndarray) -> float:
     return float(deltaE_ciede2000(rgb2lab(mean_a), rgb2lab(mean_b))[0, 0])
 
 
+def _mean_between(first: np.ndarray, second: np.ndarray) -> float:
+    """CIEDE2000 between the average colours of two sets of RGB pixels."""
+    mean_first = (first.mean(axis=0) / 255.0).reshape(1, 1, 3)
+    mean_second = (second.mean(axis=0) / 255.0).reshape(1, 1, 3)
+    return float(deltaE_ciede2000(rgb2lab(mean_first), rgb2lab(mean_second))[0, 0])
+
+
 @dataclass(frozen=True)
 class _Marks:
     """The two files' marks inside a finding's window, and how they line up."""
 
     agreement: float
     near_any: np.ndarray  # window-sized: within reach of a mark of either file
+    ink: np.ndarray  # window-sized: a mark of either file
 
 
 def _marks_within(original: np.ndarray, suspect: np.ndarray, box: BoundingBox, pad: int, slack_px: int) -> _Marks | None:
@@ -104,7 +117,31 @@ def _marks_within(original: np.ndarray, suspect: np.ndarray, box: BoundingBox, p
         return None
     a_near, b_near = _dilated(a, slack_px), _dilated(b, slack_px)
     agreement = min((a_here & b_near[inside]).sum() / a_here.sum(), (b_here & a_near[inside]).sum() / b_here.sum())
-    return _Marks(float(agreement), _dilated(a | b, slack_px + 1)[inside])
+    return _Marks(float(agreement), _dilated(a | b, slack_px + 1)[inside], (a | b)[inside])
+
+
+@dataclass(frozen=True)
+class PairMarks:
+    """How the marks of two crops of one place line up."""
+
+    agreement: float  # the smaller of the share of each one's marks lying within the slack of the other's (0-1)
+    only_original: int  # marks of the first that lie beyond the slack of the second's
+    only_suspect: int
+
+
+def marks_within_pair(original: np.ndarray, suspect: np.ndarray, slack_px: int) -> PairMarks | None:
+    """The marks of two colour crops of the same place (cut with one background and threshold), and how far they line
+    up. None if the two together have no marks to speak of."""
+    both = _marks(original, suspect)
+    if both is None:
+        return None
+    a, b = both
+    if not a.any() and not b.any():
+        return None
+    a_near, b_near = _dilated(a, slack_px), _dilated(b, slack_px)
+    a_in_b = float((a & b_near).sum() / a.sum()) if a.any() else 0.0
+    b_in_a = float((b & a_near).sum() / b.sum()) if b.any() else 0.0
+    return PairMarks(min(a_in_b, b_in_a), int((a & ~b_near).sum()), int((b & ~a_near).sum()))
 
 
 def marks_agreement(
@@ -125,28 +162,42 @@ def evidence(
     a, b = original[y0:y1, x0:x1], suspect[y0:y1, x0:x1]
     if a.size == 0:
         return Evidence(0.0, None)
+    extent = min(a.shape[0], a.shape[1])
     delta = _mean_delta(a.reshape(-1, 3), b.reshape(-1, 3))
     found = _marks_within(original, suspect, box, margin, slack_px)
     if found is None:
-        return Evidence(delta, None, delta)
+        return Evidence(delta, None, delta, 0.0, extent)
     background = ~found.near_any
     background_delta = _mean_delta(a[background], b[background]) if background.sum() >= _MIN_BACKGROUND_PX else 0.0
-    return Evidence(delta, found.agreement, background_delta)
+    contrast = 0.0
+    if background.sum() >= _MIN_BACKGROUND_PX and found.ink.sum() >= _MIN_BACKGROUND_PX // 4:
+        contrast = _mean_between(a[found.ink], a[background])
+    return Evidence(delta, found.agreement, background_delta, contrast, extent)
 
 
-def is_residue(found: Evidence, config: DetectionConfig) -> bool:
+def is_residue(found: Evidence, config: DetectionConfig, shape_only: bool = False) -> bool:
     """Whether the evidence says the two files have the same content there.
 
     Where the marks coincide, the letters and lines are the same and only how they are drawn differs: the average
     colour may move a little (`residue_max_ink_colour_delta`: a thin line drawn softer or a shade lighter), but the
     background between them must not (`residue_max_colour_delta`: a tint that changed is a change). Where there
     are no marks to compare (a flat area) the average colour must not differ at all by more than that.
+
+    `shape_only` is a finding about shape (the similarity map): if the marks coincide there is no shape difference, and
+    a colour one is for the colour comparison to report, so it is allowed a larger colour difference.
     """
     if found.agreement is None:
         return found.colour_delta < config.residue_max_colour_delta
+    # An edge across the window that moved or softened by `residue_edge_shift_px` changes the window's average by that
+    # much of the contrast, over the window's width: the stronger the edge (a black letter on light blue) and the
+    # narrower the window (a thin line), the further the average can shift although nothing changed.
+    shift_allowance = found.contrast * config.residue_edge_shift_px / max(found.extent, 1)
+    allowed = max(config.residue_max_ink_colour_delta, shift_allowance)
+    if shape_only:
+        allowed = max(allowed, config.residue_max_shape_colour_delta)
     return (
         found.agreement >= config.residue_min_agreement
-        and found.colour_delta < config.residue_max_ink_colour_delta
+        and found.colour_delta < allowed
         and found.background_delta < config.residue_max_colour_delta
     )
 
@@ -165,7 +216,7 @@ def _rated_by_average(candidate: DiffCandidate, original: np.ndarray, suspect: n
         return replace(
             candidate,
             type=DiffType.GRAPHICS,
-            subtype=DiffSubtype.CHANGED,
+            subtype=DiffSubtype.MOVED,  # (rated like a small shift: Minor, never Major for the size of the box)
             magnitude=0.5,
             confidence=0.5,
             detail="Shape or position differs (colour unchanged)",
@@ -176,6 +227,12 @@ def _rated_by_average(candidate: DiffCandidate, original: np.ndarray, suspect: n
         confidence=min(1.0, delta / (config.color_delta_e_threshold * 4)),
         detail=f"Colour changed (dE {delta:.1f})",
     )
+
+
+def _is_thin(box: BoundingBox) -> bool:
+    """Whether a box is a line (a few pixels across and much longer) rather than a speck the size of a glyph."""
+    short, long = sorted((box.width, box.height))
+    return short <= _THIN_PX and long >= _THIN_ASPECT * short
 
 
 def drop_residue(
@@ -195,7 +252,13 @@ def drop_residue(
         if candidate.type not in _PIXEL_TYPES or candidate.bbox.area > _MAX_CHECKED_AREA_PX:
             kept.append(candidate)
             continue
-        if is_residue(evidence(original, suspect, candidate.bbox, config.residue_margin_px, config.residue_slack_px), config):
+        # A thin difference (a line one file draws a pixel or two from where the other does) is forgiven one pixel more.
+        slack = config.residue_slack_px + (1 if _is_thin(candidate.bbox) else 0)
+        found = evidence(original, suspect, candidate.bbox, config.residue_margin_px, slack)
+        # A small patch of colour that differs by a shade is what two exports of one artwork do to a solid ink (a colour
+        # profile), not a change to a patch of it; a whole panel differing by that much is still a change.
+        small_shade = candidate.region and candidate.bbox.area < _SMALL_REGION_PX and found.colour_delta < config.residue_max_ink_colour_delta
+        if small_shade or is_residue(found, config, shape_only=candidate.type is DiffType.GRAPHICS):
             dropped += 1
             continue
         kept.append(_rated_by_average(candidate, original, suspect, config) if candidate.type is DiffType.COLOUR else candidate)

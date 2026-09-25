@@ -236,6 +236,14 @@ class DetectionConfig:
     # changes every colour, blurs every edge and never registers exactly, and comparing the two pictures gave dozens
     # of false 'graphics' differences (a fold line, the scanner's own edge, every dark block) round the few real ones.
     scan_compare_graphics: bool = False
+    # What each file is READ from in Scan vs Digital (see scan_normalizer.reading_source): 'ink' (the ink picture: background
+    # removed, ink black), 'gray' (the file's own grey), 'flat' (grey with the paper divided out), 'darkest' (the darkest
+    # channel, paper divided out), 'clahe' (flat, local contrast stretched) or 'adaptive' (flat, thresholded locally).
+    scan_reading_digital: str = "ink"
+    scan_reading_scan: str = "ink"
+    # A line that differs is read again, from its own window, in the picture above AND in this one ("" for none): a word
+    # that one picture misreads and the other reads is not a difference, and a real change is different in both.
+    scan_reading_alternate: str = ""
     # Text is read from the ink pictures at no more than this long edge (px): Tesseract reads best at
     # about 300 DPI, so an A4 page (3508 px) is read as it is and a larger sheet is reduced to this.
     ocr_long_edge_px: int = 3600
@@ -276,6 +284,11 @@ class DetectionConfig:
 
     # Text (OCR).
     ocr_min_confidence: float = 40.0
+    # The reader's language (a Tesseract code, or several joined with "+", e.g. "eng+fra"): only what has that
+    # language's tessdata installed can be read as more than shapes. A finding a word cannot be read for is still
+    # found and located from its pixels (OCR only DESCRIBES a finding, never decides one) -- it is just not
+    # captioned with the words. See `app.engine.ocr_locator.available_languages`.
+    ocr_language: str = "eng"
     text_move_tolerance_px: float = 6.0
     # Two digital files are read the same where their pixels are the same: a word read differently over
     # marks that agree this closely (within 2 px, each way) is the reader's inconsistency (reading a page
@@ -309,6 +322,14 @@ class DetectionConfig:
     # ...where 'on the same ink' is judged to this many pixels: a scan's dot gain makes a hairline of lettering several
     # times as thick, so its ink lies further from the digital's than a couple of pixels.
     text_misread_slack_px: int = 3
+    # Where the two files' INK PICTURES are, in the difference's box, the same picture -- correlate (normalised, softened a little,
+    # each window about a letter wide re-settling within a few pixels of where the scan sits, so a line's warp along a
+    # scan is not counted against it) at least `text_same_ink_loose_correlation` as a whole (one shift for the box; only
+    # rules out an accident) and `text_same_ink_worst` in their worst window -- the reading, not the artwork, is what
+    # differs, and the finding is ranked down (a changed letter leaves a window that does not correlate, however well
+    # the rest of the word does).
+    text_same_ink_loose_correlation: float = 0.6
+    text_same_ink_worst: float = 0.85
 
     # Automatic mode finds differences in the PIXELS. Two files that register to a pixel or two, or where one is a
     # little softer than the other (a picture of the type against live type), differ along every edge -- 13 of 19
@@ -321,13 +342,54 @@ class DetectionConfig:
     # area), the average colour must differ by less than the latter. On the carton pairs every such hairline
     # measured under 3 (average) and over 0.97 (marks), and every real change was over 4 or under 0.94.
     residue_margin_px: int = 6
-    # 'Coincide' means within this many pixels: the registration error and the softness to be forgiven. It applies to an
-    # exactly registered pair too: a copy softened by a pixel or two has marks that far apart (a page blurred by 1.3 px
-    # gave a finding at 1), and a glyph 1.5 px from where it was is drawn the same.
+    # 'Coincide' means within this many pixels: the registration error and the softness to be forgiven. An exactly
+    # registered pair forgives one pixel only (`effective_detection_config`): with two, a 0 -> 1 in six-pixel type was
+    # 'the same marks' and was missed (a 0 and a 1 are within two pixels of each other's strokes).
     residue_slack_px: int = 2
     residue_max_colour_delta: float = 2.0
-    residue_max_ink_colour_delta: float = 4.0
+    # Two exports of the same artwork often render a solid ink a few dE apart (a colour profile: one pink or black a
+    # shade off across the whole page), which is not a change to a piece of it: 4.6 on a wordmark, 4.0 on a black word.
+    residue_max_ink_colour_delta: float = 5.0
+    # A shape finding (the similarity map) whose marks coincide has no shape difference: what colour it has is for the
+    # colour comparison to say, and reports where it is a change. So it is only kept for a colour difference this big.
+    residue_max_shape_colour_delta: float = 8.0
+    residue_edge_shift_px: float = 2.0  # ...or what an edge moved by this much shifts it (contrast x this / the window's width), if more
     residue_min_agreement: float = 0.97
+    # The deep local comparison (`local_diff`): where the two files differ at all (a full-size overlay, per-channel
+    # difference above `local_coarse_threshold` levels), each 128 px tile is registered on its own (a whole-pixel shift
+    # within `local_shift_radius_px`, taken only if it clearly helps), softened by `local_blur_px`, and compared with
+    # `local_forgive_px` forgiven each way; what still differs by more than `local_tolerance` levels is a difference. Groups
+    # of such pixels within `local_group_px` are one, if at least `local_min_pixels` strong.
+    local_enabled: bool = True
+    # True: the older reduced-size detectors (colour, similarity map, structure) run beside the local comparison.
+    # False: the local comparison alone finds the pixel differences (exact boxes, and faster).
+    legacy_pixel_detectors: bool = False
+    # Automatic mode with no crop or lift finds the artwork on each sheet itself and compares only that.
+    auto_artwork: bool = True
+    # Something missing where it was and added where it is, looking alike, is one finding: that it moved. And a finding whose
+    # crop of the original fits the suspect a few pixels away is that picture moved.
+    pair_moves: bool = True
+    find_moves: bool = True
+    find_moves_max_findings: int = 300
+    local_coarse_threshold: int = 24
+    local_tolerance: int = 32
+    local_blur_px: float = 0.8
+    local_shift_radius_px: int = 2
+    local_forgive_px: int = 1
+    local_group_px: int = 3
+    local_min_pixels: int = 8
+    # Colour regions: where two files differ in colour over a FLAT area (no edge within a pixel; a recoloured panel, a
+    # tint, the fill of a letter), the difference is found at full size as CIE76 delta-E of at least
+    # `local_colour_delta_e` over at least `local_colour_min_area_px` (after closing gaps and opening specks), and its box is
+    # the region's own. A region of at least `local_offset_min_area_px` is a recoloured AREA: what differs by no more
+    # than its colour offset is not a difference, so the digits changed inside it are found on their own.
+    local_colour_delta_e: float = 4.0
+    local_colour_min_area_px: int = 60
+    local_offset_min_area_px: int = 1500
+    local_faint_threshold: int = 8
+    local_flat_gradient: int = 12
+    # A difference that is one long thin stroke (at least this long) is line-work: a die line or fold line.
+    local_line_min_length_px: int = 60
     # What a finding says is then READ from its own box (never the whole page: two readings of one page group
     # their lines differently and report areas that did not change). At most this many findings are read.
     text_describe_max_findings: int = 80
@@ -365,33 +427,31 @@ class DetectionConfig:
 
 @dataclass(frozen=True)
 class ClusteringConfig:
-    # PENDING QA SIGN-OFF (SRS §7): the proximity rule for merging individual
-    # word / number / barcode-line differences into one cluster is not
-    # numerically defined. Two same-type differences whose boxes are within
-    # this many pixels of each other (in the original's render resolution,
-    # 300 DPI for a PDF) become one finding. 30 px is ~2.5 mm: enough to join
-    # the words of a moved line and the lines of a paragraph, small enough
-    # not to fuse unrelated changes on opposite sides of a carton panel.
+    """How raw differences become findings. Each difference is its own finding, exactly where it is, and is joined to
+    another only where the two are really one thing:
+
+    * the bars of a barcode (and the dots of Braille) are one symbol: within `distance_px` of each other they are one
+      finding;
+    * the letters and words of a changed line of type are one finding when they adjoin on the same line (below);
+    * two boxes that are the same place found by two detectors (a new logo is both a colour and a graphics difference)
+      are one finding;
+    * nothing else is joined: a small difference inside a big one (a digit changed in a recoloured panel) is a finding of
+      its own, and two differences a few millimetres apart are two.
+    """
+
+    # Barcode bars and Braille dots within this many pixels (300 DPI: ~2.5 mm) are one symbol, one finding.
     distance_px: float = 30.0
-    # Two findings whose boxes overlap by at least this share of the SMALLER
-    # one are the same physical change seen by different detectors (a new logo
-    # is both a colour and a graphics difference) and are reported once.
-    merge_overlap_ratio: float = 0.2
-    # ...unless one box is vastly larger than the other, which is a stray
-    # outline artefact swallowing genuine findings rather than a duplicate.
-    merge_max_area_ratio: float = 60.0
-    # Single-linkage chains: on a real pair whose layout differs, hundreds of neighbouring changed words
-    # and boxes linked one after another into ONE finding covering a third of the carton (or 61% of a
-    # sheet), which says nothing about where anything changed. A finding whose member boxes cover less
-    # than this share of its own box is a chain, not one thing: it is re-clustered with a shorter link
-    # (halved until it falls apart, down to `min_link_px`) -- as long as its box is bigger than
-    # `split_min_area_px` (small findings are left whole).
-    min_fill_ratio: float = 0.25
-    split_min_area_px: float = 60000.0
-    min_link_px: float = 4.0
-    # A single candidate box bigger than this (px^2; ~12 cm square at 300 DPI) is a whole panel differing,
-    # not a place: it is a finding of its own and links nothing (see `cluster_candidates`).
-    huge_candidate_area_px: float = 2000000.0
+    # Letters/words are one line of type if they are on the same line -- their boxes overlap by at least this share of the
+    # smaller height -- and no further apart than `line_gap_heights` times the taller one (at most `line_max_gap_px`). A box
+    # taller than `line_max_height_px` is not a letter or a word and is not joined along a line.
+    line_overlap: float = 0.5
+    line_gap_heights: float = 1.2
+    line_max_height_px: float = 400.0
+    line_max_gap_px: float = 60.0  # (however tall the letters: a heading's letters are a few millimetres apart, not a hand)
+    # Boxes of one category that touch (a gap of at most this many pixels) and lie side by side are one thing cut in two by
+    # a tile edge; boxes of different categories that cover the same place (this much of their union) are one change.
+    touch_px: float = 2.0
+    duplicate_iou: float = 0.6
     # Words that MOVED are one move only if they moved alike: this much difference in displacement (px) at
     # most, or this share of the larger one, whichever is more.
     moved_displacement_tolerance_px: float = 6.0
@@ -445,10 +505,15 @@ class SubjectConfig:
     border_faint_line_contrast: float = 30.0
     border_line_width_fraction: float = 0.006
     border_min_page_brightness: float = 170.0
-    # Automatic mode accepts an enclosure only if it is a sizeable part of the sheet, so a text
-    # box is not taken for the artwork; "Border line" mode accepts any of at least this share.
-    border_min_area_fraction: float = 0.08
-    border_min_area_fraction_forced: float = 0.005
+    # With no press point (finding the artwork on its own) an enclosure is accepted only if it is a sizeable part of
+    # the sheet, so a text box is not taken for the artwork. Where the reviewer POINTED, there is no size rule: any
+    # closed border round the spot is lifted, however small (the floor, 0.02% of the sheet, is only there so that the counter of a
+    # letter is not taken for the artwork: a 2 x 1 cm label on a carton sheet is 0.15%).
+    border_min_area_fraction: float = 0.03
+    border_min_area_fraction_forced: float = 0.0002
+    # The colour method's press marks a disc of definite subject: this share of the page's short side, then smaller
+    # (each in turn) where the area pressed on is smaller than the disc.
+    seed_radius_steps: tuple[float, ...] = (1.0, 0.3, 0.1)
     # Thin protrusions (a leader line, a dimension line and its arrowheads, a label hung on one)
     # narrower than twice this share of the long edge are shaved off; what is left of the outline
     # is then grown back by the same amount, so real corners keep their points.
@@ -466,22 +531,63 @@ class SubjectConfig:
 
 
 @dataclass(frozen=True)
-class RuntimeConfig:
-    """Guard rails and worker settings (Architecture §5 and §7).
+class SeriesConfig:
+    """Finding every repeat of one artwork on a sheet printed with several copies of it (`app/engine/series.py`)."""
 
-    Files are checked against these BEFORE anything is allocated for them, so an
-    oversized input produces a clear message instead of an out-of-memory crash.
+    # The scale is settled once by the strongest single match anywhere on the sheet, tried at steps of this ratio...
+    scale_step: float = 1.06
+    scale_steps_each_way: int = 14  # ...covering a factor of about scale_step ** steps_each_way either way
+    # ...around 1.0 (the same size as the original crop) unless the two files' resolutions say otherwise.
+    default_expected_scale: float = 1.0
+    min_match_score: float = 0.4  # normalised correlation of the two pictures' edges
+    min_match_peak: float = 5.0  # ...standing out from the correlation's own average by this many standard deviations
+    max_repeats: int = 60
+    search_long_edge_px: int = 1600  # the sheet is searched on a copy no bigger than this (long edge)
+    instance_margin_px: int = 24  # each repeat is cropped out with this much extra around it, for its own alignment to refine
+    # After a repeat is found, another is not looked for within this fraction of the template's width/height of it (a
+    # real neighbour, printed with a gap, sits further off; this only stops the same instance being found twice).
+    suppression_fraction: float = 0.3
+
+
+@dataclass(frozen=True)
+class LeafletConfig:
+    """Comparing a multi-page document (a leaflet, an insert) page by page, however it was made -- outlined to a
+    picture, live text, closed or open, one language or several (`app/engine/leaflet.py`).
+
+    Every page's pixels are compared exactly as Automatic mode compares a single pair (alignment, every detector,
+    clustering): a page needs no border or die-line, only its two renders. OCR only ever DESCRIBES a difference the
+    pixels already found (never decides one), so a page in a language nobody has installed tessdata for is still
+    compared correctly -- its findings are just not captioned with the words.
     """
 
-    # Real packaging artwork is tens of MB; a file far beyond this is not artwork.
-    max_file_size_mb: int = 250
-    # A carton or leaflet file is a handful of pages; hundreds is a catalogue or a mistake.
-    max_pdf_pages: int = 100
-    # The largest page compared, in millions of pixels at the working resolution. A
-    # 1 m x 1 m sheet at 300 DPI is ~140 MP (about 420 MB as RGB, and several
-    # times that while detecting), so this is the point past which memory, not
-    # the artwork, decides the outcome. The 310 x 420 mm sample carton is 18 MP.
-    max_render_megapixels: int = 160
+    # A Tesseract language code, or several joined with "+" (e.g. "eng+fra+deu"): whichever of them has its tessdata
+    # installed is used; none installed falls back to English and says so once, rather than failing page by page.
+    language: str = "eng"
+    max_page_workers: int = 4  # pages are compared this many at a time (each comparison already threads its own work)
+    page_gap_px: int = 28  # blank strip between one page and the next in the stacked view, with a label drawn on it
+    # When the two files do not have the same number of pages, each page is paired with its most alike page in the
+    # other file (a thumbnail correlation) rather than assumed to be at the same position; below this, a page is left
+    # unpaired (a whole page added or missing) rather than compared with something it is not.
+    min_page_match_score: float = 0.3
+    thumbnail_long_edge_px: int = 300  # pages are paired on copies this small (fast; only which page matches which)
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Worker settings and memory guards (Architecture §5 and §7).
+
+    Nothing here refuses a file. A page too big to hold at the working resolution is rendered at a lower one
+    (`working_megapixels`), and the comparison says so; the size and page limits are off (0) unless someone sets them.
+    """
+
+    # A file bigger than this many MB is refused (0 = never). Real artwork runs to hundreds of MB, so no default.
+    max_file_size_mb: int = 0
+    # A PDF with more pages than this is refused (0 = never): a leaflet or a carton file is a few pages, a catalogue is many.
+    max_pdf_pages: int = 0
+    # The most pixels (millions) a page is held at. A 300 DPI render of a 310 x 420 mm carton is 18 MP; a 1 m x 1 m sheet is
+    # ~140 MP (420 MB as RGB, and several times that while detecting). A page that would be bigger is rendered at whatever
+    # lower DPI fits (a 2.2 m shipper at ~180 DPI), so memory, not a rule, decides the resolution -- and nothing is turned away.
+    max_render_megapixels: int = 100
 
     # One comparison at a time in a separate process (Architecture §5).
     # Recycled after this many jobs so native-library memory cannot creep.
@@ -497,6 +603,8 @@ class AppConfig:
     clustering: ClusteringConfig = field(default_factory=ClusteringConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     subject: SubjectConfig = field(default_factory=SubjectConfig)
+    series: SeriesConfig = field(default_factory=SeriesConfig)
+    leaflet: LeafletConfig = field(default_factory=LeafletConfig)
 
 
 def load_config(path: Path | str | None = None) -> AppConfig:
@@ -519,6 +627,8 @@ def load_config(path: Path | str | None = None) -> AppConfig:
         clustering=_merge(ClusteringConfig(), raw.get("clustering", {})),
         runtime=_merge(RuntimeConfig(), raw.get("runtime", {})),
         subject=_merge(SubjectConfig(), raw.get("subject", {})),
+        series=_merge(SeriesConfig(), raw.get("series", {})),
+        leaflet=_merge(LeafletConfig(), raw.get("leaflet", {})),
     )
 
 

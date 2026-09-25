@@ -45,6 +45,9 @@ class MainWindow(QMainWindow):
         self._owns_jobs = jobs is None
         self.jobs = jobs or JobController(self.config.runtime, parent=self)
         self._job_context: tuple[object, object, ComparisonMode] | None = None
+        self._last_request: ComparisonRequest | None = None  # what the results on show came from
+        self._job_from_results = False  # the running job was started from the results page (a toggle there)
+        self._pending_request: ComparisonRequest | None = None
         self._job_started = 0.0
         self._job_stage = ""
 
@@ -55,7 +58,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(central)
         self.results_view = ResultsView(self.stack)
         self.stack.addWidget(self.results_view)
-        self.results_view.backRequested.connect(lambda: self.stack.setCurrentWidget(central))
+        self.results_view.backRequested.connect(self._show_setup)
+        self.results_view.graphicsToggled.connect(self._on_graphics_toggled)
         self._setup_page = central
 
         layout = QVBoxLayout(central)
@@ -73,7 +77,6 @@ class MainWindow(QMainWindow):
         top_row.setSpacing(16)
         self.upload_panel = UploadPanel(central, config=self.config)
         self.mode_selector = ModeSelector(central)
-        self.mode_selector.scan_graphics.setChecked(self.config.detection.scan_compare_graphics)
         top_row.addWidget(self.upload_panel, stretch=1)
         top_row.addWidget(self.mode_selector)
         layout.addLayout(top_row, stretch=1)
@@ -92,10 +95,17 @@ class MainWindow(QMainWindow):
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setMinimumHeight(40)
         self.cancel_button.setVisible(False)
+        # After "New comparison" the last results are still there: a button takes the reviewer back to them.
+        self.results_button = QPushButton("Back to the last results")
+        self.results_button.setMinimumHeight(40)
+        self.results_button.setVisible(False)
+        self.results_button.clicked.connect(lambda: self.stack.setCurrentWidget(self.results_view))
         buttons.addWidget(self.compare_button, stretch=1)
+        buttons.addWidget(self.results_button)
         buttons.addWidget(self.cancel_button)
         layout.addLayout(buttons)
 
+        self.mode_selector.modeChanged.connect(self.upload_panel.set_mode)
         self.upload_panel.filesChanged.connect(self._update_compare_enabled)
         # A replaced file is closed, so the results page must not keep drawing from it.
         self.upload_panel.filesChanged.connect(self.results_view.release_sources)
@@ -124,38 +134,51 @@ class MainWindow(QMainWindow):
         self.status_label.setText(text)
         set_variant(self.status_label, "status", state)
 
+    def _show_setup(self) -> None:
+        self.results_button.setVisible(self.results_view.has_results)
+        self.stack.setCurrentWidget(self._setup_page)
+
     def _on_compare(self) -> None:
         """Start the comparison in the worker process; the UI stays responsive meanwhile."""
         original, suspect = self.upload_panel.original, self.upload_panel.suspect
         assert original is not None and suspect is not None
         if self.jobs.is_busy:
             return
-
-        mode = self.mode_selector.mode
-        config = self.config
-        if mode is ComparisonMode.SCAN_VS_DIGITAL and self.mode_selector.compare_scan_graphics != config.detection.scan_compare_graphics:
-            config = replace(config, detection=replace(config.detection, scan_compare_graphics=self.mode_selector.compare_scan_graphics))
         request = ComparisonRequest(
             original_path=original.path,
             suspect_path=suspect.path,
-            mode=mode,
-            config=config,
+            mode=self.mode_selector.mode,
+            config=self.config,
             original_geometry=self.upload_panel.original_slot.geometry,
             suspect_geometry=self.upload_panel.suspect_slot.geometry,
         )
-        self._job_context = (original, suspect, mode)
+        self._start(request, (original, suspect, request.mode), from_results=False)
+
+    def _on_graphics_toggled(self, checked: bool) -> None:
+        """Scan vs Digital's graphics switched on or off on the results page: the same files, compared again."""
+        request, context = self._last_request, self._job_context
+        if request is None or context is None or self.jobs.is_busy:
+            return
+        detection = replace(request.config.detection, scan_compare_graphics=checked)
+        self.results_view.set_busy("Comparing again…")
+        self._start(replace(request, config=replace(request.config, detection=detection)), context, from_results=True)
+
+    def _start(self, request: ComparisonRequest, context, from_results: bool) -> None:
+        self._job_context = context
+        self._job_from_results = from_results
+        self._pending_request = request
         job_id = self.jobs.start(request)
         logger.info(
             "comparison job started",
             extra={
                 "job_id": job_id,
-                "mode": mode.value,
-                "original": str(original.path),
-                "suspect": str(suspect.path),
+                "mode": request.mode.value,
+                "original": str(request.original_path),
+                "suspect": str(request.suspect_path),
             },
         )
         self._set_running(True)
-        self._job_started, self._job_stage = monotonic(), "Starting\u2026"
+        self._job_started, self._job_stage = monotonic(), "Starting…"
         self._show_progress()
         self._ticker.start()
 
@@ -174,11 +197,15 @@ class MainWindow(QMainWindow):
 
     def _show_progress(self) -> None:
         elapsed = monotonic() - self._job_started
-        self._set_status(f"{self._job_stage}  ({elapsed:.0f} s)", "idle")
+        text = f"{self._job_stage}  ({elapsed:.0f} s)"
+        self._set_status(text, "idle")
+        if self._job_from_results:
+            self.results_view.set_busy(text)
 
     def _on_completed(self, outcome: ComparisonOutcome) -> None:
         self._set_running(False)
         original, suspect, mode = self._job_context
+        self._last_request = self._pending_request
         self._set_status(*_describe(outcome))
         self.results_view.show_outcome(
             outcome,
@@ -190,6 +217,8 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, kind: str, message: str) -> None:
         self._set_running(False)
+        if self._job_from_results:
+            self._back_on_results(f"Could not compare again: {message}")
         # Stay on the setup page: the files and settings are still there to fix and retry.
         self._set_status(message, "error")
         if kind in (ErrorKind.CRASH, ErrorKind.INTERNAL):
@@ -197,7 +226,17 @@ class MainWindow(QMainWindow):
 
     def _on_cancelled(self) -> None:
         self._set_running(False)
+        if self._job_from_results:
+            self._back_on_results("")
         self._set_status("Comparison cancelled.", "idle")
+
+    def _back_on_results(self, message: str) -> None:
+        """A comparison started from the results page did not finish: the results stay as they were, and the toggle
+        goes back to what they were compared with."""
+        self.results_view.graphics_check.blockSignals(True)
+        self.results_view.graphics_check.setChecked(not self.results_view.graphics_check.isChecked())
+        self.results_view.graphics_check.blockSignals(False)
+        self.results_view.set_busy(message, locked=False)
 
     def closeEvent(self, event) -> None:
         if self._owns_jobs:

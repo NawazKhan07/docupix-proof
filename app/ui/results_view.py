@@ -8,7 +8,7 @@ filtering or ignoring in the list changes which markers the viewer draws.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QPushButton, QSplitter, QTabWidget, QVBoxLayout, QWidget
 
 from app.engine.file_loader import LoadedArtwork
 from app.engine.worker import ComparisonOutcome
@@ -23,6 +23,7 @@ PANEL_MIN_WIDTH = 340
 
 class ResultsView(QWidget):
     backRequested = Signal()
+    graphicsToggled = Signal(bool)  # Scan vs Digital: compare the graphics too (or not), on these same files
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,9 +42,28 @@ class ResultsView(QWidget):
         titles.setSpacing(2)
         titles.addWidget(heading)
         titles.addWidget(self.subtitle_label)
+        self.note_label = QLabel("")
+        self.note_label.setProperty("secondary", "true")
+        self.note_label.setWordWrap(True)
+        self.note_label.setVisible(False)
+        titles.addWidget(self.note_label)
         header.addWidget(self.back_button, alignment=Qt.AlignmentFlag.AlignTop)
         header.addSpacing(8)
         header.addLayout(titles, stretch=1)
+        # Scan vs Digital compares text; its graphics are an option, switched here so the reviewer need not go back,
+        # tick a box and start again. A change re-compares the same files.
+        self.graphics_check = QCheckBox("Also compare graphics")
+        self.graphics_check.setToolTip(
+            "Scan vs Digital compares text, numbers and barcode bars. Tick this to compare logos and other artwork too "
+            "(a scan can show false differences there)."
+        )
+        self.graphics_check.setVisible(False)
+        self.graphics_check.toggled.connect(self._on_graphics_toggled)
+        self.busy_label = QLabel("")
+        self.busy_label.setProperty("status", "idle")
+        self.busy_label.setVisible(False)
+        header.addWidget(self.busy_label, alignment=Qt.AlignmentFlag.AlignTop)
+        header.addWidget(self.graphics_check, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addLayout(header)
 
         self.viewport = ComparisonViewport(self)
@@ -86,11 +106,24 @@ class ResultsView(QWidget):
         """Show a result. Passing the loaded files lets the viewer re-render PDFs
         from vector data when zoomed in (FR-9.1)."""
         self.subtitle_label.setText(subtitle)
+        self.note_label.setText("  ".join(outcome.notes))
+        self.note_label.setVisible(bool(outcome.notes))
+        self.has_results = True
+        scan_mode = outcome.mode is ComparisonMode.SCAN_VS_DIGITAL
+        self.graphics_check.blockSignals(True)
+        self.graphics_check.setChecked(bool(outcome.graphics_compared))
+        self.graphics_check.blockSignals(False)
+        self.graphics_check.setVisible(scan_mode)
+        self.set_busy("")
         ink_pair = (
             (outcome.ink_original, outcome.ink_suspect)
             if outcome.ink_original is not None and outcome.ink_suspect is not None
             else None
         )
+        # Flicker/Overlay/Grayscale blend the two panes pixel-for-pixel: only sound when they are the same picture, one
+        # warped onto the other (every mode but Series, whose suspect pane is a whole sheet beside one small artwork).
+        same_size = outcome.aligned_original.shape[:2] == outcome.aligned_suspect.shape[:2]
+        self.viewport.set_composite_modes_enabled(same_size)
         self.viewport.set_images(outcome.aligned_original, outcome.aligned_suspect, ink_pair)
         self.viewport.set_sources(original, suspect, outcome.alignment.transform)
         self.viewport.set_compared_area(outcome.compared_outline)
@@ -121,6 +154,18 @@ class ResultsView(QWidget):
 
         self.side.tabBar().setVisible(self.side.count() > 1)  # a lone tab is just noise
         self.side.setCurrentWidget(chosen)
+
+    has_results = False
+
+    def set_busy(self, text: str, locked: bool = True) -> None:
+        """Say what a re-comparison is doing, or how it ended (empty for nothing to say); the toggle is locked while
+        it runs."""
+        self.busy_label.setText(text)
+        self.busy_label.setVisible(bool(text))
+        self.graphics_check.setEnabled(not (text and locked))
+
+    def _on_graphics_toggled(self, checked: bool) -> None:
+        self.graphicsToggled.emit(checked)
 
     def release_sources(self) -> None:
         """Stop holding the loaded files (they are closed when replaced)."""

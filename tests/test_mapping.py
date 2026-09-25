@@ -1,7 +1,6 @@
-"""Where differences are mapped, and how they are grouped into findings, checked against the failures found on real pairs.
+"""How differences are read and mapped, checked against the failures found on real pairs (how they are grouped into
+findings is in `test_clustering.py`).
 
-On real cartons whose layouts differ, single-linkage clustering chained hundreds of separate changes into ONE
-finding the size of the carton (35% of a page, 61% of a sheet), a page-sized 'graphic changed' object did the same,
 OCR read rotated text and barcode digits as junk 'changes', and identical pixels were reported as changed words.
 """
 
@@ -11,124 +10,16 @@ import cv2
 import numpy as np
 import pytest
 
-from app.config import AppConfig, ClusteringConfig, DetectionConfig
-from app.engine.aggregation.aggregator import build_clusters
-from app.engine.aggregation.clustering import cluster_candidates
+from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import braille_diff, structure_diff, text_diff
 from app.engine.detectors.text_diff import OcrWord, _findings, _runs, _trustworthy, corroborated, marks_agreement
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
-CLUSTERING = ClusteringConfig()
 
 
 def _candidate(x0, y0, x1, y1, diff_type=DiffType.GRAPHICS, subtype=DiffSubtype.CHANGED, magnitude=0.0) -> DiffCandidate:
     return DiffCandidate(BoundingBox(x0, y0, x1, y1), diff_type, subtype, 1.0, f"{diff_type.value} at {x0},{y0}", magnitude)
-
-
-def _groups(candidates, **overrides):
-    settings = dict(
-        distance_px=CLUSTERING.distance_px,
-        overlap_ratio=CLUSTERING.merge_overlap_ratio,
-        max_area_ratio=CLUSTERING.merge_max_area_ratio,
-        moved_tolerance=(CLUSTERING.moved_displacement_tolerance_px, CLUSTERING.moved_displacement_tolerance_share),
-        min_fill=CLUSTERING.min_fill_ratio,
-        split_min_area_px=CLUSTERING.split_min_area_px,
-        min_link_px=CLUSTERING.min_link_px,
-        huge_area_px=CLUSTERING.huge_candidate_area_px,
-    )
-    settings.update(overrides)
-    return cluster_candidates(candidates, **settings)
-
-
-# ---- chains ---------------------------------------------------------------------------------------------------------
-
-
-def _chain(count=40, step=50, size=30):
-    """Small changes marching diagonally across a page, each within reach of the next: a chain, not one thing."""
-    return [_candidate(i * step, i * step, i * step + size, i * step + size) for i in range(count)]
-
-
-def test_a_chain_of_small_changes_across_the_page_is_not_one_finding():
-    chain = _chain()
-    assert len(cluster_candidates(chain, distance_px=40)) == 1  # single linkage alone fuses it
-
-    groups = _groups(chain, distance_px=40)
-
-    assert len(groups) > 10
-    assert all(len(group) <= 4 for group in groups)
-
-
-def test_a_dense_change_stays_one_finding():
-    """A paragraph gone: its words fill their box, so it is one finding however large."""
-    words = [_candidate(100 + column * 90, 100 + row * 40, 100 + column * 90 + 80, 100 + row * 40 + 30, DiffType.TEXT, DiffSubtype.REMOVED)
-             for row in range(12) for column in range(10)]
-    assert len(_groups(words)) == 1
-
-
-def test_a_small_group_is_never_split():
-    close = [_candidate(0, 0, 20, 20), _candidate(28, 0, 48, 20), _candidate(0, 45, 20, 65)]
-    assert len(_groups(close)) == 1
-
-
-def test_turning_the_split_off_restores_plain_single_linkage():
-    assert len(_groups(_chain(), distance_px=40, min_fill=0.0)) == 1
-
-
-def test_a_split_piece_keeps_its_duplicates_together():
-    """The same change seen by two detectors (overlapping boxes) is still one finding after a split."""
-    chain = _chain(30)
-    chain += [_candidate(c.bbox.x0 + 2, c.bbox.y0 + 2, c.bbox.x1 - 2, c.bbox.y1 - 2, DiffType.COLOUR) for c in chain]
-    groups = _groups(chain, distance_px=40)
-    assert all({m.type for m in group} == {DiffType.GRAPHICS, DiffType.COLOUR} for group in groups)
-
-
-def test_the_findings_are_still_in_reading_order():
-    groups = _groups(_chain(), distance_px=40)
-    corners = [(min(m.bbox.y0 for m in g), min(m.bbox.x0 for m in g)) for g in groups]
-    assert corners == sorted(corners)
-
-
-# ---- a candidate the size of a panel ------------------------------------------------------------------------------------------
-
-
-def test_a_panel_sized_candidate_is_a_finding_of_its_own_and_links_nothing():
-    huge = _candidate(0, 0, 2400, 2400)
-    small = [_candidate(100, 100, 130, 130), _candidate(150, 100, 180, 130), _candidate(2000, 2000, 2030, 2030)]
-
-    groups = _groups([huge, *small])
-
-    assert sorted(len(g) for g in groups) == [1, 1, 2] and any(g == [huge] for g in groups)
-
-
-def test_two_huge_duplicates_of_one_change_are_still_one_finding():
-    a, b = _candidate(0, 0, 2400, 2400), _candidate(10, 10, 2390, 2390, DiffType.COLOUR)
-    assert len(_groups([a, b])) == 1
-
-
-# ---- words that moved -----------------------------------------------------------------------------------------------------------
-
-
-def test_words_that_moved_alike_are_one_move_and_words_that_moved_differently_are_not():
-    sentence = [_candidate(x, 100, x + 40, 120, DiffType.TEXT, DiffSubtype.MOVED, magnitude=12) for x in (0, 50, 100)]
-    other = [_candidate(x, 100, x + 40, 120, DiffType.TEXT, DiffSubtype.MOVED, magnitude=110) for x in (150, 200)]
-
-    groups = _groups(sentence + other)
-
-    assert sorted(len(g) for g in groups) == [2, 3]
-
-
-def test_a_moved_word_does_not_join_a_changed_word_beside_it():
-    moved = _candidate(0, 0, 40, 20, DiffType.TEXT, DiffSubtype.MOVED, magnitude=12)
-    changed = _candidate(50, 0, 90, 20, DiffType.TEXT, DiffSubtype.CHANGED)
-    assert len(_groups([moved, changed])) == 2
-
-
-def test_the_aggregator_uses_the_configured_limits():
-    chain = _chain()
-    loose = build_clusters(chain, np.eye(3), ClusteringConfig(distance_px=40, min_fill_ratio=0.0))
-    tight = build_clusters(chain, np.eye(3), ClusteringConfig(distance_px=40))
-    assert len(loose) == 1 and len(tight) > 10
 
 
 # ---- text: no junk, no phantom changes, no page-sized 'change' --------------------------------------------------------------------------

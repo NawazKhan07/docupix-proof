@@ -1,7 +1,7 @@
 """The findings list (SRS FR-7.1/7.2/7.5, Architecture §3.1 "Diff List Panel").
 
-Shows each clustered difference with its category and a severity colour, and
-gives each one an Ignore control. Ignoring is a soft state on the finding
+Shows each clustered difference with what it is (its category, in the category's own colour, and
+what happened to it) and gives each one an Ignore control. Ignoring is a soft state on the finding
 (`DiffCluster.status`), never a deletion, so what a reviewer dismissed stays
 on the record and can be restored.
 """
@@ -23,25 +23,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.engine.aggregation.severity import SEVERITY_COLOURS
 from app.engine.aggregation.aggregator import merge_clusters
-from app.models.diff import DiffCluster, Severity
+from app.models.categories import CATEGORY_LABELS, CATEGORY_ORDER, SUBTYPE_LABELS, category_colour
+from app.models.diff import DiffCluster
 from app.models.result import AlignmentResult
 from app.ui.theme import set_variant
 
 logger = logging.getLogger(__name__)
 
-CATEGORY_LABELS = {"text": "Text", "colour": "Colour", "graphics": "Graphics"}
-SEVERITY_LABELS = {
-    Severity.CRITICAL: "Critical",
-    Severity.MAJOR: "Major",
-    Severity.MINOR: "Minor",
-}
 _ALL = "all"
 
 
 class FindingCard(QFrame):
-    """One finding: a severity colour bar, what it is, and an Ignore/Restore button."""
+    """One finding: a bar in its category's colour, what it is, and an Ignore/Restore button."""
 
     selectRequested = Signal(int)
     ignoreToggled = Signal(int)
@@ -55,12 +49,13 @@ class FindingCard(QFrame):
 
         bar = QFrame(self)
         bar.setFixedWidth(5)
-        bar.setStyleSheet(f"background: {SEVERITY_COLOURS[cluster.severity]}; border-radius: 2px;")
+        bar.setStyleSheet(f"background: {category_colour(cluster.category)}; border-radius: 2px;")
         self.colour_bar = bar
 
         title = QLabel(
-            f"#{cluster.id}  ·  {CATEGORY_LABELS[cluster.category]}  ·  "
-            f"{SEVERITY_LABELS[cluster.severity]}"
+            f"#{cluster.id}  ·  {CATEGORY_LABELS.get(cluster.category, cluster.category)}  ·  "
+            f"{SUBTYPE_LABELS[cluster.subtype].capitalize()}"
+            + ("  ·  possible misread" if cluster.uncertain else "")
         )
         title.setStyleSheet("font-weight: 700;")
         detail = QLabel(cluster.detail)
@@ -131,19 +126,24 @@ class DiffListPanel(QWidget):
 
         filters = QHBoxLayout()
         self.category_combo = QComboBox()
-        self.category_combo.addItem("All categories", _ALL)
-        for key, label in CATEGORY_LABELS.items():
-            self.category_combo.addItem(label, key)
-        self.severity_combo = QComboBox()
-        self.severity_combo.addItem("All severities", _ALL)
-        for severity, label in SEVERITY_LABELS.items():
-            self.severity_combo.addItem(label, severity)
+        self.category_combo.addItem("All kinds", _ALL)
+        for key in CATEGORY_ORDER:
+            self.category_combo.addItem(CATEGORY_LABELS[key], key)
         filters.addWidget(self.category_combo, stretch=1)
-        filters.addWidget(self.severity_combo, stretch=1)
         layout.addLayout(filters)
 
+        checks = QHBoxLayout()
         self.show_ignored_check = QCheckBox("Show ignored")
-        layout.addWidget(self.show_ignored_check)
+        # Where the words differ but the pixels say the same ink is there, the reader most likely misread: those are
+        # listed apart, on request, so a real change in small print is never hidden and the list is not full of them.
+        self.show_uncertain_check = QCheckBox("Show possible misreads")
+        self.show_uncertain_check.setToolTip(
+            "Text the reader saw differently although the pixels match: most likely a misreading, not a change."
+        )
+        checks.addWidget(self.show_ignored_check)
+        checks.addWidget(self.show_uncertain_check)
+        checks.addStretch(1)
+        layout.addLayout(checks)
 
         self._cards_layout = QVBoxLayout()
         self._cards_layout.setSpacing(8)
@@ -156,9 +156,9 @@ class DiffListPanel(QWidget):
         self._scroll.setWidget(container)
         layout.addWidget(self._scroll, stretch=1)
 
-        for control in (self.category_combo, self.severity_combo):
-            control.currentIndexChanged.connect(self._on_filters_changed)
+        self.category_combo.currentIndexChanged.connect(self._on_filters_changed)
         self.show_ignored_check.toggled.connect(self._on_filters_changed)
+        self.show_uncertain_check.toggled.connect(self._on_filters_changed)
 
     # -- data ---------------------------------------------------------------
     def set_result(
@@ -184,15 +184,15 @@ class DiffListPanel(QWidget):
     def visible_clusters(self) -> list[DiffCluster]:
         """The findings that pass the filters and are not ignored (unless shown)."""
         category = self.category_combo.currentData()
-        severity = self.severity_combo.currentData()
         show_ignored = self.show_ignored_check.isChecked()
+        show_uncertain = self.show_uncertain_check.isChecked()
 
         return [
             cluster
             for cluster in self._clusters
             if (show_ignored or not cluster.is_ignored)
+            and (show_uncertain or not cluster.uncertain)
             and (category == _ALL or cluster.category == category)
-            and (severity == _ALL or cluster.severity is severity)
         ]
 
     def marker_clusters(self) -> list[DiffCluster]:
@@ -221,7 +221,7 @@ class DiffListPanel(QWidget):
         # Merging is the reviewer's decision about what counts as one difference in regulated artwork: leave a trace.
         logger.info(
             "findings merged",
-            extra={"merged_ids": sorted(cluster.id for cluster in chosen), "into": merged.id, "severity": merged.severity.value},
+            extra={"merged_ids": sorted(cluster.id for cluster in chosen), "into": merged.id, "category": merged.category},
         )
         self._rebuild()
         self.visibilityChanged.emit()
@@ -269,7 +269,6 @@ class DiffListPanel(QWidget):
             extra={
                 "cluster_id": cluster.id,
                 "category": cluster.category,
-                "severity": cluster.severity.value,
                 "detail": cluster.detail,
             },
         )
@@ -322,15 +321,20 @@ class DiffListPanel(QWidget):
         self._update_header()
 
     def _update_header(self) -> None:
-        active = [c for c in self._clusters if not c.is_ignored]
-        ignored = len(self._clusters) - len(active)
+        active = [c for c in self._clusters if not c.is_ignored and (self.show_uncertain_check.isChecked() or not c.uncertain)]
+        ignored = sum(1 for c in self._clusters if c.is_ignored)
+        hidden = sum(1 for c in self._clusters if c.uncertain and not c.is_ignored and not self.show_uncertain_check.isChecked())
         self.title_label.setText(f"Findings ({len(active)})")
 
+        # One chip per kind that is present, in that kind's colour: the same colour as its boxes in the two files.
         counts = [
-            f'<span style="color:{SEVERITY_COLOURS[severity]}">■</span> '
-            f"{sum(1 for c in active if c.severity is severity)} {label}"
-            for severity, label in SEVERITY_LABELS.items()
+            f'<span style="color:{category_colour(key)}">■</span> '
+            f"{sum(1 for c in active if c.category == key)} {CATEGORY_LABELS[key]}"
+            for key in CATEGORY_ORDER
+            if any(c.category == key for c in active)
         ]
+        if hidden:
+            counts.append(f"{hidden} possible misread(s) hidden")
         if ignored:
             counts.append(f"{ignored} ignored")
         self.summary_label.setText("  ·  ".join(counts) if self._clusters else "")

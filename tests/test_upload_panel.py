@@ -59,3 +59,27 @@ def test_edit_artwork_area_discards_geometry_on_cancel(qapp, synthetic_png: Path
     slot._on_edit_artwork_area()
 
     assert slot.geometry is None
+
+
+def _two_page_pdf(tmp_path: Path) -> Path:
+    import numpy as np
+    from PIL import Image
+
+    pages = [Image.fromarray(np.full((300, 400, 3), 255, dtype="uint8")) for _ in range(2)]
+    path = tmp_path / "two_pages.pdf"
+    pages[0].save(path, save_all=True, append_images=pages[1:])
+    return path
+
+
+def test_the_page_note_says_leaflet_mode_compares_every_page(qapp, tmp_path):
+    from app.models.job import ComparisonMode
+
+    slot = UploadSlot("Original")
+    slot.load_path(_two_page_pdf(tmp_path))
+    assert "only page 1 is compared" in slot.detail_label.text()
+
+    slot.set_mode(ComparisonMode.LEAFLET)
+    assert "every page is compared" in slot.detail_label.text()
+
+    slot.set_mode(ComparisonMode.AUTOMATIC)
+    assert "only page 1 is compared" in slot.detail_label.text()

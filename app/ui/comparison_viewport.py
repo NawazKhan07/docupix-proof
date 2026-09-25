@@ -163,6 +163,7 @@ class ComparisonViewport(QWidget):
             row.addWidget(button)
             self._mode_buttons[mode] = button
         self._mode_buttons[ViewMode.SIDE_BY_SIDE].setChecked(True)
+        self._composite_modes_enabled = True
 
         row.addSpacing(16)
         self.scroll_lock_check = QCheckBox("Scroll lock")
@@ -344,6 +345,16 @@ class ComparisonViewport(QWidget):
     @property
     def view_mode(self) -> ViewMode:
         return self._mode
+
+    def set_composite_modes_enabled(self, enabled: bool) -> None:
+        """Flicker/Overlay/Grayscale blend the two panes pixel-for-pixel, which only makes sense when they are the
+        same picture, warped to fit: not a small artwork beside a whole sheet holding several repeats of it. Disabled
+        (and switched back to Side by side, if one of them was on), the reviewer still has two panes to look at."""
+        self._composite_modes_enabled = enabled
+        for mode in (ViewMode.FLICKER, ViewMode.OVERLAY, ViewMode.GRAYSCALE):
+            self._mode_buttons[mode].setEnabled(enabled)
+        if not enabled and self._mode is not ViewMode.SIDE_BY_SIDE:
+            self.set_view_mode(ViewMode.SIDE_BY_SIDE)
 
     def set_view_mode(self, mode: ViewMode) -> None:
         if mode is self._mode and self._mode_buttons[mode].isChecked():

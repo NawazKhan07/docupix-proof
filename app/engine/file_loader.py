@@ -49,12 +49,8 @@ class CorruptFileError(ArtworkLoadError):
 
 
 class InputTooLargeError(ArtworkLoadError):
-    """The file is bigger than the app will take on (Architecture §7).
-
-    Raised before any large allocation, with a message that says what is too big
-    and what to do about it -- the alternative is running out of memory partway
-    through a comparison.
-    """
+    """The file is over a limit that someone set (`RuntimeConfig.max_file_size_mb` / `max_pdf_pages`): off by default,
+    so nothing is refused for its size unless a person asked for that."""
 
 
 _BYTES_PER_MB = 1024 * 1024
@@ -71,6 +67,40 @@ class LoadedArtwork:
     native_mode: str  # PIL/colour mode of the source (e.g. "RGB", "CMYK")
     _pdf_doc: Optional[fitz.Document] = None
     _pil_image: Optional[Image.Image] = None
+    budget_megapixels: float = 100.0  # the most pixels a page is held at (see `RuntimeConfig.max_render_megapixels`)
+
+    def working_dpi(self, page: int = 0) -> float:
+        """The DPI a PDF page is rendered at: `WORKING_DPI`, or lower where the page would not fit `budget_megapixels`
+        (a page 2 m across is not held at 300 DPI, it is held at what fits). Images have their own pixels: their nominal
+        DPI is `WORKING_DPI`."""
+        if self.kind != "pdf":
+            return float(WORKING_DPI)
+        assert self._pdf_doc is not None
+        rect = self._pdf_doc[page].rect
+        points = max(1.0, rect.width * rect.height)
+        fitting = _PDF_BASE_DPI * math.sqrt(max(1.0, self.budget_megapixels) * 1e6 / points)
+        return float(min(WORKING_DPI, fitting))
+
+    def reduced_note(self, page: int = 0) -> str | None:
+        """A sentence saying the page is held below `WORKING_DPI`, or None if it is not."""
+        if self.kind == "pdf":
+            dpi = self.working_dpi(page)
+            if dpi < WORKING_DPI - 0.5:
+                rect = self._pdf_doc[page].rect
+                return (
+                    f"'{self.path.name}' is {rect.width * 25.4 / 72:.0f} x {rect.height * 25.4 / 72:.0f} mm, more than fits in "
+                    f"memory at {WORKING_DPI} DPI, so it was compared at {dpi:.0f} DPI."
+                )
+            return None
+        if self._pil_image is not None:
+            width, height = self._pil_image.size
+            if width * height > self.budget_megapixels * 1e6:
+                scale = math.sqrt(self.budget_megapixels * 1e6 / (width * height))
+                return (
+                    f"'{self.path.name}' is {width} x {height} px, more than fits in memory, so it was compared at "
+                    f"{scale:.0%} of its size."
+                )
+        return None
 
     def pdf_page(self, page: int = 0) -> fitz.Page:
         if self.kind != "pdf":
@@ -90,14 +120,15 @@ class LoadedArtwork:
         assert self._pil_image is not None
         return self._pil_image.size
 
-    def render(self, dpi: float = WORKING_DPI, page: int = 0) -> np.ndarray:
+    def render(self, dpi: float | None = None, page: int = 0) -> np.ndarray:
         """Return an RGB uint8 numpy array (H, W, 3).
 
-        For PDFs this re-rasterizes the vector page at `dpi` — full fidelity
-        at every zoom level. For images `dpi` is ignored: the native pixels
-        are always returned untouched (no invented detail, no silent
-        downsampling).
+        For PDFs this re-rasterizes the vector page at `dpi` (the working DPI, which is lower for a page too big to hold
+        at 300) — full fidelity at every zoom level. An image is returned at its own pixels, reduced only if it is too big
+        to hold (`budget_megapixels`), with a note in `reduced_note`.
         """
+        if dpi is None:
+            dpi = self.working_dpi(page)
         with StageTimer(logger, f"render_{self.kind}"):
             if self.kind == "pdf":
                 return self._render_pdf_page(dpi, page)
@@ -117,6 +148,11 @@ class LoadedArtwork:
 
     def _render_image(self) -> np.ndarray:
         assert self._pil_image is not None
+        width, height = self._pil_image.size
+        if width * height > self.budget_megapixels * 1e6:
+            scale = math.sqrt(self.budget_megapixels * 1e6 / (width * height))
+            size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            return np.array(self._pil_image.convert("RGB").resize(size, Image.Resampling.BOX))
         return np.array(self._pil_image.convert("RGB"))
 
     def close(self) -> None:
@@ -151,7 +187,7 @@ def load_artwork(path: Path | str, limits: RuntimeConfig | None = None) -> Loade
     size_bytes = path.stat().st_size
     if size_bytes == 0:
         raise CorruptFileError(f"File is empty: {path}")
-    if size_bytes > limits.max_file_size_mb * _BYTES_PER_MB:
+    if limits.max_file_size_mb and size_bytes > limits.max_file_size_mb * _BYTES_PER_MB:
         raise InputTooLargeError(
             f"'{path.name}' is {size_bytes / _BYTES_PER_MB:.0f} MB, above the "
             f"{limits.max_file_size_mb} MB limit. Export a smaller version of the artwork, "
@@ -176,35 +212,19 @@ def load_artwork(path: Path | str, limits: RuntimeConfig | None = None) -> Loade
     return artwork
 
 
-def _check_page_size(name: str, width_px: int, height_px: int, limits: RuntimeConfig, what: str) -> None:
-    megapixels = width_px * height_px / 1e6
-    if megapixels > limits.max_render_megapixels:
-        raise InputTooLargeError(
-            f"{what} of '{name}' is {width_px} x {height_px} px ({megapixels:.0f} megapixels), above the "
-            f"{limits.max_render_megapixels} megapixel limit for a comparison. Export the artwork at a smaller "
-            "page size or resolution, or raise \"runtime.max_render_megapixels\" in config.json "
-            "if this machine has the memory for it."
-        )
-
-
 def _load_pdf(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
     try:
         doc = fitz.open(path)
         if doc.page_count < 1:
             raise CorruptFileError(f"PDF has no pages: {path}")
-        if doc.page_count > limits.max_pdf_pages:
+        if limits.max_pdf_pages and doc.page_count > limits.max_pdf_pages:
             raise InputTooLargeError(
                 f"'{path.name}' has {doc.page_count} pages, above the {limits.max_pdf_pages}-page limit. "
                 "A comparison uses one page, so export just the artwork page."
             )
         # Touching page 0 forces PyMuPDF to parse content now, surfacing a
         # corrupt/truncated PDF here rather than deep inside a later render.
-        rect = doc[0].rect
-        scale = WORKING_DPI / _PDF_BASE_DPI
-        _check_page_size(
-            path.name, math.ceil(rect.width * scale), math.ceil(rect.height * scale), limits,
-            f"Page 1 at {WORKING_DPI} DPI",
-        )
+        _ = doc[0].rect
     except (CorruptFileError, InputTooLargeError):
         doc.close()
         raise
@@ -217,21 +237,15 @@ def _load_pdf(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
         color_profile=None,
         native_mode="RGB",
         _pdf_doc=doc,
+        budget_megapixels=float(limits.max_render_megapixels),
     )
 
 
 def _load_image(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
     try:
+        Image.MAX_IMAGE_PIXELS = None  # a big scan is not a decompression bomb: it is held reduced, not refused
         image = Image.open(path)  # reads the header only; the pixels are decoded below
-        _check_page_size(path.name, *image.size, limits, "The image")
         image.load()  # force full decode now, not lazily on first use
-    except InputTooLargeError:
-        image.close()
-        raise
-    except Image.DecompressionBombError as exc:
-        raise InputTooLargeError(
-            f"'{path.name}' is far larger than an image comparison can take on ({exc})."
-        ) from exc
     except (UnidentifiedImageError, OSError) as exc:
         raise CorruptFileError(f"Could not parse image '{path}': {exc}") from exc
     return LoadedArtwork(
@@ -241,4 +255,5 @@ def _load_image(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
         color_profile=image.info.get("icc_profile"),
         native_mode=image.mode,
         _pil_image=image,
+        budget_megapixels=float(limits.max_render_megapixels),
     )

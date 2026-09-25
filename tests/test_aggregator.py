@@ -4,14 +4,12 @@ import numpy as np
 
 from app.config import ClusteringConfig
 from app.engine.aggregation.aggregator import build_clusters
-from app.engine.aggregation.severity import SeverityRule
 from app.models.diff import (
     BoundingBox,
     DiffCandidate,
     DiffStatus,
     DiffSubtype,
     DiffType,
-    Severity,
 )
 
 CONFIG = ClusteringConfig(distance_px=30.0)
@@ -29,12 +27,12 @@ def _candidate(x0, y0, x1, y1, diff_type=DiffType.TEXT, subtype=DiffSubtype.CHAN
     )
 
 
-def test_candidates_become_clusters_with_severity_and_both_boxes():
+def test_candidates_become_clusters_with_both_boxes_and_a_category():
     clusters = build_clusters([_candidate(100, 100, 140, 120)], IDENTITY, CONFIG)
 
     assert len(clusters) == 1
     cluster = clusters[0]
-    assert cluster.severity is Severity.CRITICAL  # a changed text run
+    assert cluster.category == "text" and cluster.subtype is DiffSubtype.CHANGED
     assert cluster.bbox_in_original == BoundingBox(100, 100, 140, 120)
     assert cluster.bbox_in_suspect == BoundingBox(100, 100, 140, 120)  # identity transform
     assert cluster.status is DiffStatus.ACTIVE
@@ -48,13 +46,28 @@ def test_suspect_box_is_carried_through_the_inverse_transform():
     assert cluster.bbox_in_suspect == BoundingBox(70, 88, 110, 108)
 
 
-def test_a_cluster_takes_its_worst_members_severity():
+def test_each_kind_of_difference_is_its_own_category():
+    kinds = {
+        DiffType.TEXT: "text",
+        DiffType.NUMBER: "text",
+        DiffType.COLOUR: "colour",
+        DiffType.GRAPHICS: "graphics",
+        DiffType.BARCODE: "barcode",
+        DiffType.BRAILLE: "braille",
+    }
+    for diff_type, category in kinds.items():
+        (cluster,) = build_clusters([_candidate(0, 0, 40, 20, diff_type)], IDENTITY, CONFIG)
+        assert cluster.category == category
+
+
+def test_a_cluster_is_labelled_by_its_most_specific_member():
+    """One place seen by two detectors: a changed word is a text finding before it is a colour one."""
     candidates = [
-        _candidate(0, 0, 40, 20, DiffType.COLOUR, DiffSubtype.CHANGED, magnitude=3.0),  # minor
-        _candidate(50, 0, 90, 20, DiffType.COLOUR, DiffSubtype.CHANGED, magnitude=30.0),  # critical
+        _candidate(0, 0, 40, 20, DiffType.COLOUR, DiffSubtype.CHANGED, magnitude=30.0),
+        _candidate(0, 0, 40, 20, DiffType.TEXT, DiffSubtype.CHANGED),
     ]
     (cluster,) = build_clusters(candidates, IDENTITY, CONFIG)
-    assert cluster.severity is Severity.CRITICAL
+    assert cluster.category == "text"
     assert len(cluster.members) == 2
 
 
@@ -70,22 +83,24 @@ def test_ids_follow_reading_order_starting_at_one():
     assert [c.bbox_in_original.x0 for c in clusters] == [0, 300, 500]
 
 
-def test_a_multi_member_cluster_summarises_itself_with_a_count():
-    words = [_candidate(x, 0, x + 40, 20, subtype=DiffSubtype.MOVED) for x in (0, 50, 100)]
+def test_the_words_of_one_line_are_one_finding_and_it_says_what_the_strongest_says():
+    words = [_candidate(x, 0, x + 40, 20, subtype=DiffSubtype.MOVED) for x in (0, 50, 100)]  # a few pixels apart, one line
     (cluster,) = build_clusters(words, IDENTITY, CONFIG)
-    assert cluster.detail.endswith("\u00d73")  # "x3": three members, one finding
+    assert len(cluster.members) == 3
+    assert cluster.detail.startswith("text @")  # one line of description, not a count
 
 
-def test_a_custom_rule_table_is_honoured():
-    lenient = (SeverityRule(Severity.MINOR),)
-    (cluster,) = build_clusters([_candidate(0, 0, 40, 20)], IDENTITY, CONFIG, rules=lenient)
-    assert cluster.severity is Severity.MINOR
+def test_differences_on_different_lines_are_findings_of_their_own_however_near():
+    lines = [_candidate(0, 0, 40, 20), _candidate(0, 26, 40, 46)]  # six pixels between them
+    assert len(build_clusters(lines, IDENTITY, CONFIG)) == 2
 
 
-def test_clustering_distance_comes_from_config():
-    pair = [_candidate(0, 0, 40, 20), _candidate(100, 0, 140, 20)]  # 60 px apart
-    assert len(build_clusters(pair, IDENTITY, ClusteringConfig(distance_px=30))) == 2
-    assert len(build_clusters(pair, IDENTITY, ClusteringConfig(distance_px=80))) == 1
+def test_only_the_bars_of_a_barcode_are_merged_by_distance():
+    bars = [_candidate(x, 0, x + 6, 100, DiffType.BARCODE) for x in (0, 16, 32)]
+    assert len(build_clusters(bars, IDENTITY, ClusteringConfig(distance_px=30))) == 1
+    assert len(build_clusters(bars, IDENTITY, ClusteringConfig(distance_px=5))) == 3
+    far_apart = [_candidate(x, 0, x + 6, 100, DiffType.BARCODE) for x in (0, 200)]
+    assert len(build_clusters(far_apart, IDENTITY, ClusteringConfig(distance_px=30))) == 2
 
 
 def test_no_candidates_means_no_clusters():

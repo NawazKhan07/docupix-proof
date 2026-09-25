@@ -29,7 +29,7 @@ from app.engine.detectors.text_diff import (
     read_windows,
     reading_picture,
 )
-from app.engine.aggregation.severity import LIKELY_MISREAD_CONFIDENCE
+from app.engine.detectors.text_diff import LIKELY_MISREAD_CONFIDENCE
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
@@ -111,7 +111,7 @@ def test_a_short_page_is_one_strip():
 def test_strips_are_read_side_by_side_and_their_words_put_back_in_page_coordinates(monkeypatch):
     calls = []
 
-    def fake(image, page_segmentation=None):
+    def fake(image, page_segmentation=None, lang=None):
         calls.append(image.shape)
         return {"text": ["", "word"], "conf": [-1, 91], "left": [0, 10], "top": [0, 20], "width": [0, 60], "height": [0, 20],
                 "block_num": [1, 1], "par_num": [1, 1], "line_num": [1, 1]}
@@ -256,7 +256,7 @@ def test_any_reading_of_a_line_that_agrees_makes_it_no_difference():
 def test_the_windows_of_several_lines_are_read_in_one_call_and_their_words_go_back_to_their_own_line(monkeypatch):
     seen = []
 
-    def fake(image, page_segmentation=None):
+    def fake(image, page_segmentation=None, lang=None):
         seen.append(image.shape)
         # one word in the middle of each stacked window: find the windows by their (dark) marks
         rows = np.flatnonzero((image < 128).any(axis=1))

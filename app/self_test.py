@@ -198,6 +198,121 @@ def run(report_path: Path | None = None) -> int:
         except Exception as exc:
             record("pixel comparison ignores a softer copy", False, f"{type(exc).__name__}: {exc}")
 
+        # The deep local comparison: a 0 become a 1 in a serial number set in tiny type, on a pair that registers
+        # exactly, is one small finding at that digit (and nothing else on the sheet).
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            def _carton(serial):
+                page = np.full((900, 1400, 3), 235, np.uint8)
+                for row in range(12):
+                    cv2.putText(page, f"Store below 25 C in a dry place, protect from light {row}", (60, 90 + row * 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 2, cv2.LINE_AA)
+                cv2.rectangle(page, (900, 100), (1300, 400), (30, 60, 200), -1)
+                cv2.circle(page, (1100, 650), 120, (200, 120, 30), -1)
+                cv2.putText(page, serial, (300, 800), cv2.FONT_HERSHEY_SIMPLEX, 0.33, (0, 0, 0), 1, cv2.LINE_AA)
+                return page
+
+            first, second = Path(tmp) / "serial_a.png", Path(tmp) / "serial_b.png"
+            Image.fromarray(_carton("SN EMJ3TLBE204300")).save(first)
+            Image.fromarray(_carton("SN EMJ3TLBE204301")).save(second)
+            found, error = _run_job(ComparisonRequest(first, second, ComparisonMode.AUTOMATIC, AppConfig()))
+            ok = found is not None and len(found.clusters) == 1 and found.clusters[0].bbox_in_original.width < 30
+            record(
+                "small change found by the local comparison",
+                ok,
+                f"{len(found.clusters) if found else error} finding(s) for a digit changed in tiny type",
+            )
+        except Exception as exc:
+            record("small change found by the local comparison", False, f"{type(exc).__name__}: {exc}")
+
+        # Series mode: one artwork against a sheet of three repeats, one of them recoloured -- found, on its own
+        # repeat, and the other two are silent.
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image
+
+            from app.models.isolation import IsolationGeometry, NormalizedRect
+
+            def _artwork(colour=(20, 60, 150)):
+                # Enough distinct detail (a heading, a coloured bar, a circle, barcode-like bars, small print) that
+                # three copies of it are told apart cleanly from an unrelated crop at another scale: three near-blank
+                # cells differing only in one bar's colour proved too alike for that, and found nothing.
+                cell = np.full((260, 200, 3), 250, np.uint8)
+                cv2.rectangle(cell, (2, 2), (197, 257), (90, 90, 90), 2)
+                cv2.putText(cell, "SPAS TABLETS", (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+                cv2.rectangle(cell, (20, 35), (180, 70), colour, -1)
+                cv2.circle(cell, (55, 130), 30, (200, 40, 40), -1)
+                cv2.putText(cell, "500 mg", (95, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+                for i, bar in enumerate((3, 1, 2, 1, 3, 2, 1, 3, 2, 1, 2, 3)):
+                    x = 20 + i * 13
+                    cv2.rectangle(cell, (x, 180), (x + max(2, bar), 220), (20, 20, 20), -1)
+                cv2.putText(cell, "Batch AB1234  Exp 07/2028", (12, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 60, 60), 1, cv2.LINE_AA)
+                return cell
+
+            gap = 20
+            sheet = np.full((260 + 2 * gap, 3 * 200 + 4 * gap, 3), 235, np.uint8)
+            for column, colour in enumerate([(20, 60, 150), (20, 60, 150), (150, 20, 20)]):  # repeat 3 recoloured
+                x = gap + column * (200 + gap)
+                sheet[gap : gap + 260, x : x + 200] = _artwork(colour)
+            page = np.full((260 + 2 * gap, 200 + 2 * gap, 3), 235, np.uint8)
+            page[gap : gap + 260, gap : gap + 200] = _artwork()
+
+            series_original, series_suspect = Path(tmp) / "series_original.png", Path(tmp) / "series_suspect.png"
+            Image.fromarray(page).save(series_original)
+            Image.fromarray(sheet).save(series_suspect)
+            geometry = IsolationGeometry(boundary=NormalizedRect(gap / page.shape[1], gap / page.shape[0], (gap + 200) / page.shape[1], (gap + 260) / page.shape[0]))
+            series_outcome, series_error = _run_job(
+                ComparisonRequest(series_original, series_suspect, ComparisonMode.SERIES, AppConfig(), original_geometry=geometry)
+            )
+            ok = (
+                series_outcome is not None
+                and any("Repeat 3 of 3" in c.detail for c in series_outcome.clusters)
+                and not any("Repeat 1 of 3" in c.detail or "Repeat 2 of 3" in c.detail for c in series_outcome.clusters)
+            )
+            record(
+                "series mode (repeated artwork)",
+                ok,
+                f"{len(series_outcome.clusters) if series_outcome else series_error} finding(s)",
+            )
+        except Exception as exc:
+            record("series mode (repeated artwork)", False, f"{type(exc).__name__}: {exc}")
+
+        # Leaflet mode: a two-page document, one page changed -- found on its own page, the other page silent.
+        try:
+            from PIL import Image
+
+            def _leaflet_page(heading, edited=False):
+                page = np.full((500, 700, 3), 250, np.uint8)
+                cv2.rectangle(page, (0, 0), (700, 80), (40, 90, 150), -1)
+                cv2.putText(page, heading, (30, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(page, "Body text for this section of the leaflet", (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 40, 40), 1, cv2.LINE_AA)
+                if edited:
+                    cv2.rectangle(page, (25, 130), (500, 165), (250, 250, 250), -1)
+                    cv2.putText(page, "This body text was changed", (30, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (40, 40, 40), 1, cv2.LINE_AA)
+                return page
+
+            leaflet_original, leaflet_suspect = Path(tmp) / "leaflet_original.pdf", Path(tmp) / "leaflet_suspect.pdf"
+            original_leaflet_pages = [Image.fromarray(_leaflet_page("INDICATIONS")), Image.fromarray(_leaflet_page("DOSAGE"))]
+            suspect_leaflet_pages = [Image.fromarray(_leaflet_page("INDICATIONS")), Image.fromarray(_leaflet_page("DOSAGE", edited=True))]
+            original_leaflet_pages[0].save(leaflet_original, save_all=True, append_images=original_leaflet_pages[1:])
+            suspect_leaflet_pages[0].save(leaflet_suspect, save_all=True, append_images=suspect_leaflet_pages[1:])
+            leaflet_outcome, leaflet_error = _run_job(ComparisonRequest(leaflet_original, leaflet_suspect, ComparisonMode.LEAFLET, AppConfig()))
+            ok = (
+                leaflet_outcome is not None
+                and bool(leaflet_outcome.clusters)
+                and all(c.detail.startswith("Page 2:") for c in leaflet_outcome.clusters)
+            )
+            record(
+                "leaflet mode (multi-page)",
+                ok,
+                f"{len(leaflet_outcome.clusters) if leaflet_outcome else leaflet_error} finding(s)",
+            )
+        except Exception as exc:
+            record("leaflet mode (multi-page)", False, f"{type(exc).__name__}: {exc}")
+
         # Symbol decoding: a Pharmacode drawn here must be read back by the bundled decoders.
         try:
             import cv2

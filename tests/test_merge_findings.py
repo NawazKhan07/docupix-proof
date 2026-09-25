@@ -8,11 +8,11 @@ from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import QMouseEvent
 
 from app.engine.aggregation.aggregator import merge_clusters
-from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType, Severity
+from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType
 from app.ui.results_view import ResultsView, _mostly_inside
 
 
-def _cluster(cluster_id, box, diff_type=DiffType.GRAPHICS, severity=Severity.MINOR, detail="Graphic changed", subtype=DiffSubtype.CHANGED):
+def _cluster(cluster_id, box, diff_type=DiffType.GRAPHICS, detail="Graphic changed", subtype=DiffSubtype.CHANGED):
     x0, y0, x1, y1 = box
     member = DiffCandidate(BoundingBox(x0, y0, x1, y1), diff_type, subtype, 0.9, detail, 1.0)
     return DiffCluster(
@@ -20,7 +20,6 @@ def _cluster(cluster_id, box, diff_type=DiffType.GRAPHICS, severity=Severity.MIN
         bbox_in_original=BoundingBox(x0, y0, x1, y1),
         bbox_in_suspect=BoundingBox(x0 + 5, y0 + 5, x1 + 5, y1 + 5),
         type=diff_type,
-        severity=severity,
         members=[member],
         detail=detail,
     )
@@ -43,13 +42,13 @@ def test_it_keeps_the_lowest_number_so_the_numbering_does_not_shift():
     assert merge_clusters([_cluster(7, (0, 0, 10, 10)), _cluster(4, (20, 0, 30, 10))]).id == 4
 
 
-def test_it_is_as_severe_as_the_worst_and_as_specific_as_the_most_specific():
-    minor = _cluster(1, (0, 0, 10, 10), DiffType.GRAPHICS, Severity.MINOR)
-    critical_text = _cluster(2, (20, 0, 30, 10), DiffType.TEXT, Severity.CRITICAL, "'500' -> '250'")
+def test_it_is_as_specific_as_the_most_specific():
+    graphics = _cluster(1, (0, 0, 10, 10), DiffType.GRAPHICS)
+    text = _cluster(2, (20, 0, 30, 10), DiffType.TEXT, "'500' -> '250'")
 
-    merged = merge_clusters([minor, critical_text])
+    merged = merge_clusters([graphics, text])
 
-    assert merged.severity is Severity.CRITICAL and merged.type is DiffType.TEXT
+    assert merged.type is DiffType.TEXT
     assert merged.types == {DiffType.GRAPHICS, DiffType.TEXT}
     assert "2 findings merged" in merged.detail and "'500' -> '250'" in merged.detail
 

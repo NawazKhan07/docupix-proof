@@ -1087,3 +1087,24 @@ def test_a_slot_says_its_lifted_artwork_can_be_placed_on_the_other_file(qapp, sy
     )
     panel.original_slot._refresh_status()  # the suspect has its area now: nothing left to suggest
     assert "place it on" not in panel.original_slot.detail_label.text()
+
+
+# ---- the outline is laid over at the size the two files' resolutions say ---------------------------------------------------------------
+
+
+def test_the_other_files_outline_starts_at_the_size_the_two_resolutions_say():
+    from types import SimpleNamespace
+
+    cutout = _cutout_of_text()
+    pdf_at = lambda dpi: SimpleNamespace(kind="pdf", working_dpi=lambda: dpi)  # noqa: E731
+    twice = SimpleNamespace(_reference=SubjectReference(cutout, "a.pdf", source_dpi=150.0), _artwork=pdf_at(300.0))
+    assert IsolationDialog._expected_scale(twice) == pytest.approx(2.0)
+    same = SimpleNamespace(_reference=SubjectReference(cutout, "a.pdf", source_dpi=300.0), _artwork=pdf_at(300.0))
+    assert IsolationDialog._expected_scale(same) == pytest.approx(1.0)
+    # a photograph has no known resolution, nor has an outline lifted from one
+    photo = SimpleNamespace(_reference=SubjectReference(cutout, "a.png"), _artwork=pdf_at(300.0))
+    assert IsolationDialog._expected_scale(photo) is None
+    scan = SimpleNamespace(_reference=SubjectReference(cutout, "a.pdf", source_dpi=300.0), _artwork=SimpleNamespace(kind="image", working_dpi=lambda: 300.0))
+    assert IsolationDialog._expected_scale(scan) is None
+    alone = SimpleNamespace(_reference=None, _artwork=pdf_at(300.0))
+    assert IsolationDialog._expected_scale(alone) is None

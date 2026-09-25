@@ -3,10 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.engine.aggregation.severity import SEVERITY_COLOURS
-from app.models.diff import DiffStatus, Severity
+from app.models.categories import CATEGORY_COLOURS, CATEGORY_LABELS, SUBTYPE_LABELS
+from app.models.diff import DiffCandidate, DiffCluster, DiffStatus, DiffSubtype, DiffType, BoundingBox
 from app.models.result import AlignmentResult
-from app.ui.diff_list_panel import CATEGORY_LABELS, SEVERITY_LABELS, DiffListPanel, FindingCard
+from app.ui.diff_list_panel import DiffListPanel, FindingCard
 
 
 def _alignment(residual: float = 0.74, low_confidence: bool = False) -> AlignmentResult:
@@ -43,27 +43,51 @@ def test_every_finding_is_listed_with_a_count(panel, outcome):
     assert len(_cards(panel)) == len(outcome.clusters)
 
 
-def test_each_finding_shows_its_category_and_severity(panel, outcome):
-    """FR-7.1 / FR-7.2."""
+def test_each_finding_shows_what_it_is_and_what_happened_to_it(panel, outcome):
+    """FR-7.1: its category and what happened (changed, moved, added, removed) -- there is no severity."""
     by_id = {c.id: c for c in outcome.clusters}
     for card in _cards(panel):
         cluster = by_id[card.cluster_id]
         assert CATEGORY_LABELS[cluster.category] in card.title_label.text()
-        assert SEVERITY_LABELS[cluster.severity] in card.title_label.text()
+        assert SUBTYPE_LABELS[cluster.subtype].capitalize() in card.title_label.text()
+        assert "Critical" not in card.title_label.text() and "Major" not in card.title_label.text()
         assert card.detail_label.text() == cluster.detail
 
 
-def test_each_finding_carries_its_severity_colour(panel, outcome):
+def test_each_finding_carries_its_categorys_own_colour(panel, outcome):
     by_id = {c.id: c for c in outcome.clusters}
     for card in _cards(panel):
-        expected = SEVERITY_COLOURS[by_id[card.cluster_id].severity]
+        expected = CATEGORY_COLOURS[by_id[card.cluster_id].category]
         assert expected in card.colour_bar.styleSheet()
 
 
-def test_the_summary_counts_findings_by_severity(panel, outcome):
+def test_the_summary_counts_findings_by_kind(panel, outcome):
     summary = panel.summary_label.text()
-    critical = sum(1 for c in outcome.clusters if c.severity is Severity.CRITICAL)
-    assert f"{critical} Critical" in summary
+    for category in {c.category for c in outcome.clusters}:
+        count = sum(1 for c in outcome.clusters if c.category == category)
+        assert f"{count} {CATEGORY_LABELS[category]}" in summary
+        assert CATEGORY_COLOURS[category] in summary
+
+
+def _uncertain(cluster_id: int) -> DiffCluster:
+    member = DiffCandidate(BoundingBox(0, 0, 10, 10), DiffType.TEXT, DiffSubtype.CHANGED, 0.25, "'a' -> 'b'", uncertain=True)
+    return DiffCluster(
+        id=cluster_id, bbox_in_original=member.bbox, bbox_in_suspect=member.bbox, type=DiffType.TEXT, members=[member], detail=member.detail
+    )
+
+
+def test_a_reading_the_pixels_do_not_bear_out_is_listed_apart_and_shown_on_request(qapp):
+    widget = DiffListPanel()
+    widget.show()
+    widget.set_result([_uncertain(1)], _alignment(), [])
+    qapp.processEvents()
+    assert widget.visible_clusters() == [] and "1 possible misread" in widget.summary_label.text()
+    assert widget.title_label.text() == "Findings (0)"
+
+    widget.show_uncertain_check.setChecked(True)
+    assert len(widget.visible_clusters()) == 1 and widget.title_label.text() == "Findings (1)"
+    assert "possible misread" in _cards(widget)[0].title_label.text()
+    widget.close()
 
 
 # ---------------------------------------------------------------------------
@@ -149,13 +173,10 @@ def test_filtering_by_category(panel, outcome):
     assert len(_cards(panel)) == len(shown)
 
 
-def test_filtering_by_severity(panel, outcome):
-    panel.severity_combo.setCurrentIndex(panel.severity_combo.findData(Severity.CRITICAL))
-    shown = panel.visible_clusters()
-    assert shown and all(c.severity is Severity.CRITICAL for c in shown)
-
-    panel.severity_combo.setCurrentIndex(panel.severity_combo.findData(Severity.MINOR))
-    assert panel.visible_clusters() == []  # nothing in the fixture is Minor
+def test_filtering_by_a_kind_with_no_findings_says_so(panel, outcome):
+    absent = next(key for key in CATEGORY_LABELS if all(c.category != key for c in outcome.clusters))
+    panel.category_combo.setCurrentIndex(panel.category_combo.findData(absent))
+    assert panel.visible_clusters() == []
     labels = [label.text() for label in panel.findChildren(type(panel.title_label))]
     assert "No findings match the current filters." in labels
 

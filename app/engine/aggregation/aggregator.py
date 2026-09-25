@@ -1,7 +1,7 @@
 """The Diff Aggregator (Architecture §3.3.6): raw candidates -> findings.
 
-Composes the three aggregation steps -- cluster, assign severity, bind
-coordinates -- into the `DiffCluster` list the UI presents.
+Composes the two aggregation steps -- cluster, bind coordinates -- into the `DiffCluster`
+list the UI presents. A finding is described (its category, what happened to it), never ranked.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import numpy as np
 from app.config import ClusteringConfig
 from app.engine.aggregation.clustering import cluster_candidates, union_box
 from app.engine.aggregation.coordinate_projection import original_to_suspect
-from app.engine.aggregation.severity import DEFAULT_RULES, SeverityRule, worst_severity
 from app.logging_config import StageTimer
 from app.models.diff import DiffCandidate, DiffCluster, DiffType
 
@@ -37,21 +36,20 @@ def build_clusters(
     candidates: list[DiffCandidate],
     alignment_transform: np.ndarray,
     config: ClusteringConfig,
-    rules: tuple[SeverityRule, ...] = DEFAULT_RULES,
 ) -> list[DiffCluster]:
-    """Cluster `candidates`, rate each cluster, and bind it to both files' coordinates."""
+    """Cluster `candidates` and bind each cluster to both files' coordinates."""
     with StageTimer(logger, "aggregation"):
         clusters = []
         for members in cluster_candidates(
             candidates,
             config.distance_px,
-            config.merge_overlap_ratio,
-            config.merge_max_area_ratio,
+            config.line_overlap,
+            config.line_gap_heights,
+            config.line_max_height_px,
+            config.touch_px,
+            config.duplicate_iou,
             (config.moved_displacement_tolerance_px, config.moved_displacement_tolerance_share),
-            config.min_fill_ratio,
-            config.split_min_area_px,
-            config.min_link_px,
-            config.huge_candidate_area_px,
+            config.line_max_gap_px,
         ):
             box = union_box(members)
             clusters.append(
@@ -60,7 +58,6 @@ def build_clusters(
                     bbox_in_original=box,
                     bbox_in_suspect=original_to_suspect(box, alignment_transform),
                     type=_dominant_type(members),
-                    severity=worst_severity(members, rules),
                     members=members,
                     detail=_summarise(members),
                 )
@@ -78,23 +75,19 @@ def build_clusters(
     return clusters
 
 
-def add_member(
-    cluster: DiffCluster, member: DiffCandidate, rules: tuple[SeverityRule, ...] = DEFAULT_RULES
-) -> None:
+def add_member(cluster: DiffCluster, member: DiffCandidate) -> None:
     """Add what a detector found about a finding after it was clustered (the words its pixels show, say):
-    its type, severity and one-line description are worked out again with the new member in."""
+    its type and one-line description are worked out again with the new member in."""
     cluster.members.append(member)
     cluster.type = _dominant_type(cluster.members)
-    cluster.severity = worst_severity(cluster.members, rules)
     cluster.detail = _summarise(cluster.members)
 
 
-def merge_clusters(clusters: list[DiffCluster], rules: tuple[SeverityRule, ...] = DEFAULT_RULES) -> DiffCluster:
+def merge_clusters(clusters: list[DiffCluster]) -> DiffCluster:
     """One finding from several the reviewer chose to treat as one (the bars of a barcode, a cluster of small changes).
 
-    It has the members of all of them, a box that covers them all in both files, the type the most specific of them
-    gives it and the severity of the worst; it keeps the lowest number, so the numbering the reviewer has been reading
-    does not shift under them.
+    It has the members of all of them, a box that covers them all in both files and the type the most specific of them
+    gives it; it keeps the lowest number, so the numbering the reviewer has been reading does not shift under them.
     """
     if len(clusters) < 2:
         raise ValueError("merging takes at least two findings")
@@ -109,7 +102,6 @@ def merge_clusters(clusters: list[DiffCluster], rules: tuple[SeverityRule, ...] 
         bbox_in_original=original_box,
         bbox_in_suspect=suspect_box,
         type=_dominant_type(members),
-        severity=worst_severity(members, rules),
         members=members,
         detail=f"{len(ordered)} findings merged: {_summarise(members)}",
     )
@@ -121,16 +113,10 @@ def _dominant_type(members: list[DiffCandidate]) -> DiffType:
 
 
 def _summarise(members: list[DiffCandidate]) -> str:
-    """One line a reviewer can read without opening the finding.
-
-    Each kind of difference that went into the finding contributes its
-    strongest description, with a count when there were several.
-    """
-    parts = []
+    """One line a reviewer can read without opening the finding: what the most specific kind of difference in it says (a
+    changed word before the graphic it is on, a graphic before the colour it also differs in)."""
     for diff_type in TYPE_PRIORITY:
         group = [member for member in members if member.type is diff_type]
-        if not group:
-            continue
-        strongest = max(group, key=lambda member: (member.magnitude, member.confidence))
-        parts.append(strongest.detail if len(group) == 1 else f"{strongest.detail} \u00d7{len(group)}")
-    return "; ".join(parts)
+        if group:
+            return max(group, key=lambda member: (member.magnitude, member.confidence)).detail
+    return ""

@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 
 from app.config import AppConfig
 from app.engine.alignment.aligner import AlignmentError
-from app.engine.file_loader import WORKING_DPI, LoadedArtwork
+from app.engine.file_loader import LoadedArtwork
 from app.engine.isolation import crop_tool
 from app.engine.isolation.cutout import Cutout, CutoutError
 from app.engine.isolation.placement import Placement, fit_placement
@@ -92,6 +92,7 @@ class SubjectReference:
 
     cutout: Cutout
     source_name: str
+    source_dpi: float | None = None  # the resolution the other file was rendered at, if it is a PDF (its pixels are then real sizes)
 
 
 class IsolationDialog(QDialog):
@@ -430,7 +431,7 @@ class IsolationDialog(QDialog):
         share = 100 * width_px * height_px / (page_width * page_height)
         text = f"{label} {width_px:,} × {height_px:,} px"
         if self._artwork.kind == "pdf":  # a PDF is rendered at a known DPI, so real size is known
-            to_mm = _MM_PER_INCH / WORKING_DPI
+            to_mm = _MM_PER_INCH / self._artwork.working_dpi()
             text += f" ({width_px * to_mm:.1f} × {height_px * to_mm:.1f} mm)"
         return f"{text} · {share:.0f}% of the page"
 
@@ -567,7 +568,7 @@ class IsolationDialog(QDialog):
                 self._config.subject,
                 hints=self._hints,
                 page=self._artwork.pdf_page(0) if is_pdf else None,
-                dpi=WORKING_DPI if is_pdf else None,
+                dpi=self._artwork.working_dpi() if is_pdf else None,
                 method=self.method_combo.currentData(),
             )
         except NoSubjectFoundError as exc:
@@ -682,13 +683,26 @@ class IsolationDialog(QDialog):
         self._update_option_states()
         self._autofit(announce=f"Placed {name}. ")
 
+    def _expected_scale(self) -> float | None:
+        """How much bigger this file's pixels are than the other file's, where both are PDFs (both rendered at a known DPI):
+        the outline lifted from the other file is that much bigger here."""
+        if self._reference is None or self._reference.source_dpi is None or self._artwork.kind != "pdf":
+            return None
+        own = self._artwork.working_dpi()
+        return own / self._reference.source_dpi if own > 0 and self._reference.source_dpi > 0 else None
+
     def _autofit(self, announce: str = "") -> None:
         if self._cutout is None:
             return
+        expected = self._expected_scale()
         QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            fit = fit_placement(self._cutout, self._rendered, self._config.alignment)
+            fit = fit_placement(self._cutout, self._rendered, self._config.alignment, expected)
         except AlignmentError:
+            placement = self.canvas.overlay_placement()
+            if placement is not None and expected is not None:
+                # not found, but the two files' resolutions say how big it is here: it starts at that size, not at 100%
+                self.canvas.set_overlay_placement(Placement(placement.center, placement.rotation_deg, expected))
             self._say(announce + "The artwork could not be matched automatically. Drag the outline into place, "
                       "or set its rotation and scale, then press Trim to outline.")
             return
@@ -697,10 +711,12 @@ class IsolationDialog(QDialog):
 
         self.canvas.set_overlay_placement(fit.placement)
         confidence = " Low confidence: check it by eye before trimming." if fit.alignment.low_confidence else ""
-        self._say(
-            f"{announce}Fitted by matching the artwork (residual {fit.alignment.residual_error_px:.2f} px). "
-            f"Adjust it if needed, then press Trim to outline.{confidence}"
+        how = (
+            f"by matching the artwork's edges ({fit.placement.scale * 100:.0f}% of its size in the other file)"
+            if fit.alignment.method == "template"
+            else f"by matching the artwork (residual {fit.alignment.residual_error_px:.2f} px, {fit.placement.scale * 100:.0f}% of its size in the other file)"
         )
+        self._say(f"{announce}Fitted {how}. Adjust it if needed, then press Trim to outline.{confidence}")
 
     def _sync_placement_controls(self) -> None:
         placement = self.canvas.overlay_placement()

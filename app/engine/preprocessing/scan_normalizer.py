@@ -222,3 +222,46 @@ def ink_image(
     if outside is not None:
         result[outside] = 255
     return result
+
+
+READING_SOURCES = ("ink", "gray", "flat", "darkest", "clahe", "adaptive")
+_ADAPTIVE_BLOCK_PX = 51  # the neighbourhood a local threshold is taken over: wider than a stroke, narrower than a line's height twice over
+_ADAPTIVE_OFFSET = 12  # a pixel is ink if it is this much darker than its neighbourhood
+
+
+def reading_source(
+    image: np.ndarray, config: DetectionConfig | None = None, valid: np.ndarray | None = None, source: str = "ink"
+) -> np.ndarray:
+    """The file as it is READ for text: an 8-bit grey picture, 255 = paper, darker = ink (see `DetectionConfig.scan_reading_scan`).
+
+    'ink' is `ink_image`. The others keep more of what the file is: 'gray' is its own grey, 'flat' divides the paper out
+    (so a scan's darker corners and cream paper are white paper again), 'darkest' does the same on the darkest channel
+    (a saturated ink is dark in one), 'clahe' stretches the local contrast of that, and 'adaptive' thresholds it locally.
+    """
+    config = config or DetectionConfig()
+    if source == "ink":
+        return ink_image(image, config, valid)
+    if source not in READING_SOURCES:
+        raise ValueError(f"unknown reading source {source!r}")
+    outside = None
+    if valid is not None and not valid.all():
+        outside = ~valid
+        image = _filled_outside(image, valid)
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    if source == "gray":
+        picture = gray
+    else:
+        base = cv2.min(cv2.min(image[..., 0], image[..., 1]), image[..., 2]) if source == "darkest" else gray
+        paper = cv2.resize(np.clip(_paper_field(gray), _MIN_PAPER, 255).astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
+        picture = cv2.divide(base, paper, scale=255.0)
+        if source == "clahe":
+            picture = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(picture)
+        elif source == "adaptive":
+            picture = cv2.adaptiveThreshold(
+                picture, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, _ADAPTIVE_BLOCK_PX, _ADAPTIVE_OFFSET
+            )
+    if outside is not None:
+        picture = picture.copy()
+        picture[outside] = 255
+    return picture

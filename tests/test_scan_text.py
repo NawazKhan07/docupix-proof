@@ -15,7 +15,7 @@ import pytest
 from scan_simulator import LIGHT, TYPICAL, simulate_scan
 
 from app.config import AppConfig, DetectionConfig
-from app.engine.aggregation.severity import LIKELY_MISREAD_CONFIDENCE, severity_for
+from app.engine.detectors.text_diff import LIKELY_MISREAD_CONFIDENCE
 from app.engine.detectors import text_diff
 from app.engine.detectors.text_diff import (
     OcrWord,
@@ -32,7 +32,7 @@ from app.engine.detectors.text_diff import (
 )
 from app.engine.ocr_locator import find_tesseract
 from app.engine.worker import run_comparison
-from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType, Severity
+from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 from app.models.job import ComparisonMode
 
 CONFIG = DetectionConfig()
@@ -173,28 +173,20 @@ def test_where_one_file_has_no_ink_there_is_no_agreement():
     assert ink_agreement(_ink_page([(50, 50, 52, 90)]), _ink_page([]), BoundingBox(40, 40, 70, 100)) == 0.0
 
 
-def test_a_difference_over_the_same_ink_is_marked_a_likely_misread_and_ranked_minor():
+def test_a_difference_over_the_same_ink_is_marked_a_likely_misread_and_listed_apart():
     marks = _ink_page([(50, 50, 52, 90), (60, 50, 62, 90)])
     finding = DiffCandidate(BoundingBox(40, 40, 80, 100), DiffType.TEXT, DiffSubtype.CHANGED, 0.9, "'Plot' -> 'Phot'")
 
     marked = _marked_if_misread(finding, marks, marks.copy(), CONFIG)
 
     assert marked.confidence == LIKELY_MISREAD_CONFIDENCE and "likely a misread" in marked.detail
-    assert severity_for(marked) is Severity.MINOR
-    assert severity_for(finding) is Severity.CRITICAL  # the same finding, read surely, is the serious kind
+    assert marked.uncertain and not finding.uncertain  # the same finding, read surely, is not marked
 
 
 def test_a_difference_over_different_ink_is_left_alone():
     finding = DiffCandidate(BoundingBox(40, 40, 100, 100), DiffType.NUMBER, DiffSubtype.CHANGED, 0.9, "'500' -> '250'")
     kept = _marked_if_misread(finding, _ink_page([(50, 50, 52, 90)]), _ink_page([(50, 50, 90, 52)]), CONFIG)
-    assert kept is finding and severity_for(kept) is Severity.CRITICAL
-
-
-def test_only_text_findings_read_unsurely_are_ranked_down():
-    unsure = DiffCandidate(BoundingBox(0, 0, 10, 10), DiffType.GRAPHICS, DiffSubtype.CHANGED, 0.1, "")
-    assert severity_for(unsure) is not Severity.CRITICAL  # graphics keep their own rules
-    text_unsure = DiffCandidate(BoundingBox(0, 0, 10, 10), DiffType.TEXT, DiffSubtype.REMOVED, LIKELY_MISREAD_CONFIDENCE + 0.01, "")
-    assert severity_for(text_unsure) is Severity.CRITICAL
+    assert kept is finding and not kept.uncertain
 
 
 # ---- the worker ----------------------------------------------------------------------------------------------------------
@@ -213,7 +205,7 @@ def _text_candidates(outcome) -> list[DiffCandidate]:
 
 
 def _serious(outcome) -> list[DiffCandidate]:
-    return [c for c in _text_candidates(outcome) if severity_for(c) is Severity.CRITICAL]
+    return [c for c in _text_candidates(outcome) if not c.uncertain]
 
 
 def test_unreadable_lines_are_reported_to_the_reviewer_not_as_changes(monkeypatch):

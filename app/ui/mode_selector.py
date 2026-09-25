@@ -6,7 +6,6 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QFrame,
     QGroupBox,
     QLabel,
@@ -22,13 +21,22 @@ _MODE_DESCRIPTIONS = {
     ComparisonMode.SCAN_VS_DIGITAL: "Ignores colour: both files become black ink on white, and their text and numbers are read and compared, with barcode bars as marks.",
     ComparisonMode.BARCODE: "Restricts comparison to detected barcode/pharmacode/QR symbols, decoded and compared.",
     ComparisonMode.BRAILLE: "Restricts comparison to the coloured dot-matrix representing Braille content.",
+    ComparisonMode.SERIES: "Original: one artwork, cropped or lifted as usual. Suspect: a sheet printed with several "
+    "repeats of it -- every repeat is found automatically and compared against the original on its own.",
+    ComparisonMode.LEAFLET: "For a multi-page leaflet or insert, open or closed, in any language. Pages are matched "
+    "by what is on them (so an inserted or missing page does not throw the rest out of step) and every page is "
+    "compared in full.",
 }
+
+_PANEL_WIDTH_PX = 360
 
 _MODE_ORDER = [
     ComparisonMode.AUTOMATIC,
     ComparisonMode.SCAN_VS_DIGITAL,
     ComparisonMode.BARCODE,
     ComparisonMode.BRAILLE,
+    ComparisonMode.SERIES,
+    ComparisonMode.LEAFLET,
 ]
 
 
@@ -75,6 +83,7 @@ class ModeSelector(QGroupBox):
 
     def __init__(self, parent=None):
         super().__init__("Comparison Mode", parent)
+        self.setFixedWidth(_PANEL_WIDTH_PX)  # (a long description must not widen the panel when its card is chosen)
         self._button_group = QButtonGroup(self)
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -85,16 +94,6 @@ class ModeSelector(QGroupBox):
             layout.addWidget(card)
             self._cards[mode] = card
             card.radio.toggled.connect(self._on_toggled(mode))
-
-        # A scan changes every colour and blurs every edge, so comparing its graphics gives false differences round the
-        # real ones: text is what this mode compares, and graphics are an option.
-        self.scan_graphics = QCheckBox("Also compare graphics (a scan can show false differences)")
-        self.scan_graphics.setToolTip(
-            "Scan vs Digital compares text, numbers and barcode bars. Tick this to compare logos and other artwork too."
-        )
-        self.scan_graphics.setVisible(False)
-        layout.addWidget(self.scan_graphics)
-        self.modeChanged.connect(lambda mode: self.scan_graphics.setVisible(mode is ComparisonMode.SCAN_VS_DIGITAL))
 
         self._cards[ComparisonMode.AUTOMATIC].radio.setChecked(True)
 
@@ -114,8 +113,3 @@ class ModeSelector(QGroupBox):
 
     def set_mode(self, mode: ComparisonMode) -> None:
         self._cards[mode].radio.setChecked(True)
-
-    @property
-    def compare_scan_graphics(self) -> bool:
-        """Whether a Scan vs Digital comparison should also compare graphics."""
-        return self.scan_graphics.isChecked()

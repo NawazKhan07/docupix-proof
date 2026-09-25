@@ -63,8 +63,10 @@ def detect(
     """Colour differences between two images already in the shared aligned space."""
     with StageTimer(logger, "detector_color"):
         factor = _downscale_factor(original.shape, config.color_working_long_edge_px)
+        factor_x = factor_y = 1.0
         if factor < 1.0:
             size = (int(original.shape[1] * factor), int(original.shape[0] * factor))
+            factor_x, factor_y = size[0] / original.shape[1], size[1] / original.shape[0]  # (whole pixels: not quite `factor`)
             small_original = cv2.resize(original, size, interpolation=cv2.INTER_AREA)
             small_suspect = cv2.resize(suspect, size, interpolation=cv2.INTER_AREA)
             small_mask = (
@@ -99,7 +101,7 @@ def detect(
             peak_delta = float(region.max()) if region.size else 0.0
             candidates.append(
                 DiffCandidate(
-                    bbox=box.scaled(1 / factor),
+                    bbox=box.scaled_xy(1 / factor_x, 1 / factor_y),
                     type=DiffType.COLOUR,
                     subtype=DiffSubtype.CHANGED,
                     confidence=min(1.0, peak_delta / (config.color_delta_e_threshold * 4)),

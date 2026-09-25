@@ -29,16 +29,15 @@ class DiffSubtype(Enum):
     REMOVED = "removed"
 
 
-# FR-7.1 asks for three reporting categories; the finer DiffTypes fold into
-# them. Barcode and Braille findings have their own dedicated result panels
-# (FR-10.2 / FR-11.1) but still read as "graphics" in the general diff list.
+# What a finding IS, in the words a reviewer uses. Each has its own colour (`app.models.categories`), so what kind of
+# difference a box marks is seen at a glance. (There is no severity: a difference is described, not ranked.)
 _CATEGORIES = {
     DiffType.TEXT: "text",
     DiffType.NUMBER: "text",
     DiffType.COLOUR: "colour",
     DiffType.GRAPHICS: "graphics",
-    DiffType.BARCODE: "graphics",
-    DiffType.BRAILLE: "graphics",
+    DiffType.BARCODE: "barcode",
+    DiffType.BRAILLE: "braille",
 }
 
 
@@ -86,6 +85,11 @@ class BoundingBox:
     def scaled(self, factor: float) -> "BoundingBox":
         return BoundingBox(self.x0 * factor, self.y0 * factor, self.x1 * factor, self.y1 * factor)
 
+    def scaled_xy(self, factor_x: float, factor_y: float) -> "BoundingBox":
+        """Scaled by one factor across and another down: a reduced picture's width and height are whole numbers, so its
+        two scales are not quite the same, and one factor for both puts a box a few pixels off at the far edge."""
+        return BoundingBox(self.x0 * factor_x, self.y0 * factor_y, self.x1 * factor_x, self.y1 * factor_y)
+
 
 @dataclass
 class DiffCandidate:
@@ -94,32 +98,23 @@ class DiffCandidate:
     subtype: DiffSubtype
     confidence: float
     detail: str = ""
-    # Detector-specific strength, kept numeric so severity rules never have
+    # Detector-specific strength, kept numeric so nothing has
     # to parse `detail`: peak delta-E for colour, 1 - SSIM for graphics, and
     # 0 where a detector has no meaningful scale (text, symbols, Braille).
     magnitude: float = 0.0
+    # A long thin stroke that is all there is to the difference (a die line or fold line drawn in one file and not the
+    # other, or in another colour): whether it is ignored depends on where it lies (see `worker._drop_die_lines`).
+    line_work: bool = False
+    # A difference in what was READ that the pixels do not bear out (the words differ, the ink matches: most likely the
+    # reader's mistake, not the artwork's). Listed apart, and only shown on request.
+    uncertain: bool = False
+    # A recoloured AREA (a panel, a tint): its finding is the colour; what is written on it is findings of their own, so
+    # the words in its box are not read into it.
+    region: bool = False
 
     @property
     def category(self) -> str:
         return _CATEGORIES[self.type]
-
-
-class Severity(Enum):
-    """FR-7.2 tiers. PENDING SIGN-OFF: the SRS says "Critical and others"
-    without finalising the list (SRS §7). The rules that assign these, and
-    the colour for each, live together in `engine/aggregation/severity.py`."""
-
-    CRITICAL = "critical"
-    MAJOR = "major"
-    MINOR = "minor"
-
-    @property
-    def rank(self) -> int:
-        """Lower is more severe, so sorting by rank puts Critical first."""
-        return _SEVERITY_RANK[self]
-
-
-_SEVERITY_RANK = {Severity.CRITICAL: 0, Severity.MAJOR: 1, Severity.MINOR: 2}
 
 
 class DiffStatus(Enum):
@@ -140,7 +135,6 @@ class DiffCluster:
     bbox_in_original: BoundingBox
     bbox_in_suspect: BoundingBox
     type: DiffType
-    severity: Severity
     members: list[DiffCandidate] = field(default_factory=list)
     status: DiffStatus = DiffStatus.ACTIVE
     detail: str = ""
@@ -148,6 +142,18 @@ class DiffCluster:
     @property
     def category(self) -> str:
         return _CATEGORIES[self.type]
+
+    @property
+    def subtype(self) -> DiffSubtype:
+        """What happened to it: changed, moved, added or removed (that of the strongest member that has one)."""
+        for member in sorted(self.members, key=lambda m: (m.type is not self.type, -m.magnitude)):
+            return member.subtype
+        return DiffSubtype.CHANGED
+
+    @property
+    def uncertain(self) -> bool:
+        """Whether every member is a reading the pixels do not bear out (see `DiffCandidate.uncertain`)."""
+        return bool(self.members) and all(member.uncertain for member in self.members)
 
     @property
     def types(self) -> set[DiffType]:

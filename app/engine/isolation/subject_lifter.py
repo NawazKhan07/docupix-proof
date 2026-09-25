@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 Point = tuple[float, float]
 
 _GMM_COMPONENTS = 5  # GrabCut's model size
-_MIN_SUBJECT_FRACTION = 0.002  # smaller than this share of the page is not a subject
+_MIN_SUBJECT_PX = 40  # a speck of fewer pixels than this is not a subject (there is no rule about size beyond that)
 _REFINE_PRIOR = 1.5  # how strongly the coarse outline is trusted against colour, in log-likelihood
 _REFINE_SMOOTHING_PX = 1.2
 _MAX_REFINE_BAND_PX = 24
@@ -418,21 +418,27 @@ def lift_subject(
             small = bgr
         seed_small = (seed[0] * scale, seed[1] * scale)
 
-        small_mask, foreground_model, background_model = _segment(small, seed_small, config)
+        # The press marks a disc of definite subject; where the area pressed on is smaller than the disc, the result is
+        # the disc and nothing has been lifted. So a smaller disc is tried, and smaller again: a small area is lifted like a big one.
+        mask = None
+        for step in config.seed_radius_steps:
+            trial = replace(config, seed_radius_fraction=config.seed_radius_fraction * step)
+            small_mask, foreground_model, background_model = _segment(small, seed_small, trial)
 
-        if scale < 1.0:
-            # Bilinear, not blurred first: smoothing a reduced-size mask rounds an artwork's corners by
-            # several full-resolution pixels, more than the edge refinement then reaches to correct.
-            mask = cv2.resize(small_mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR) > 0.5
-        else:
-            mask = small_mask
-        mask = _refine_edge(bgr, mask, foreground_model, background_model, seed, scale, config)
+            if scale < 1.0:
+                # Bilinear, not blurred first: smoothing a reduced-size mask rounds an artwork's corners by
+                # several full-resolution pixels, more than the edge refinement then reaches to correct.
+                candidate = cv2.resize(small_mask.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR) > 0.5
+            else:
+                candidate = small_mask
+            candidate = _refine_edge(bgr, candidate, foreground_model, background_model, seed, scale, trial)
 
-        # The press marks a small disc as subject by fiat; nothing has been LIFTED unless the result
-        # is a good deal more than that disc (and more than a speck of the page).
-        seed_area = math.pi * (max(3.0, config.seed_radius_fraction * min(small.shape[:2])) / scale) ** 2
-        if mask.sum() < max(_MIN_SUBJECT_FRACTION * mask.size, 4 * seed_area):
-            raise NoSubjectFoundError("That area is too small to be the artwork. Press and hold on the artwork itself.")
+            seed_area = math.pi * (max(3.0, trial.seed_radius_fraction * min(small.shape[:2])) / scale) ** 2
+            if candidate.sum() >= max(_MIN_SUBJECT_PX, 2 * seed_area):
+                mask = candidate
+                break
+        if mask is None:
+            raise NoSubjectFoundError("Nothing could be lifted at that spot. Press and hold on the artwork itself.")
         mask = _corrected(mask, hints, seed)
 
         polygon = outline_from_mask(mask, config)

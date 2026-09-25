@@ -257,18 +257,18 @@ def test_the_real_worker_compares_two_files_from_their_paths(qapp, tmp_path):
         controller.shutdown()
 
 
-def test_the_real_worker_reports_an_oversized_file_as_an_input_error(qapp, tmp_path):
-    controller = JobController(RuntimeConfig(max_render_megapixels=0))
+def test_the_real_worker_reports_a_file_over_a_limit_someone_set_as_an_input_error(qapp, tmp_path):
+    controller = JobController(RuntimeConfig(max_file_size_mb=-1))
     seen = Recorder(controller)
     try:
         original, suspect = _pair(tmp_path)
         controller.start(
-            ComparisonRequest(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(runtime=RuntimeConfig(max_render_megapixels=0)))
+            ComparisonRequest(original, suspect, ComparisonMode.AUTOMATIC, AppConfig(runtime=RuntimeConfig(max_file_size_mb=-1)))
         )
         _wait(qapp, lambda: seen.results or seen.errors, timeout=90)
 
         assert seen.errors and seen.errors[0][0] == ErrorKind.INPUT
-        assert "megapixel" in seen.errors[0][1]
+        assert "max_file_size_mb" in seen.errors[0][1]
     finally:
         controller.shutdown()
 

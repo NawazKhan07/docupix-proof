@@ -178,6 +178,47 @@ def test_a_cutout_that_is_not_in_the_target_cannot_be_placed_and_says_so():
         fit_placement(cutout, unrelated, AlignmentConfig())
 
 
+def _features_fail(monkeypatch):
+    """Plain artwork, few marks: the features cannot be matched (so the pictures' edges have to be)."""
+    import app.engine.isolation.placement as placement_module
+
+    def refuse(*_args, **_kwargs):
+        raise AlignmentError("too few features")
+
+    monkeypatch.setattr(placement_module, "align", refuse)
+
+
+@pytest.mark.parametrize("scale", [0.85, 1.0], ids=["a size smaller", "the same size"])
+def test_where_the_features_cannot_be_matched_the_outline_is_found_by_its_edges_at_its_size(monkeypatch, scale):
+    _features_fail(monkeypatch)
+    _image, _truth, _subject, cutout = _lifted_cutout()
+    target, target_truth = scenes.compose(scenes.artwork(edge="coloured"), "grey desk", canvas=(1500, 1700), rotation_deg=0.0, scale=scale, offset=(0, 0), seed=9)
+
+    fit = fit_placement(cutout, target, AlignmentConfig(), expected_scale=scale)
+
+    assert fit.alignment.method == "template"
+    assert fit.placement.scale == pytest.approx(scale, abs=0.03)
+    placed = cv2.fillPoly(
+        np.zeros(target.shape[:2], np.uint8), [np.round(np.array(fit.placement.map_points(cutout.polygon, cutout.size))).astype(np.int32)], 1
+    ).astype(bool)
+    assert scenes.iou(placed, target_truth) > 0.9
+
+
+def test_the_edges_are_looked_for_at_the_same_resolution_if_nothing_says_otherwise(monkeypatch):
+    _features_fail(monkeypatch)
+    _image, _truth, _subject, cutout = _lifted_cutout()
+    target, _ = scenes.compose(scenes.artwork(edge="coloured"), "grey desk", canvas=(1500, 1700), rotation_deg=0.0, scale=1.0, offset=(0, 0), seed=9)
+    assert fit_placement(cutout, target, AlignmentConfig()).placement.scale == pytest.approx(1.0, abs=0.03)
+
+
+def test_an_outline_that_is_nowhere_in_the_picture_is_not_placed_by_its_edges_either(monkeypatch):
+    _features_fail(monkeypatch)
+    _image, _truth, _subject, cutout = _lifted_cutout()
+    unrelated = scenes.background("wood", (1500, 1700))
+    with pytest.raises(AlignmentError):
+        fit_placement(cutout, unrelated, AlignmentConfig())
+
+
 def test_the_cutouts_own_outline_never_anchors_the_registration():
     """The fit rests on the artwork's features: a polygon that was lifted (or placed) is only a mask."""
     _image, _truth, _subject, cutout = _lifted_cutout()

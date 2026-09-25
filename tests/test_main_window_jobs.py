@@ -93,18 +93,18 @@ def test_a_second_click_on_compare_while_running_is_ignored(busy_window):
     assert controller._job_id == first
 
 
-def test_an_oversized_file_says_so_in_the_status_strip(qapp, tmp_path, shared_jobs, run_comparison_in_window):
+def test_a_file_over_a_limit_someone_set_says_so_in_the_status_strip(qapp, tmp_path, shared_jobs, run_comparison_in_window):
     a, b = _pair(tmp_path)
     window = MainWindow(jobs=shared_jobs)
     try:
         window.upload_panel.original_slot.load_path(a)
         window.upload_panel.suspect_slot.load_path(b)
         # the limit is applied by the worker when it loads the file, from the request's config
-        window.config = type(window.config)(runtime=RuntimeConfig(max_render_megapixels=0))
+        window.config = type(window.config)(runtime=RuntimeConfig(max_file_size_mb=-1))
         run_comparison_in_window(window)
 
         assert window.status_label.property("status") == "error"
-        assert "megapixel" in window.status_label.text()
+        assert "max_file_size_mb" in window.status_label.text()
         assert window.stack.currentWidget() is not window.results_view
         assert window.compare_button.isEnabled()
     finally:

@@ -317,25 +317,36 @@ def test_with_no_press_the_largest_closed_border_is_taken():
     assert subject.source == "border" and scenes.iou(subject.mask, _outline_dilated(truth)) > 0.97
 
 
-def test_a_press_outside_every_border_lifts_nothing_by_the_border_method():
-    sheet, _truth, _ = scenes.dieline_sheet()
-    with pytest.raises(NoSubjectFoundError) as caught:
-        lift_subject(sheet, (600, 140), CONFIG, method="border")  # on the title
-    assert "border" in str(caught.value)
+def test_a_press_outside_every_border_never_lifts_the_artwork_by_the_border_method():
+    """On the title, outside the carton: no closed border there is the artwork (a small enclosure of the title's own,
+    if the press lands on one, may be lifted -- there is no size rule -- but never the carton)."""
+    sheet, truth, _ = scenes.dieline_sheet()
+    try:
+        subject = lift_subject(sheet, (600, 140), CONFIG, method="border")  # on the title
+    except NoSubjectFoundError as caught:
+        assert "border" in str(caught)
+        return
+    assert scenes.iou(subject.mask, _outline_dilated(truth)) < 0.05
 
 
-def test_a_small_closed_shape_is_not_taken_for_the_artwork_in_automatic_mode():
-    """A boxed label inside the sheet is a closed border too, but automatic mode wants a sizeable part of
-    the sheet; asking for the border method explicitly lowers the bar."""
+def test_a_small_closed_shape_that_is_pointed_at_is_lifted_however_small():
+    """There is no size rule where the reviewer pointed: a boxed label is a closed border too, and pointing at it lifts
+    it, in the automatic method as in the border method. (Finding the artwork with NO press is careful of what it takes.)"""
     sheet = np.full((1500, 1200, 3), 255, np.uint8)
     cv2.rectangle(sheet, (400, 500), (560, 620), (20, 20, 20), 2)  # 120 x 100 px: ~0.7% of the sheet
-    small = lift_subject(sheet, (480, 560), CONFIG, method="border")
-    assert small.source == "border" and small.area_fraction < 0.02
-    try:
-        automatic = lift_subject(sheet, (480, 560), CONFIG, method="auto")
-    except NoSubjectFoundError:
-        return
-    assert automatic.source == "segmented"  # not offered as the artwork's border
+    for method in ("border", "auto"):
+        small = lift_subject(sheet, (480, 560), CONFIG, method=method)
+        assert small.source == "border" and small.area_fraction < 0.02, method
+        assert 11_000 < small.area_fraction * sheet.shape[0] * sheet.shape[1] < 21_000, method  # (inside the line, and the line)
+    with pytest.raises(NoSubjectFoundError):
+        lift_subject(sheet, None, CONFIG)  # with no press, a boxed label is not taken for the whole artwork
+
+
+def test_an_even_smaller_shape_is_lifted_too():
+    sheet = np.full((3000, 2400, 3), 255, np.uint8)
+    cv2.rectangle(sheet, (1000, 1200), (1140, 1290), (20, 20, 20), 3)  # 140 x 90 px of a 7 MP sheet: 0.18%
+    small = lift_subject(sheet, (1070, 1245), CONFIG)
+    assert small.source == "border"
 
 
 def test_a_photograph_is_not_treated_as_line_art():

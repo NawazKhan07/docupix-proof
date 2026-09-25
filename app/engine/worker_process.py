@@ -34,7 +34,10 @@ from app import offline_guard
 from app.config import AppConfig
 from app.engine.alignment.aligner import AlignmentError
 from app.engine.file_loader import ArtworkLoadError, load_artwork
+from app.engine.isolation.auto_area import find_artwork
+from app.engine.leaflet import NoPagesComparedError, compare_leaflet
 from app.engine.ocr_locator import configure_ocr
+from app.engine.series import NoRepeatsFoundError, compare_series
 from app.engine.worker import ComparisonOutcome, run_comparison
 from app.logging_config import job_log_file
 from app.models.isolation import IsolationGeometry
@@ -81,24 +84,70 @@ def execute_request(
     with load_artwork(request.original_path, limits) as original, load_artwork(
         request.suspect_path, limits
     ) as suspect:
+        if request.mode is ComparisonMode.LEAFLET:
+            # Every page matters, not one: rendered and paired inside, not as a single "the" page here.
+            outcome = compare_leaflet(original, suspect, request.config, progress=say)
+            for note in (original.reduced_note(), suspect.reduced_note()):
+                if note:
+                    outcome.notes.insert(0, note)
+            return outcome
+
         say("Rendering the artwork…")
         original_image, suspect_image = original.render(), suspect.render()
-        return run_comparison(
-            original_image,
-            suspect_image,
-            request.mode,
-            request.config,
-            original_geometry=request.original_geometry,
-            suspect_geometry=request.suspect_geometry,
-            progress=say,
-        )
+        original_geometry, suspect_geometry = request.original_geometry, request.suspect_geometry
+        notes: list[str] = []
+        if (
+            request.mode is ComparisonMode.AUTOMATIC
+            and request.config.detection.auto_artwork
+            and original_geometry is None
+            and suspect_geometry is None
+        ):
+            # Nothing was cropped or lifted: the artwork is found on each sheet, trimmed to, aligned and compared.
+            say("Finding the artwork\u2026")
+            found = find_artwork(
+                original_image,
+                suspect_image,
+                request.config.subject,
+                original.pdf_page(0) if original.kind == "pdf" else None,
+                suspect.pdf_page(0) if suspect.kind == "pdf" else None,
+                original.working_dpi() if original.kind == "pdf" else None,
+                suspect.working_dpi() if suspect.kind == "pdf" else None,
+            )
+            original_geometry, suspect_geometry = found.original, found.suspect
+            if found.note:
+                notes.append(found.note)
+        if request.mode is ComparisonMode.SERIES:
+            # The suspect is a whole sheet of repeats, never isolated by the reviewer: only the original's own
+            # geometry (the one artwork, cropped or lifted as usual) means anything here.
+            say("Finding the repeats…")
+            expected_scale = None
+            if original.kind == "pdf" and suspect.kind == "pdf" and original.working_dpi() > 0:
+                expected_scale = suspect.working_dpi() / original.working_dpi()
+            outcome = compare_series(
+                original_image, suspect_image, request.mode, request.config, original_geometry, expected_scale
+            )
+        else:
+            outcome = run_comparison(
+                original_image,
+                suspect_image,
+                request.mode,
+                request.config,
+                original_geometry=original_geometry,
+                suspect_geometry=suspect_geometry,
+                progress=say,
+            )
+        outcome.notes = notes + outcome.notes
+        for note in (original.reduced_note(), suspect.reduced_note()):
+            if note:
+                outcome.notes.insert(0, note)
+        return outcome
 
 
 def _classify(exc: BaseException) -> tuple[str, str]:
     """(ErrorKind, message a person can act on) for an exception raised by a job."""
     if isinstance(exc, ArtworkLoadError):
         return ErrorKind.INPUT, str(exc)
-    if isinstance(exc, AlignmentError):
+    if isinstance(exc, (AlignmentError, NoRepeatsFoundError, NoPagesComparedError)):
         return ErrorKind.ALIGNMENT, str(exc)
     if isinstance(exc, MemoryError):
         return ErrorKind.MEMORY, (

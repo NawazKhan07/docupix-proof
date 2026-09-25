@@ -26,7 +26,7 @@ import cv2
 import pymupdf as fitz
 import numpy as np
 
-from app.engine.file_loader import WORKING_DPI, LoadedArtwork
+from app.engine.file_loader import LoadedArtwork
 
 _PDF_POINTS_DPI = 72.0
 _EDGE_PAD_PX = 2  # over-render past the tile so edge pixels are never clipped
@@ -82,7 +82,7 @@ def render_vector_tile(
     if not is_vector(artwork):
         raise ValueError("render_vector_tile needs a PDF; use render_raster_tile for images")
 
-    scale = zoom * WORKING_DPI / _PDF_POINTS_DPI  # device pixels per PDF point
+    scale = zoom * artwork.working_dpi(page) / _PDF_POINTS_DPI  # device pixels per PDF point
     # Shift so the tile's own origin lands on device (0, 0); the clip is then
     # the same region expressed back in page coordinates, padded slightly.
     matrix = fitz.Matrix(scale, 0, 0, scale, -rect.x, -rect.y)

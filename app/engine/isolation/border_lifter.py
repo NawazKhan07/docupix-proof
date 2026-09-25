@@ -297,13 +297,14 @@ def border_region(
 ) -> BorderRegion | None:
     """The region inside the closed border line under `seed`, or None if there is no such border.
 
-    `strict` (automatic mode) only accepts a region that is a sizeable part of a light
-    sheet, so a text box on a photograph is not taken for the artwork; otherwise any
-    closed border of at least half a percent of the page will do. `page` and `dpi`, for a
+    `strict` with no `seed` (finding the artwork on its own) only accepts a region that is a sizeable part of a light
+    sheet, so a text box on a photograph is not taken for the artwork; where the reviewer pointed at a spot, any
+    closed border round it is lifted, however small. `page` and `dpi`, for a
     rendered PDF, let its vector strokes be used as the lines.
     """
     height, width = image_rgb.shape[:2]
-    minimum = config.border_min_area_fraction if strict else config.border_min_area_fraction_forced
+    # (no size rule where the reviewer pointed: only the finding of the artwork on its own is careful of what it takes)
+    minimum = config.border_min_area_fraction if (strict and seed is None) else config.border_min_area_fraction_forced
     scale, size = _working_scale(height, width, config.border_working_long_edge_px)
     seed_small = (seed[0] * scale, seed[1] * scale) if seed is not None else None
 
@@ -329,3 +330,52 @@ def border_region(
         )
         return BorderRegion(mask, source, line_width)
     return None
+
+
+def border_regions(
+    image_rgb: np.ndarray, config: SubjectConfig, page=None, dpi: float | None = None, limit: int = 4
+) -> list[BorderRegion]:
+    """The closed borders on the sheet, the biggest first (at most `limit`): the candidates for 'the artwork', where
+    more than one thing on the sheet is closed by a line (a carton, and a table of details below it).
+
+    Nothing that runs off the page, and none smaller than `border_min_area_fraction` of it; a border that is one of these
+    seen through a thicker wall is not listed twice.
+    """
+    height, width = image_rgb.shape[:2]
+    scale, size = _working_scale(height, width, config.border_working_long_edge_px)
+    walls_list: list[tuple[np.ndarray, str]] = []
+    if page is not None and dpi:
+        vector = vector_walls(page, dpi, size, scale)
+        if vector is not None:
+            walls_list.append((vector, "vector lines"))
+    raster = raster_walls(image_rgb, config)
+    if raster is not None:
+        walls_list.append((raster[0], "dark lines"))
+
+    found: list[tuple[np.ndarray, str]] = []
+    for walls, source in walls_list:
+        total = walls.size
+        for bridge in _BRIDGES_PX:
+            pieces, count = _sealed_pieces(walls, bridge)
+            areas = np.bincount(pieces.ravel(), minlength=count).astype(np.int64)
+            areas[0] = 0
+            areas[np.unique(np.concatenate([pieces[0], pieces[-1], pieces[:, 0], pieces[:, -1]]))] = 0
+            for label in np.argsort(-areas)[:limit]:
+                if areas[label] < config.border_min_area_fraction * total or areas[label] >= config.border_frame_fraction * total:
+                    continue
+                piece = pieces == int(label)
+                if bridge > 0:
+                    piece = cv2.erode(piece.astype(np.uint8), disc_kernel(bridge)).astype(bool)
+                piece = _shave(fill_holes(piece), config, None)
+                if not any(float((piece & other).sum()) > 0.8 * min(piece.sum(), other.sum()) for other, _s in found):
+                    found.append((piece, source))
+        if found:
+            break  # (the vector lines, when the file has them, are the border; the dark lines are only for a raster)
+
+    regions = []
+    for piece, source in sorted(found, key=lambda item: -int(item[0].sum()))[:limit]:
+        line_width = _line_width(piece, walls_list[0][0] if source == "vector lines" else walls_list[-1][0]) / scale
+        soft = cv2.GaussianBlur(piece.astype(np.float32), (0, 0), 0.8) if scale < 1.0 else piece.astype(np.float32)
+        mask = cv2.resize(soft, (width, height), interpolation=cv2.INTER_LINEAR) > 0.5 if scale < 1.0 else piece
+        regions.append(BorderRegion(mask, source, line_width))
+    return regions

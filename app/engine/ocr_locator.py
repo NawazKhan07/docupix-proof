@@ -55,6 +55,31 @@ def find_tesseract() -> Path | None:
     return next((candidate for candidate in _candidates() if candidate.is_file()), None)
 
 
+def available_languages() -> frozenset[str]:
+    """The Tesseract language codes that can actually be read (their tessdata is installed) -- empty if Tesseract
+    itself is not available. `configure_ocr()` should have run first, or this asks whatever `tesseract` PATH finds."""
+    try:
+        return frozenset(pytesseract.get_languages(config=""))
+    except Exception:  # noqa: BLE001 -- no engine, or a build too old for --list-langs: nothing is available
+        return frozenset()
+
+
+def usable_language(requested: str) -> tuple[str, bool]:
+    """(the language to actually ask Tesseract for, whether that is what was requested).
+
+    `requested` may join several with "+" (Tesseract's own syntax): whichever of them are installed are kept, in the
+    order given. None installed falls back to English; if that is not installed either, `requested` is returned
+    regardless (there is nothing better to try, and Tesseract will say so itself)."""
+    wanted = [code for code in requested.split("+") if code]
+    installed = available_languages()
+    if not installed:
+        return requested, True
+    usable = [code for code in wanted if code in installed]
+    if usable:
+        return "+".join(usable), usable == wanted
+    return ("eng" if "eng" in installed else requested), False
+
+
 def configure_ocr() -> Path | None:
     """Point pytesseract at the Tesseract found. Safe to call more than once, in any process."""
     executable = find_tesseract()

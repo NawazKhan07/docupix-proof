@@ -396,7 +396,7 @@ def test_text_is_read_from_the_ink_pictures(monkeypatch):
     page = _label()
     seen = []
 
-    def fake_detect(original, suspect, config):
+    def fake_detect(original, suspect, config, *reading):
         seen.append((original, suspect))
         return text_diff.TextScanResult([])
 
