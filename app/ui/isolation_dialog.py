@@ -38,9 +38,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QSizePolicy,
     QSlider,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +56,7 @@ from app.models.isolation import (
     NormalizedPolygon,
     NormalizedRect,
 )
+from app.ui.flow_layout import flow_widget
 from app.ui.interactive_canvas import InteractiveCanvas
 
 _STATUS_TEXT = {
@@ -93,6 +92,68 @@ class SubjectReference:
     cutout: Cutout
     source_name: str
     source_dpi: float | None = None  # the resolution the other file was rendered at, if it is a PDF (its pixels are then real sizes)
+
+
+_SHORT_NAME_CHARS = 44  # a file name longer than this is shortened in the middle on a button (in full in its tooltip)
+
+
+def _shortened(name: str) -> str:
+    if len(name) <= _SHORT_NAME_CHARS:
+        return name
+    tail = _SHORT_NAME_CHARS // 3
+    return f"{name[: _SHORT_NAME_CHARS - tail - 1]}…{name[-tail:]}"
+
+
+class _OptionsStack(QWidget):
+    """The current tool's options, one page at a time, as tall as the page on show needs at this width.
+
+    Not a stacked widget: that is as tall as the tallest of ALL its pages, which left a blank band under a short one
+    once the rows of controls could wrap. Here the other pages are simply hidden, and a hidden widget takes no room.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pages: list[QWidget] = []
+        self._current = -1
+        self._column = QVBoxLayout(self)
+        self._column.setContentsMargins(0, 0, 0, 0)
+        self._column.setSpacing(0)
+
+    def addWidget(self, page: QWidget) -> int:
+        self._pages.append(page)
+        self._column.addWidget(page)
+        page.setVisible(len(self._pages) - 1 == self._current)
+        if self._current < 0:
+            self.setCurrentIndex(0)
+        return len(self._pages) - 1
+
+    def count(self) -> int:
+        return len(self._pages)
+
+    def widget(self, index: int) -> QWidget | None:
+        return self._pages[index] if 0 <= index < len(self._pages) else None
+
+    def currentIndex(self) -> int:
+        return self._current
+
+    def currentWidget(self) -> QWidget | None:
+        return self.widget(self._current)
+
+    def setCurrentIndex(self, index: int) -> None:
+        self._current = index
+        for position, page in enumerate(self._pages):
+            page.setVisible(position == index)
+
+
+def _group(*widgets: QWidget) -> QWidget:
+    """Controls that belong together on one line, kept together when their row wraps."""
+    group = QWidget()
+    row = QHBoxLayout(group)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    for widget in widgets:
+        row.addWidget(widget)
+    return group
 
 
 class IsolationDialog(QDialog):
@@ -135,8 +196,9 @@ class IsolationDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        tool_row = QHBoxLayout()
-        tool_row.setSpacing(6)
+        # The rows of controls wrap onto another line in a narrow window rather than push it wider than the screen.
+        tool_widget, tool_row = flow_widget(self, spacing=16)
+        tools = _group()
         self.crop_button = QPushButton("Crop")
         self.lift_button = QPushButton("Lift Subject")
         self.place_button = QPushButton("Place Subject")
@@ -153,9 +215,9 @@ class IsolationDialog(QDialog):
         for button, _tool in self._tool_buttons:
             button.setCheckable(True)
             button.setProperty("variant", "segment")
-            tool_row.addWidget(button)
+            tools.layout().addWidget(button)
         self.crop_button.setChecked(True)
-        tool_row.addStretch(1)
+        tool_row.addWidget(tools)
 
         # Zoom controls: the page opens fitted, and these (or a pinch / Ctrl + wheel) change that.
         self.zoom_out_button = QPushButton("−")
@@ -165,18 +227,21 @@ class IsolationDialog(QDialog):
         self.actual_button = QPushButton("100%")
         for button in (self.zoom_out_button, self.zoom_in_button):
             button.setProperty("variant", "icon")
+            button.setFixedWidth(36)
         for button in (self.fit_button, self.actual_button):
             button.setProperty("variant", "segment")
         self.zoom_label.setMinimumWidth(48)
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        zoom = _group()
         for widget in (self.zoom_out_button, self.zoom_label, self.zoom_in_button, self.fit_button, self.actual_button):
-            tool_row.addWidget(widget)
-        layout.addLayout(tool_row)
+            zoom.layout().addWidget(widget)
+        tool_row.addWidget(zoom)
+        layout.addWidget(tool_widget)
 
         layout.addWidget(self._build_reference_banner())
 
         # The options of the current tool.
-        self.options = QStackedWidget()
+        self.options = _OptionsStack()
         self.options.addWidget(QWidget())  # crop has none
         self.options.addWidget(self._build_lift_options())
         self.options.addWidget(self._build_place_options())
@@ -236,10 +301,7 @@ class IsolationDialog(QDialog):
 
     # -- building the option bars ---------------------------------------------------------
     def _build_lift_options(self) -> QWidget:
-        bar = QWidget()
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        bar, row = flow_widget(spacing=8)
 
         self.method_combo = QComboBox()
         for label, value in _METHODS:
@@ -271,11 +333,9 @@ class IsolationDialog(QDialog):
         self.save_cutout_button = QPushButton("Save cutout…")
         self.save_cutout_button.setToolTip("Save the lifted artwork as a PNG with a transparent background.")
 
-        for widget in (QLabel("Method"), self.method_combo, self.autodetect_button, self.keep_button, self.drop_button,
-                       QLabel("Brush"), self.brush_slider, self.edit_button):
-            row.addWidget(widget)
-        row.addStretch(1)
-        row.addWidget(self.save_cutout_button)
+        for widgets in ((QLabel("Method"), self.method_combo), (self.autodetect_button,), (self.keep_button, self.drop_button),
+                        (QLabel("Brush"), self.brush_slider), (self.edit_button,), (self.save_cutout_button,)):
+            row.addWidget(_group(*widgets))
 
         self.autodetect_button.clicked.connect(lambda: self._run_lift(None))
         self.keep_button.toggled.connect(lambda on: self._set_brush("keep", on))
@@ -320,16 +380,14 @@ class IsolationDialog(QDialog):
         self.place_hint_label.setProperty("secondary", "true")
         column.addWidget(self.place_hint_label)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-        column.addLayout(row)
+        row_widget, row = flow_widget(spacing=8)
+        column.addWidget(row_widget)
 
         name = self._reference.source_name if self._reference else self._partner_title
-        self.use_reference_button = QPushButton(f"Use artwork lifted from {name}")
+        self.use_reference_button = QPushButton(f"Use artwork lifted from {_shortened(name)}")
         self.use_reference_button.setEnabled(self._reference is not None)
         self.use_reference_button.setToolTip(
-            "Lay the artwork lifted from the other file over this one."
+            f"Lay the artwork lifted from {name} over this one."
             if self._reference is not None
             else f"Nothing has been lifted from {self._partner_title} yet."
         )
@@ -356,11 +414,10 @@ class IsolationDialog(QDialog):
         self.trim_button = QPushButton("Trim to outline")
         self.trim_button.setProperty("variant", "primary")
 
-        for widget in (self.use_reference_button, self.open_cutout_button, self.autofit_button, QLabel("Rotate"),
-                       self.rotation_spin, QLabel("Scale"), self.scale_spin, QLabel("Opacity"), self.opacity_slider):
-            row.addWidget(widget)
-        row.addStretch(1)
-        row.addWidget(self.trim_button)
+        for widgets in ((self.use_reference_button,), (self.open_cutout_button, self.autofit_button),
+                        (QLabel("Rotate"), self.rotation_spin, QLabel("Scale"), self.scale_spin),
+                        (QLabel("Opacity"), self.opacity_slider), (self.trim_button,)):
+            row.addWidget(_group(*widgets))
 
         self.use_reference_button.clicked.connect(self._use_reference)
         self.open_cutout_button.clicked.connect(self._open_cutout)
@@ -487,15 +544,8 @@ class IsolationDialog(QDialog):
             self._use_reference()  # there is something to place: place it, rather than wait for a second click
 
     def _show_options(self, index: int) -> None:
-        """Show one tool's options, and give the page all the height the other tools' taller options would leave blank."""
+        """Show one tool's options (the others take no room: see `_OptionsStack`)."""
         self.options.setCurrentIndex(index)
-        for position in range(self.options.count()):
-            page = self.options.widget(position)
-            page.setSizePolicy(
-                QSizePolicy.Policy.Preferred,
-                QSizePolicy.Policy.Preferred if position == index else QSizePolicy.Policy.Ignored,
-            )
-        self.options.updateGeometry()
 
     def _on_erase_selection_changed(self, rect: NormalizedRect | None) -> None:
         self._update_option_states()

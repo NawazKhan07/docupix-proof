@@ -356,6 +356,9 @@ class InteractiveCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.viewport().setMouseTracking(True)  # so the cursor can show what a drag would do
+        # No scroll bars: the page is moved by Space + drag or the middle button, and zoomed by pinch / Ctrl + wheel.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         enable_zoom_gestures(self)
 
         self._pixmap_item: QGraphicsPixmapItem | None = None

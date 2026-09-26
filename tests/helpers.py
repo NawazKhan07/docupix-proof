@@ -48,3 +48,36 @@ def make_carton_pdf(
     doc.save(path)
     doc.close()
     return path
+
+
+def make_multi_panel_carton_pdf(path: Path, shift_second_panel: tuple[float, float] = (0.0, 0.0)) -> Path:
+    """A carton-like vector page of TWO panels side by side, each in its own frame (they meet at the fold), each
+    with its own real content -- `find_blocks` finds both. `shift_second_panel`, if given, shifts the whole right
+    panel, frame and content (a fold not quite flat when this file was made), independent of the left panel: the
+    vector equivalent of `test_block_alignment.py`'s `_locally_misaligned_suspect`.
+    """
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    # Each panel its own frame: a panel not quite flat when the file was made moves with its outline, as a real
+    # out-of-plane panel does -- its printing does not slide about inside a frame that stays put.
+    page.draw_rect(fitz.Rect(20, 20, 200, 280), color=(0, 0, 0), width=1.5)
+    dx, dy = shift_second_panel
+    page.draw_rect(fitz.Rect(200 + dx, 20 + dy, 380 + dx, 280 + dy), color=(0, 0, 0), width=1.5)
+
+    page.insert_text((35, 80), "PARACETAMOL", fontsize=14)
+    page.insert_text((35, 100), "500 mg Tablets", fontsize=9)
+    page.draw_rect(fitz.Rect(35, 120, 100, 150), color=(0.8, 0.1, 0.15), fill=(0.8, 0.1, 0.15))
+    for index in range(8):
+        page.draw_line(fitz.Point(35 + index * 6, 200), fitz.Point(35 + index * 6, 230), color=(0, 0, 0), width=1.5)
+
+    page.insert_text((220 + dx, 80 + dy), "BATCH INFO")
+    page.insert_text((220 + dx, 100 + dy), "EXP DATE 2027", fontsize=9)
+    page.draw_circle(fitz.Point(300 + dx, 180 + dy), 25, color=(0.1, 0.35, 0.8), fill=(0.1, 0.35, 0.8))
+    for index in range(8):
+        page.draw_line(
+            fitz.Point(220 + dx + index * 6, 220 + dy), fitz.Point(220 + dx + index * 6, 250 + dy), color=(0, 0, 0), width=1.5
+        )
+
+    doc.save(path)
+    doc.close()
+    return path

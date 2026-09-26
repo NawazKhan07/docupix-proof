@@ -20,11 +20,31 @@ def _solid(colour, height: int = 60, width: int = 80) -> np.ndarray:
     return image
 
 
-def test_flicker_alternates_between_the_two_files():
-    original, suspect = _solid((200, 0, 0)), _solid((0, 0, 200))
-    assert compose_flicker(original, suspect, 0) is original
-    assert compose_flicker(original, suspect, 1) is suspect
-    assert compose_flicker(original, suspect, 2) is original
+def test_flicker_holds_unchanged_areas_still():
+    """FR-8.2: only the flagged regions flicker, not the whole page."""
+    original = _solid((200, 0, 0))
+    result = compose_flicker(original, _solid((0, 0, 200)), [], phase=1)
+    assert np.array_equal(result, original)
+
+
+def test_flicker_alternates_the_two_files_inside_a_difference():
+    original, suspect = _solid((200, 30, 40)), _solid((30, 160, 60))
+    box = BoundingBox(10, 10, 30, 30)
+
+    first = compose_flicker(original, suspect, [box], phase=0)
+    second = compose_flicker(original, suspect, [box], phase=1)
+
+    assert tuple(first[20, 20]) == (200, 30, 40)  # the original's colour...
+    assert tuple(second[20, 20]) == (30, 160, 60)  # ...then the suspect's: it flickers
+    assert np.array_equal(first[50:, 40:], original[50:, 40:])  # outside stays on the original
+    assert np.array_equal(second[50:, 40:], original[50:, 40:])  # ...and does not flicker
+
+
+def test_flicker_boxes_are_clipped_to_the_image():
+    """A marker box straddling the edge must not crash or wrap around."""
+    original, suspect = _solid((200, 30, 40)), _solid((30, 160, 60))
+    result = compose_flicker(original, suspect, [BoundingBox(-20, -20, 500, 500)], phase=1)
+    assert result.shape == original.shape
 
 
 def test_overlay_blends_the_two_files_evenly():

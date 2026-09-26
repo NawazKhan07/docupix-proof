@@ -98,6 +98,16 @@ def _dot_box(center: np.ndarray, radius: float = 6.0) -> BoundingBox:
     return BoundingBox(x - radius, y - radius, x + radius, y + radius)
 
 
+def _region(*dot_sets: np.ndarray) -> BoundingBox | None:
+    """The box round every dot found (None if there are none)."""
+    dots = [d for d in dot_sets if len(d)]
+    if not dots:
+        return None
+    every = np.vstack(dots)
+    (x0, y0), (x1, y1) = every.min(axis=0), every.max(axis=0)
+    return _dot_box(np.array([x0, y0])).union(_dot_box(np.array([x1, y1])))
+
+
 def compare(
     original: np.ndarray, suspect: np.ndarray, config: DetectionConfig
 ) -> tuple[list[DiffCandidate], BrailleComparison]:
@@ -153,6 +163,7 @@ def compare(
             missing=len(missing),
             added=len(added),
             moved=moved,
+            region=_region(original_dots, suspect_dots),
         )
 
     logger.info(

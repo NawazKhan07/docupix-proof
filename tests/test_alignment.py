@@ -55,6 +55,23 @@ def _warp(image: np.ndarray, angle: float, tx: float, ty: float) -> tuple[np.nda
     return warped, np.vstack([matrix, [0, 0, 1]])
 
 
+def _warp_stretched(
+    image: np.ndarray, angle: float, tx: float, ty: float, scale_x: float, scale_y: float, canvas_scale: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Warp an image by a known rotation+translation+INDEPENDENT x/y scale, onto a canvas of a different overall
+    size (`canvas_scale` of the original's): the lifted subject is not always printed at the same size or
+    proportions as its counterpart. Returns (warped, 3x3 matrix)."""
+    height, width = image.shape[:2]
+    stretch = np.diag([scale_x, scale_y, 1.0])
+    rotation = np.vstack([cv2.getRotationMatrix2D((width * scale_x / 2, height * scale_y / 2), angle, 1.0), [0, 0, 1]])
+    matrix = rotation @ stretch
+    matrix[0, 2] += tx
+    matrix[1, 2] += ty
+    canvas = (round(width * scale_x * canvas_scale), round(height * scale_y * canvas_scale))
+    warped = cv2.warpAffine(image, matrix[:2], canvas, borderValue=(255, 255, 255))
+    return warped, matrix
+
+
 def _polygon_geometry(points) -> IsolationGeometry:
     return IsolationGeometry(boundary=NormalizedPolygon(points=list(points)))
 
@@ -94,6 +111,24 @@ def test_estimate_homography_returns_none_with_too_few_matches():
     blank = np.full((200, 200, 3), 255, dtype=np.uint8)
     matches = match_features(blank, blank.copy(), CONFIG)
     assert homography.estimate_homography(matches, CONFIG) is None
+
+
+def test_align_registers_a_stretched_rescaled_file_on_a_differently_sized_canvas():
+    """One lifted artwork is not always the same size or proportions as its counterpart -- printed a little
+    smaller, or unevenly stretched, on a sheet of a different size altogether. A full homography (not a rigid
+    rotation+translation) must still register the two well, whichever way each file was resized."""
+    original = _artwork_image()
+    suspect, forward = _warp_stretched(
+        original, angle=2.0, tx=20, ty=-15, scale_x=1.18, scale_y=0.88, canvas_scale=0.9
+    )
+
+    result = align(original, suspect, CONFIG)
+
+    assert not result.low_confidence
+    probe = np.array([[100.0, 100.0], [500.0, 120.0], [300.0, 350.0]])
+    moved = apply_transform(forward, probe)
+    recovered = apply_transform(result.transform, moved)
+    assert np.allclose(recovered, probe, atol=4.0)
 
 
 # ---------------------------------------------------------------------------

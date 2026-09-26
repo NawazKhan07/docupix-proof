@@ -35,6 +35,8 @@ from app.config import AppConfig
 from app.engine.alignment.aligner import AlignmentError
 from app.engine.file_loader import ArtworkLoadError, load_artwork
 from app.engine.isolation.auto_area import find_artwork
+from app.engine.detectors.text_diff import text_layer_words
+from app.engine.isolation.block_grid import stroked_line_map
 from app.engine.leaflet import NoPagesComparedError, compare_leaflet
 from app.engine.ocr_locator import configure_ocr
 from app.engine.series import NoRepeatsFoundError, compare_series
@@ -97,12 +99,13 @@ def execute_request(
         original_geometry, suspect_geometry = request.original_geometry, request.suspect_geometry
         notes: list[str] = []
         if (
-            request.mode is ComparisonMode.AUTOMATIC
-            and request.config.detection.auto_artwork
+            request.config.detection.auto_artwork
             and original_geometry is None
             and suspect_geometry is None
         ):
             # Nothing was cropped or lifted: the artwork is found on each sheet, trimmed to, aligned and compared.
+            # Every mode benefits from this, not just Automatic -- Leaflet is the one exception, handled above,
+            # since a leaflet's pages are paired and rendered inside `compare_leaflet` rather than here.
             say("Finding the artwork\u2026")
             found = find_artwork(
                 original_image,
@@ -127,6 +130,16 @@ def execute_request(
                 original_image, suspect_image, request.mode, request.config, original_geometry, expected_scale
             )
         else:
+            # A PDF's own fold and cut lines, which the artwork is divided into blocks by (block-wise alignment), and its
+            # own words, which say what a finding's text is without reading it from the picture.
+            lines = [
+                stroked_line_map(artwork.pdf_page(0), artwork.working_dpi(), image.shape[:2]) if artwork.kind == "pdf" else None
+                for artwork, image in ((original, original_image), (suspect, suspect_image))
+            ]
+            words = [
+                text_layer_words(artwork.pdf_page(0), artwork.working_dpi(), image.shape[:2]) if artwork.kind == "pdf" else None
+                for artwork, image in ((original, original_image), (suspect, suspect_image))
+            ]
             outcome = run_comparison(
                 original_image,
                 suspect_image,
@@ -135,6 +148,10 @@ def execute_request(
                 original_geometry=original_geometry,
                 suspect_geometry=suspect_geometry,
                 progress=say,
+                original_lines=lines[0],
+                suspect_lines=lines[1],
+                original_words=words[0],
+                suspect_words=words[1],
             )
         outcome.notes = notes + outcome.notes
         for note in (original.reduced_note(), suspect.reduced_note()):

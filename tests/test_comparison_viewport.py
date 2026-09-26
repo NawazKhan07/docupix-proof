@@ -213,12 +213,12 @@ def test_flicker_alternates_the_original_and_the_suspect(viewport):
     """FR-8.2: alternating display at the same screen position."""
     viewport.set_view_mode(ViewMode.FLICKER)
     assert viewport.is_animating
-    assert viewport.original_pane.shown_key == "original"
+    assert viewport.original_pane.shown_key == "flicker0"
 
     viewport._on_tick()
-    assert viewport.original_pane.shown_key == "suspect"
+    assert viewport.original_pane.shown_key == "flicker1"
     viewport._on_tick()
-    assert viewport.original_pane.shown_key == "original"
+    assert viewport.original_pane.shown_key == "flicker0"
 
 
 def test_flicker_holds_the_view_still_between_frames(viewport):
@@ -233,6 +233,18 @@ def test_flicker_holds_the_view_still_between_frames(viewport):
 
     after = (bar.value(), viewport.original_pane.verticalScrollBar().value())
     assert before == after
+
+
+def test_flicker_only_changes_pixels_inside_a_flagged_region(viewport, outcome):
+    """The whole point of scoping flicker to findings: everywhere else holds still."""
+    viewport.set_view_mode(ViewMode.FLICKER)
+    frame0 = viewport._stacks["flicker0"]._array(0)
+    frame1 = viewport._stacks["flicker1"]._array(0)
+
+    box = outcome.clusters[0].bbox_in_original
+    cx, cy = int((box.x0 + box.x1) / 2), int((box.y0 + box.y1) / 2)
+    assert not np.array_equal(frame0[cy, cx], frame1[cy, cx])  # inside a finding: it flickers
+    assert np.array_equal(frame0[5, 5], frame1[5, 5])  # far from any finding: holds still
 
 
 def test_overlay_is_static(viewport):

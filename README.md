@@ -93,6 +93,15 @@ bar or block stays a black block with its lettering white; whether a region is s
 how dark it looks, so a panel a few levels lighter in a scan is a little less black, never the opposite colour.
 Then:
 
+* **Each picture is levelled before it is read.** Alignment corrects the scan's overall rotation, but a fraction
+  of a degree is often left over, and that alone is enough to throw off Tesseract's OWN line segmentation on
+  packed, repeating print (a batch/expiry stamp, a dense table): lines merge into their neighbours, or a whole
+  line comes back as a scrambled run of words from several real lines. The residual tilt is measured (a rotation
+  search that scores how sharply the picture's rows alternate between full of ink and empty -- sharpest when
+  level) and the picture is turned that far just for the one whole-page reading; every word it returns is turned
+  straight back, so nothing else -- matching, ink agreement, the boxes shown -- ever knows it happened. A picture
+  already close to level, or with too little ink to measure, is left untouched (`detection.deskew_enabled`,
+  `deskew_max_angle_deg`).
 * **Text** is read (Tesseract) from both pictures *in full*, side by side (each page is cut into strips at
   blank rows and the strips are read one to a core), with lettering reversed out of a dark bar read the right
   way round and hairline typefaces thickened for reading. The words of the two files are matched **by what

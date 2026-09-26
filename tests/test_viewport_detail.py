@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import make_carton_pdf
+from helpers import make_carton_pdf, make_multi_panel_carton_pdf
 
 from app.config import AppConfig
 from app.engine.file_loader import load_artwork
 from app.engine.tile_renderer import TileRect, render_vector_tile
 from app.engine.worker import run_comparison
+from app.models.isolation import IsolationGeometry, NormalizedRect
 from app.models.job import ComparisonMode
 from app.ui.comparison_viewport import DETAIL_DEBOUNCE_MS, ComparisonViewport
 from app.ui.composition import ViewMode
@@ -127,7 +128,7 @@ def test_the_original_pane_shows_exactly_the_vector_render(viewport, pdf_case):
 def test_each_mode_gets_the_tiles_it_needs(viewport):
     viewport.set_zoom(3.0)
     expected_keys = {
-        ViewMode.FLICKER: {"original", "suspect"},
+        ViewMode.FLICKER: {"flicker0", "flicker1"},
         ViewMode.OVERLAY: {"overlay"},
         ViewMode.GRAYSCALE: {"gray0", "gray1"},
     }
@@ -238,6 +239,49 @@ def test_loading_a_new_result_discards_the_old_tile(viewport, pdf_case):
     viewport.set_images(outcome.aligned_original, outcome.aligned_suspect)
 
     assert not viewport.has_detail
+
+
+def test_a_locally_aligned_panel_is_crisp_zoomed_in_too(qapp, tmp_path):
+    """FR-9.1's crisp zoomed-in vector re-render must also honour a panel's own local alignment
+    (`ComparisonOutcome.block_alignments`), not just the whole artwork's transform -- otherwise a panel that
+    needed local correction (a fold not quite flat, or files of different overall proportions) renders
+    doubled at high zoom even though the very same panel is well registered in the non-zoomed composite."""
+    original = load_artwork(make_multi_panel_carton_pdf(tmp_path / "o.pdf"))
+    suspect = load_artwork(make_multi_panel_carton_pdf(tmp_path / "s.pdf", shift_second_panel=(15.0, -10.0)))
+    carton = IsolationGeometry(boundary=NormalizedRect(0.03, 0.03, 0.97, 0.97))  # panels are found inside an artwork area
+    outcome = run_comparison(
+        original.render(), suspect.render(), ComparisonMode.AUTOMATIC, AppConfig(), original_geometry=carton, suspect_geometry=carton
+    )
+    assert outcome.block_alignments  # the shifted panel's own local fit was found and trusted
+
+    widget = ComparisonViewport()
+    widget.resize(1100, 700)
+    widget.show()
+    widget.set_images(outcome.aligned_original, outcome.aligned_suspect)
+    widget.set_sources(original, suspect, outcome.alignment.transform, outcome.block_alignments)
+    widget.set_zoom(3.0)
+    qapp.processEvents()
+
+    # The shifted (right) panel, in shared-frame pixels -- read from its own polygon, not a hardcoded box.
+    polygon, _transform = next(item for item in outcome.block_alignments if min(x for x, _y in item[0]) > 400)
+    xs, ys = [p[0] for p in polygon], [p[1] for p in polygon]
+    zoom = widget._zoom
+    rect = TileRect(
+        int(min(xs) * zoom) + 10, int(min(ys) * zoom) + 10,
+        int((max(xs) - min(xs)) * zoom) - 20, int((max(ys) - min(ys)) * zoom) - 20,
+    )
+
+    tile_with_block = widget._suspect_tile(rect)
+    widget._block_alignments = []  # the bug: only the whole artwork's transform, as before this fix
+    tile_global_only = widget._suspect_tile(rect)
+    original_tile = widget._original_tile(rect)
+
+    diff_with_block = np.abs(original_tile.astype(int) - tile_with_block.astype(int)).mean()
+    diff_global_only = np.abs(original_tile.astype(int) - tile_global_only.astype(int)).mean()
+    assert diff_with_block < diff_global_only / 2  # markedly closer with the panel's own correction
+    widget.close()
+    original.close()
+    suspect.close()
 
 
 # ---------------------------------------------------------------------------

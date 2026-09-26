@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import cv2
@@ -48,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 Point = tuple[float, float]
 
+_PDF_LOCK = threading.Lock()
 _BRIDGES_PX = (0, 1, 2, 3, 5)  # wall thickening tried, in working pixels
 _GROWTH_TO_KEEP_GOING = 1.08  # a thicker wall must seal in this much more area to be preferred
 _MAX_DRAWINGS = 300_000  # a page with more vector paths than this is not scanned for lines
@@ -120,7 +123,8 @@ def vector_walls(page, dpi: float, size: tuple[int, int], scale: float) -> np.nd
     Only strokes count: a filled swatch is not a line, and text is not a path. A page
     that has no visible strokes gives None.
     """
-    drawings = page.get_drawings()
+    with _PDF_LOCK:  # the PDF library is not safe to call from two threads at once (the two files are lifted side by side)
+        drawings = page.get_drawings()
     if not drawings or len(drawings) > _MAX_DRAWINGS:
         return None
     to_pixels = dpi / 72.0 * scale
@@ -332,6 +336,27 @@ def border_region(
     return None
 
 
+def _extent(piece: np.ndarray) -> tuple[int, int, int, int, int] | None:
+    """(x0, y0, x1, y1, area) of a piece's pixels; None if it has none."""
+    points = cv2.findNonZero(piece.astype(np.uint8))
+    if points is None:
+        return None
+    x, y, w, h = cv2.boundingRect(points)
+    return x, y, x + w, y + h, len(points)
+
+
+def _same_piece(piece: np.ndarray, extent: tuple[int, int, int, int, int], other: tuple[np.ndarray, tuple[int, int, int, int, int]]) -> bool:
+    """Whether two pieces are one border seen twice: they share more than 80% of the smaller (compared only where their
+    boxes overlap -- the pages are full size, and there can be a dozen candidates)."""
+    other_piece, (ox0, oy0, ox1, oy1, other_area) = other
+    x0, y0, x1, y1, area = extent
+    ix0, iy0, ix1, iy1 = max(x0, ox0), max(y0, oy0), min(x1, ox1), min(y1, oy1)
+    if ix0 >= ix1 or iy0 >= iy1:
+        return False
+    shared = cv2.countNonZero((piece[iy0:iy1, ix0:ix1] & other_piece[iy0:iy1, ix0:ix1]).astype(np.uint8))
+    return shared > 0.8 * min(area, other_area)
+
+
 def border_regions(
     image_rgb: np.ndarray, config: SubjectConfig, page=None, dpi: float | None = None, limit: int = 4
 ) -> list[BorderRegion]:
@@ -343,38 +368,52 @@ def border_regions(
     """
     height, width = image_rgb.shape[:2]
     scale, size = _working_scale(height, width, config.border_working_long_edge_px)
-    walls_list: list[tuple[np.ndarray, str]] = []
-    if page is not None and dpi:
-        vector = vector_walls(page, dpi, size, scale)
-        if vector is not None:
-            walls_list.append((vector, "vector lines"))
-    raster = raster_walls(image_rgb, config)
-    if raster is not None:
-        walls_list.append((raster[0], "dark lines"))
+    def walls_found():
+        """The vector lines, when the file has them; the dark lines only if those close nothing in (they are for a raster)."""
+        if page is not None and dpi:
+            vector = vector_walls(page, dpi, size, scale)
+            if vector is not None:
+                yield vector, "vector lines"
+        raster = raster_walls(image_rgb, config)
+        if raster is not None:
+            yield raster[0], "dark lines"
 
     found: list[tuple[np.ndarray, str]] = []
-    for walls, source in walls_list:
+    known: list[tuple[np.ndarray, tuple[int, int, int, int, int]]] = []  # each piece found, with its box and area
+    walls_of: dict[str, np.ndarray] = {}
+    for walls, source in walls_found():
+        walls_of[source] = walls
         total = walls.size
-        for bridge in _BRIDGES_PX:
+
+        def closed(bridge: int) -> list[np.ndarray]:
+            """The biggest pieces the walls close in, thickened by `bridge` (each bridge on its own: they run side by side)."""
             pieces, count = _sealed_pieces(walls, bridge)
             areas = np.bincount(pieces.ravel(), minlength=count).astype(np.int64)
             areas[0] = 0
             areas[np.unique(np.concatenate([pieces[0], pieces[-1], pieces[:, 0], pieces[:, -1]]))] = 0
+            shaved = []
             for label in np.argsort(-areas)[:limit]:
                 if areas[label] < config.border_min_area_fraction * total or areas[label] >= config.border_frame_fraction * total:
                     continue
                 piece = pieces == int(label)
                 if bridge > 0:
                     piece = cv2.erode(piece.astype(np.uint8), disc_kernel(bridge)).astype(bool)
-                piece = _shave(fill_holes(piece), config, None)
-                if not any(float((piece & other).sum()) > 0.8 * min(piece.sum(), other.sum()) for other, _s in found):
-                    found.append((piece, source))
+                shaved.append(_shave(fill_holes(piece), config, None))
+            return shaved
+
+        with ThreadPoolExecutor(max_workers=len(_BRIDGES_PX)) as pool:
+            for shaved in pool.map(closed, _BRIDGES_PX):
+                for piece in shaved:  # in the bridges' order, as one after the other would find them
+                    extent = _extent(piece)
+                    if extent is not None and not any(_same_piece(piece, extent, other) for other in known):
+                        found.append((piece, source))
+                        known.append((piece, extent))
         if found:
             break  # (the vector lines, when the file has them, are the border; the dark lines are only for a raster)
 
     regions = []
     for piece, source in sorted(found, key=lambda item: -int(item[0].sum()))[:limit]:
-        line_width = _line_width(piece, walls_list[0][0] if source == "vector lines" else walls_list[-1][0]) / scale
+        line_width = _line_width(piece, walls_of[source]) / scale
         soft = cv2.GaussianBlur(piece.astype(np.float32), (0, 0), 0.8) if scale < 1.0 else piece.astype(np.float32)
         mask = cv2.resize(soft, (width, height), interpolation=cv2.INTER_LINEAR) > 0.5 if scale < 1.0 else piece
         regions.append(BorderRegion(mask, source, line_width))

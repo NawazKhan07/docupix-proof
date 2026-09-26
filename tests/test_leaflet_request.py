@@ -6,11 +6,23 @@ from __future__ import annotations
 from pathlib import Path
 
 import leaflet_scenes as scenes
+import pytesseract
+import pytest
 from PIL import Image
 
 from app.config import AppConfig
+from app.engine.ocr_locator import find_tesseract
 from app.engine.worker_process import ComparisonRequest, execute_request
 from app.models.job import ComparisonMode
+
+
+@pytest.fixture(autouse=True)
+def _ocr(monkeypatch):
+    # Scoped to this test, like every other file's OCR fixture (see test_leaflet.py): Leaflet mode's default
+    # strategy reads and compares the words on each page, so this needs a configured reader to find anything.
+    tesseract = find_tesseract()
+    if tesseract is not None:
+        monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(tesseract))
 
 
 def _pdf(path: Path, pages: list) -> None:

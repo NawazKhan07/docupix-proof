@@ -170,3 +170,26 @@ class DiffCluster:
 
     def restore(self) -> None:
         self.status = DiffStatus.ACTIVE
+
+
+# Scan vs Digital always finds both graphics and text changes (see `app.engine.worker.run_comparison`); its
+# results page just filters which are SHOWN, so ticking a checkbox back on is instant, nothing recompared.
+_ALWAYS_SHOWN_TYPES = {DiffType.BARCODE, DiffType.BRAILLE}
+_TEXT_TYPES = {DiffType.TEXT, DiffType.NUMBER}
+_GRAPHICS_TYPES = {DiffType.COLOUR, DiffType.GRAPHICS}
+
+
+def visible_clusters(clusters: list[DiffCluster], *, text_wanted: bool, graphics_wanted: bool) -> list[DiffCluster]:
+    """`clusters` restricted to what Scan vs Digital's graphics/text checkboxes ask to see.
+
+    Barcode and Braille are compared as marks either way and are always shown. A finding merged from more
+    than one kind of detector (a change that is both structural and textual) is shown if either is wanted:
+    hiding graphics must not hide a real text change that happened to land on the same spot.
+    """
+    def shown(cluster: DiffCluster) -> bool:
+        types = cluster.types
+        if types & _ALWAYS_SHOWN_TYPES:
+            return True
+        return bool((text_wanted and types & _TEXT_TYPES) or (graphics_wanted and types & _GRAPHICS_TYPES))
+
+    return [cluster for cluster in clusters if shown(cluster)]

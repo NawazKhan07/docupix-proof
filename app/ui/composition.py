@@ -38,9 +38,29 @@ SINGLE_PANE_MODES = frozenset({ViewMode.FLICKER, ViewMode.OVERLAY, ViewMode.GRAY
 ANIMATED_MODES = frozenset({ViewMode.FLICKER, ViewMode.GRAYSCALE})
 
 
-def compose_flicker(original: np.ndarray, suspect: np.ndarray, phase: int) -> np.ndarray:
-    """Alternate the two files at the same screen position (FR-8.2)."""
-    return original if phase % 2 == 0 else suspect
+def compose_flicker(
+    original: np.ndarray,
+    suspect: np.ndarray,
+    difference_boxes: list[BoundingBox],
+    phase: int,
+) -> np.ndarray:
+    """The original everywhere except where a difference lives (FR-8.2).
+
+    Unchanged areas hold still on the original; each area containing a
+    difference alternates between the two files, so only the flagged regions
+    flicker and the reviewer is not left hunting for a change across a whole
+    page blinking at them.
+    """
+    base = original.copy()
+    if phase % 2 == 0:
+        return base
+    height, width = base.shape[:2]
+    for box in difference_boxes:
+        x0, y0 = max(0, int(box.x0)), max(0, int(box.y0))
+        x1, y1 = min(width, int(np.ceil(box.x1))), min(height, int(np.ceil(box.y1)))
+        if x1 > x0 and y1 > y0:
+            base[y0:y1, x0:x1] = suspect[y0:y1, x0:x1]
+    return base
 
 
 def compose_overlay(original: np.ndarray, suspect: np.ndarray, opacity: float = 0.5) -> np.ndarray:

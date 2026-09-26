@@ -115,12 +115,19 @@ def test_different_types_that_are_merely_near_each_other_stay_separate():
     assert len(cluster_candidates(near, distance_px=30)) == 2
 
 
-def test_a_barely_overlapping_pair_of_different_types_is_not_merged():
-    sliver = [
+def test_different_types_butting_up_along_one_line_are_one_element_but_not_if_only_partly_on_it():
+    """One word found by two detectors -- its colour on the first letters, its shape on the rest -- is one finding;
+    two differences that only partly share a line are not."""
+    butting = [
         _candidate(0, 0, 100, 100, DiffType.COLOUR),
         _candidate(95, 0, 195, 100, DiffType.GRAPHICS),
     ]
-    assert len(cluster_candidates(sliver, distance_px=30)) == 2
+    assert len(cluster_candidates(butting, distance_px=30)) == 1
+    offset = [
+        _candidate(0, 0, 100, 100, DiffType.COLOUR),
+        _candidate(95, 40, 195, 140, DiffType.GRAPHICS),
+    ]
+    assert len(cluster_candidates(offset, distance_px=30)) == 2
 
 
 def test_a_small_difference_inside_a_big_one_is_a_finding_of_its_own():
@@ -208,3 +215,37 @@ def test_thousands_of_candidates_cluster_quickly():
 
     assert elapsed < 2.0
     assert sum(len(g) for g in groups) == len(grid)  # nothing lost or duplicated
+
+
+# ---- one changed element found in pieces -------------------------------------------------------------------------------------
+
+
+def test_a_recoloured_word_found_letter_by_letter_by_different_detectors_is_one_finding():
+    """A word recoloured AND retyped: a colour change on one letter, a graphics change on the next, a text change on the
+    rest -- the same line of type, touching -- is one finding, not three (the reported 'MATRIX' cut into pieces)."""
+    pieces = [
+        _candidate(100, 200, 130, 240, DiffType.COLOUR),
+        _candidate(134, 201, 170, 240, DiffType.GRAPHICS),
+        _candidate(172, 200, 260, 241, DiffType.TEXT),
+    ]
+    groups = cluster_candidates(pieces, distance_px=30)
+    assert len(groups) == 1 and len(groups[0]) == 3
+
+
+def test_a_pattern_of_small_round_dots_is_one_finding():
+    dots = [_candidate(x, y, x + 12, y + 12, DiffType.GRAPHICS) for x in (0, 20, 40) for y in (0, 20)]
+    groups = cluster_candidates(dots, distance_px=10)
+    assert len(groups) == 1
+
+
+def test_specks_of_colour_inside_a_changed_badge_belong_to_it():
+    badge = _candidate(0, 0, 120, 120, DiffType.GRAPHICS)
+    specks = [_candidate(30, 30, 36, 36, DiffType.COLOUR), _candidate(80, 70, 86, 76, DiffType.COLOUR)]
+    groups = cluster_candidates([badge, *specks], distance_px=10)
+    assert len(groups) == 1 and len(groups[0]) == 3
+
+
+def test_a_moved_word_and_a_changed_word_on_one_line_stay_two_findings():
+    moved = _candidate(0, 0, 60, 20, DiffType.TEXT, DiffSubtype.MOVED, magnitude=12)
+    changed = _candidate(64, 0, 120, 20, DiffType.GRAPHICS)
+    assert len(cluster_candidates([moved, changed], distance_px=10)) == 2

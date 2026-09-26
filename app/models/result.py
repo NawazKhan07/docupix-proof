@@ -74,6 +74,7 @@ class BrailleComparison:
     missing: int
     added: int
     moved: int
+    region: BoundingBox | None = None  # where the Braille is (every dot of both files, in the original's frame)
 
     @property
     def passed(self) -> bool:

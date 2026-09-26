@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 NO_WARMUP_ENV = "ARTWORK_COMPARE_NO_WARMUP"  # set by the test suite: do not start a worker at open
 _PROGRESS_TICK_MS = 500
+_SETUP_MAX_WIDTH_PX = 1500  # the setup page's content is never wider than this, however wide the window
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +48,8 @@ class MainWindow(QMainWindow):
         self._job_context: tuple[object, object, ComparisonMode] | None = None
         self._last_request: ComparisonRequest | None = None  # what the results on show came from
         self._job_from_results = False  # the running job was started from the results page (a toggle there)
+        self._reverting_check = None  # which results-page checkbox to flip back if that job does not finish
+        self._reverting_field = None  # the pages field's previous text to restore instead, if that started it
         self._pending_request: ComparisonRequest | None = None
         self._job_started = 0.0
         self._job_stage = ""
@@ -59,10 +62,23 @@ class MainWindow(QMainWindow):
         self.results_view = ResultsView(self.stack)
         self.stack.addWidget(self.results_view)
         self.results_view.backRequested.connect(self._show_setup)
-        self.results_view.graphicsToggled.connect(self._on_graphics_toggled)
+        self.results_view.modeSwitchRequested.connect(self._on_mode_switch_requested)
+        self.results_view.editFilesRequested.connect(self._on_edit_files_requested)
+        self.results_view.leafletTextToggled.connect(self._on_leaflet_text_toggled)
+        self.results_view.leafletVisualToggled.connect(self._on_leaflet_visual_toggled)
+        self.results_view.leafletPagesChanged.connect(self._on_leaflet_pages_changed)
         self._setup_page = central
 
-        layout = QVBoxLayout(central)
+        # On a wide monitor the page keeps a readable width, centred, rather than stretch edge to edge: its
+        # content sits in a column with a maximum width, and the spare width either side of it is empty.
+        centring = QHBoxLayout(central)
+        centring.setContentsMargins(0, 0, 0, 0)
+        column = QWidget(central)
+        column.setMaximumWidth(_SETUP_MAX_WIDTH_PX)
+        centring.addStretch(1)
+        centring.addWidget(column, stretch=1000)
+        centring.addStretch(1)
+        layout = QVBoxLayout(column)
         layout.setContentsMargins(24, 20, 24, 24)
         layout.setSpacing(16)
 
@@ -70,16 +86,17 @@ class MainWindow(QMainWindow):
         heading.setProperty("role", "heading")
         subheading = QLabel("Compare pharmaceutical packaging artwork files, offline.")
         subheading.setProperty("role", "subheading")
+        subheading.setWordWrap(True)
         layout.addWidget(heading)
         layout.addWidget(subheading)
 
         top_row = QHBoxLayout()
         top_row.setSpacing(16)
-        self.upload_panel = UploadPanel(central, config=self.config)
-        self.mode_selector = ModeSelector(central)
+        self.upload_panel = UploadPanel(column, config=self.config)
+        self.mode_selector = ModeSelector(column)
         top_row.addWidget(self.upload_panel, stretch=1)
-        top_row.addWidget(self.mode_selector)
-        layout.addLayout(top_row, stretch=1)
+        top_row.addWidget(self.mode_selector, stretch=1)
+        layout.addLayout(top_row, stretch=1)  # the panels take the spare height: Compare stays at the bottom
 
         self.status_label = QLabel("Load an original and a suspect file to compare.")
         self.status_label.setProperty("status", "idle")
@@ -144,24 +161,85 @@ class MainWindow(QMainWindow):
         assert original is not None and suspect is not None
         if self.jobs.is_busy:
             return
+        config = self.config
+        if self.mode_selector.mode is ComparisonMode.LEAFLET:
+            pages = self.upload_panel.original_slot.pages_to_compare
+            config = replace(config, leaflet=replace(config.leaflet, compare_pages=pages))
         request = ComparisonRequest(
             original_path=original.path,
             suspect_path=suspect.path,
             mode=self.mode_selector.mode,
-            config=self.config,
+            config=config,
             original_geometry=self.upload_panel.original_slot.geometry,
             suspect_geometry=self.upload_panel.suspect_slot.geometry,
         )
+        # A fresh compare from the setup page is what "the mode this comparison started in" means -- a
+        # results-page toggle or Barcode/Braille quick switch must never move this, or there would be no way
+        # back to it once switched away.
+        self.results_view.set_origin_mode(request.mode)
         self._start(request, (original, suspect, request.mode), from_results=False)
 
-    def _on_graphics_toggled(self, checked: bool) -> None:
-        """Scan vs Digital's graphics switched on or off on the results page: the same files, compared again."""
+    def _on_leaflet_text_toggled(self, checked: bool) -> None:
+        """Leaflet's text strategy switched on or off on the results page: the same files, compared again."""
         request, context = self._last_request, self._job_context
         if request is None or context is None or self.jobs.is_busy:
             return
-        detection = replace(request.config.detection, scan_compare_graphics=checked)
+        leaflet = replace(request.config.leaflet, compare_text=checked)
+        self._reverting_check = self.results_view.leaflet_text_check
+        self._reverting_field = None
         self.results_view.set_busy("Comparing again…")
-        self._start(replace(request, config=replace(request.config, detection=detection)), context, from_results=True)
+        self._start(replace(request, config=replace(request.config, leaflet=leaflet)), context, from_results=True)
+
+    def _on_leaflet_visual_toggled(self, checked: bool) -> None:
+        """Leaflet's visual strategy switched on or off on the results page: the same files, compared again."""
+        request, context = self._last_request, self._job_context
+        if request is None or context is None or self.jobs.is_busy:
+            return
+        leaflet = replace(request.config.leaflet, compare_visual=checked)
+        self._reverting_check = self.results_view.leaflet_visual_check
+        self._reverting_field = None
+        self.results_view.set_busy("Comparing again…")
+        self._start(replace(request, config=replace(request.config, leaflet=leaflet)), context, from_results=True)
+
+    def _on_leaflet_pages_changed(self, spec: str) -> None:
+        """Leaflet's page selection edited on the results page: the same files, compared again."""
+        request, context = self._last_request, self._job_context
+        if request is None or context is None or self.jobs.is_busy:
+            return
+        leaflet = replace(request.config.leaflet, compare_pages=spec)
+        self._reverting_check = None
+        self._reverting_field = request.config.leaflet.compare_pages
+        self.results_view.set_busy("Comparing again…")
+        self._start(replace(request, config=replace(request.config, leaflet=leaflet)), context, from_results=True)
+
+    def _on_mode_switch_requested(self, mode: ComparisonMode) -> None:
+        """Barcode/Braille quick switch from the results page: the same files, a different mode, shown instantly."""
+        request, context = self._last_request, self._job_context
+        if request is None or context is None or self.jobs.is_busy:
+            return
+        original, suspect, _old_mode = context
+        self._reverting_check = None
+        self._reverting_field = None
+        self.results_view.set_busy("Comparing again…")
+        self._start(replace(request, mode=mode), (original, suspect, mode), from_results=True)
+
+    def _on_edit_files_requested(self, which: str) -> None:
+        """Edit files from the results page: re-crop or re-lift, then compare again if anything changed."""
+        request, context = self._last_request, self._job_context
+        if request is None or context is None or self.jobs.is_busy:
+            return
+        slot = self.upload_panel.original_slot if which == "original" else self.upload_panel.suspect_slot
+        if slot.loaded is None or not slot.edit_artwork_area():
+            return  # nothing loaded there, or the dialog was cancelled
+        updated = replace(
+            request,
+            original_geometry=self.upload_panel.original_slot.geometry,
+            suspect_geometry=self.upload_panel.suspect_slot.geometry,
+        )
+        self._reverting_check = None
+        self._reverting_field = None
+        self.results_view.set_busy("Comparing again…")
+        self._start(updated, context, from_results=True)
 
     def _start(self, request: ComparisonRequest, context, from_results: bool) -> None:
         self._job_context = context
@@ -231,11 +309,16 @@ class MainWindow(QMainWindow):
         self._set_status("Comparison cancelled.", "idle")
 
     def _back_on_results(self, message: str) -> None:
-        """A comparison started from the results page did not finish: the results stay as they were, and the toggle
-        goes back to what they were compared with."""
-        self.results_view.graphics_check.blockSignals(True)
-        self.results_view.graphics_check.setChecked(not self.results_view.graphics_check.isChecked())
-        self.results_view.graphics_check.blockSignals(False)
+        """A comparison started from the results page did not finish: the results stay as they were, and the
+        control that started it goes back to what they were compared with."""
+        check = self._reverting_check
+        if check is not None:
+            check.blockSignals(True)
+            check.setChecked(not check.isChecked())
+            check.blockSignals(False)
+        if self._reverting_field is not None:
+            self.results_view.revert_leaflet_pages_field(self._reverting_field)
+            self._reverting_field = None
         self.results_view.set_busy(message, locked=False)
 
     def closeEvent(self, event) -> None:

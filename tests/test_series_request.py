@@ -51,9 +51,9 @@ def test_a_suspect_with_no_repeat_of_the_artwork_says_so_plainly(tmp_path):
         execute_request(ComparisonRequest(original, suspect, ComparisonMode.SERIES, AppConfig(), original_geometry=geometry))
 
 
-def test_series_mode_does_not_auto_find_artwork_in_the_original_the_way_automatic_mode_does(tmp_path, monkeypatch):
-    """Series has its own way of settling what the original's artwork is (the reviewer's own crop/lift, or the
-    whole page): `find_artwork` (Automatic mode's own-page auto-detection) must not also run for it."""
+def test_series_mode_does_not_auto_find_artwork_when_the_reviewer_already_cropped_or_lifted_one(tmp_path, monkeypatch):
+    """A geometry the reviewer already set (a crop or a lift) is what settles the original's artwork: auto-finding
+    must not run again and second-guess it."""
     import app.engine.worker_process as worker_process
 
     original, suspect, geometry = _files(tmp_path)
@@ -63,3 +63,20 @@ def test_series_mode_does_not_auto_find_artwork_in_the_original_the_way_automati
     execute_request(ComparisonRequest(original, suspect, ComparisonMode.SERIES, AppConfig(), original_geometry=geometry))
 
     assert not called
+
+
+def test_series_mode_auto_finds_the_original_artwork_when_nothing_was_lifted(tmp_path):
+    """Like Automatic mode: if the reviewer drops in a whole sheet without cropping or lifting, the original's
+    artwork is still found and trimmed to automatically, rather than comparing the whole, uncropped page."""
+    page, box = scenes.original_page()
+    sheet = scenes.sheet([None, "colour", None, "graphic"])
+    original, suspect = tmp_path / "original.png", tmp_path / "suspect.png"
+    Image.fromarray(page).save(original)
+    Image.fromarray(sheet).save(suspect)
+
+    outcome = execute_request(
+        ComparisonRequest(original, suspect, ComparisonMode.SERIES, AppConfig())  # no original_geometry given
+    )
+
+    assert outcome.mode is ComparisonMode.SERIES
+    assert any("4 repeats" in note for note in outcome.notes)

@@ -12,8 +12,10 @@ from PIL import Image
 from PySide6.QtCore import QObject, Signal
 
 from app.config import DetectionConfig
+from app.engine.detectors import text_diff
 from app.engine.worker import run_comparison
 from app.config import AppConfig
+from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 from app.models.job import ComparisonMode
 from app.ui.main_window import MainWindow
 from app.ui.mode_selector import ModeSelector
@@ -48,6 +50,10 @@ def test_the_option_starts_off_because_a_scans_graphics_give_false_differences()
     assert DetectionConfig().scan_compare_graphics is False
 
 
+def test_the_text_option_starts_on_because_it_is_what_scan_vs_digital_compares():
+    assert DetectionConfig().scan_compare_text is True
+
+
 def _pair(tmp_path: Path) -> tuple[Path, Path]:
     image = np.full((400, 600, 3), 255, dtype=np.uint8)
     cv2.putText(image, "PARACETAMOL 500mg", (70, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (10, 10, 10), 2)
@@ -75,6 +81,21 @@ def _outcome(mode):
     cv2.rectangle(page, (900, 100), (1300, 400), (30, 60, 200), -1)
     cv2.circle(page, (1100, 650), 120, (200, 120, 30), -1)
     return run_comparison(page, page.copy(), mode, AppConfig())
+
+
+def _outcome_with_findings(monkeypatch):
+    """A Scan vs Digital outcome with a real text finding AND a real graphics finding, so the results page's
+    two checkboxes have something to filter (OCR is faked: this machine need not have Tesseract installed)."""
+    fake_text = DiffCandidate(BoundingBox(50, 50, 150, 90), DiffType.TEXT, DiffSubtype.CHANGED, 0.9, "text changed")
+    monkeypatch.setattr(text_diff, "detect_scan", lambda *a, **k: text_diff.TextScanResult([fake_text]))
+    original = np.full((900, 1400, 3), 235, np.uint8)
+    for row in range(12):
+        cv2.putText(original, f"Store below 25 C in a dry place, protect from light {row}", (60, 90 + row * 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 2, cv2.LINE_AA)
+    cv2.rectangle(original, (900, 100), (1300, 400), (30, 60, 200), -1)
+    changed = original.copy()
+    cv2.rectangle(changed, (900, 100), (1300, 400), (226, 238, 246), -1)
+    cv2.rectangle(changed, (950, 450), (1350, 750), (200, 60, 50), -1)
+    return run_comparison(original, changed, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
 
 
 # ---- the mode panel keeps its width ------------------------------------------------------------------------------------------------------
@@ -108,33 +129,48 @@ def test_the_graphics_toggle_is_offered_on_the_results_of_scan_vs_digital_only(q
     window.close()
 
 
-def test_ticking_it_compares_the_same_files_again_with_graphics(qapp, tmp_path):
+def test_ticking_graphics_on_shows_the_already_found_graphics_findings_instantly(qapp, tmp_path, monkeypatch):
+    """Graphics are compared either way; the checkbox only decides what is shown (`app.models.diff.visible_clusters`),
+    so this never asks for another comparison."""
     window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
     window._on_compare()
-    (first,) = jobs.requests
-    assert first.config.detection.scan_compare_graphics is False
-    window._on_completed(_outcome(ComparisonMode.SCAN_VS_DIGITAL))
+    window._on_completed(_outcome_with_findings(monkeypatch))
+    assert not any(c.type is DiffType.GRAPHICS for c in window.results_view._outcome.clusters)
 
     window.results_view.graphics_check.setChecked(True)
 
-    assert len(jobs.requests) == 2
-    again = jobs.requests[1]
-    assert again.mode is ComparisonMode.SCAN_VS_DIGITAL
-    assert (again.original_path, again.suspect_path) == (first.original_path, first.suspect_path)
-    assert again.config.detection.scan_compare_graphics is True
-    assert not window.results_view.graphics_check.isEnabled()  # locked while it runs
+    assert len(jobs.requests) == 1  # nothing recompared
+    assert any(c.type is DiffType.GRAPHICS for c in window.results_view._outcome.clusters)
+    assert window.results_view.graphics_check.isEnabled()  # never locked: nothing is running
     window.close()
 
 
-def test_a_comparison_that_does_not_finish_puts_the_toggle_back(qapp, tmp_path):
+def test_unticking_graphics_off_again_hides_them_instantly(qapp, tmp_path, monkeypatch):
     window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
     window._on_compare()
-    window._on_completed(_outcome(ComparisonMode.SCAN_VS_DIGITAL))
+    window._on_completed(_outcome_with_findings(monkeypatch))
     window.results_view.graphics_check.setChecked(True)
+
+    window.results_view.graphics_check.setChecked(False)
+
+    assert len(jobs.requests) == 1  # still nothing recompared
+    assert not any(c.type is DiffType.GRAPHICS for c in window.results_view._outcome.clusters)
+    window.close()
+
+
+def test_a_failure_elsewhere_does_not_touch_the_graphics_or_text_checkboxes(qapp, tmp_path, monkeypatch):
+    """Nothing these two checkboxes do can fail (there is no comparison to fail): a re-comparison started some
+    other way (here, editing a file's area) must not revert or lock either of them."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window._on_compare()
+    window._on_completed(_outcome_with_findings(monkeypatch))
+    window.results_view.graphics_check.setChecked(True)
+    monkeypatch.setattr(type(window.upload_panel.original_slot), "edit_artwork_area", lambda self: True)
+    window.results_view.editFilesRequested.emit("original")
 
     window._on_failed("internal", "It broke.")
 
-    assert not window.results_view.graphics_check.isChecked()
+    assert window.results_view.graphics_check.isChecked()  # untouched
     assert window.results_view.graphics_check.isEnabled()
     assert "It broke." in window.results_view.busy_label.text()
     window.close()
@@ -146,6 +182,53 @@ def test_the_choice_does_not_leak_into_other_modes(qapp, tmp_path):
     (request,) = jobs.requests
     assert request.mode is ComparisonMode.AUTOMATIC
     assert request.config.detection.scan_compare_graphics is False
+    window.close()
+
+
+# ---- the text (OCR) option lives on the results page too, for a pure visual comparison ----------------------------------------------------
+
+
+def test_the_text_toggle_is_offered_on_the_results_of_scan_vs_digital_only(qapp, tmp_path):
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window.show()
+    results = window.results_view
+    window.stack.setCurrentWidget(results)
+    results.show_outcome(_outcome(ComparisonMode.SCAN_VS_DIGITAL), "a vs b")
+    assert results.text_check.isVisible() and results.text_check.isChecked()
+
+    results.show_outcome(_outcome(ComparisonMode.AUTOMATIC), "a vs b")
+    assert not results.text_check.isVisible()
+    window.close()
+
+
+def test_unticking_text_off_hides_the_text_findings_instantly(qapp, tmp_path, monkeypatch):
+    """Text is read either way; the checkbox only decides what is shown, so this never asks for another
+    comparison (`app.models.diff.visible_clusters`)."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window._on_compare()
+    window._on_completed(_outcome_with_findings(monkeypatch))
+    assert any(c.type is DiffType.TEXT for c in window.results_view._outcome.clusters)
+
+    window.results_view.text_check.setChecked(False)
+
+    assert len(jobs.requests) == 1  # nothing recompared
+    assert not any(c.type is DiffType.TEXT for c in window.results_view._outcome.clusters)
+    assert window.results_view.text_check.isEnabled()  # never locked: nothing is running
+    window.close()
+
+
+def test_the_graphics_and_text_checkboxes_do_not_affect_each_other(qapp, tmp_path, monkeypatch):
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window._on_compare()
+    window._on_completed(_outcome_with_findings(monkeypatch))
+
+    window.results_view.graphics_check.setChecked(True)
+    window.results_view.text_check.setChecked(False)
+
+    assert len(jobs.requests) == 1  # nothing ever recompared
+    clusters = window.results_view._outcome.clusters
+    assert any(c.type is DiffType.GRAPHICS for c in clusters)  # the earlier toggle stuck
+    assert not any(c.type is DiffType.TEXT for c in clusters)
     window.close()
 
 

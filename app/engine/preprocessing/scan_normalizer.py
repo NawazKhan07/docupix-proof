@@ -108,7 +108,9 @@ def _filled_outside(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
     nearest_y, nearest_x = np.nonzero(inside)  # labels number the zero pixels in raster order, from 1
     filled = small[nearest_y[labels - 1].clip(0, size[1] - 1), nearest_x[labels - 1].clip(0, size[0] - 1)]
     filled = np.where(inside[..., None], small, filled)
-    return np.where(valid[..., None], image, cv2.resize(filled, (width, height), interpolation=cv2.INTER_LINEAR))
+    result = cv2.resize(filled, (width, height), interpolation=cv2.INTER_LINEAR)
+    np.copyto(result, image, where=valid[..., None])  # (in place: no second full-size copy of the page)
+    return result
 
 
 _TINT_SCALE = 0.25  # the tint and the solid graphics are worked out on a copy this share of the size
@@ -118,8 +120,9 @@ _RAMP_MIN_INK = 40  # only pixels at least this much ink say how strong the ink 
 _RAMP_MIN_SAMPLES = 200
 
 
-def _smoothstep(values: np.ndarray, low: float, high: float) -> np.ndarray:
-    t = np.clip((values - low) / max(high - low, 1e-6), 0.0, 1.0)
+def _smoothstep(values: np.ndarray, low: float | np.ndarray, high: float | np.ndarray) -> np.ndarray:
+    """`low`/`high` may each be a scalar or a per-pixel array the same shape as `values`."""
+    t = np.clip((values - low) / np.maximum(np.asarray(high) - np.asarray(low), 1e-6), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
 
@@ -138,46 +141,74 @@ def _ink_contrast(
       stroke is the background there, so black text on a 40% panel is black on white, not black on a
       grey block that would swallow it.
     * **A solid graphic is told from a tint by how DARK it looks, and gradually.** A dark bar or a reversed-out
-      block (a dark red, a navy, a green) stays black with its white lettering white, but a saturated yellow or
-      orange panel is light to the eye and is a tint. It used to be decided by a cut-off on the darkest channel,
+      block (a dark red, a navy, a green) stays black with its white lettering white, but a pale yellow or
+      blue panel is light to the eye and is a tint. It used to be decided by a cut-off on the darkest channel,
       and a panel a few levels either side of it (a scan is a little lighter than the file it came from) came
       out black in one file and white in the other. Now how solid a region is (0 = tint, 1 = solid) is a smooth
-      function of the median LUMINANCE over the window, and it makes the region that dark, so a panel a few
-      levels lighter is a few levels less black, never the opposite colour.
+      function of the median of LUMINANCE and the darkest channel over the window, and it makes the region that
+      dark, so a panel a few levels lighter is a few levels less black, never the opposite colour. Luminance alone
+      called a saturated orange or red light, being bright to the eye, and a reversed white banner on one came out
+      as a smear: the darkest channel is included because a saturated colour is dark in it even when it reads
+      bright overall, which is exactly why it is also how a pixel is judged to be ink in the first place. A
+      colourless grey in that same ambiguous middle band is held to a stricter (darker) bar first: unlike a
+      printed reversed panel, always some definite ink colour, a neutral grey there is at least as often a
+      photograph's own backdrop, which must not render as a false solid black block.
 
     All of it is done in 8 bits, at a quarter of the size where a window is needed: at full size on an 18 MP
-    carton the float version took over a second per file.
+    carton the float version took over a second per file. Every full-size picture is let go as soon as it has
+    been used, and the last steps write into pictures no longer needed: a 100 MP page (a 2 m shipper) otherwise
+    held some twenty full-size copies at once, several GB for the two files.
     """
     height, width = image.shape[:2]
     outside = None
     if valid is not None and not valid.all():
         outside = ~valid
         image = _filled_outside(image, valid)
+    small_size = (round(width * _TINT_SCALE), round(height * _TINT_SCALE))  # what `cv2.resize(fx=_TINT_SCALE)` gives
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     paper_small = _paper_field(gray)
+    luminance = cv2.resize(gray, small_size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    del gray
     paper = cv2.resize(np.clip(paper_small, _MIN_PAPER, 255).astype(np.uint8), (width, height), interpolation=cv2.INTER_LINEAR)
 
     red, green, blue = cv2.split(image)
-    darkest = cv2.min(cv2.min(red, green), blue)
-    darkness = cv2.bitwise_not(cv2.divide(darkest, paper, scale=255.0))  # 0 for paper, 255 for black or a saturated ink
+    del image  # (only this function's own filled copy, if one was made: the caller's picture is untouched)
+    darkest = cv2.min(red, green)
+    cv2.min(darkest, blue, dst=darkest)
+    brightest = cv2.max(red, green)
+    cv2.max(brightest, blue, dst=brightest)
+    del red, green, blue
+    chroma = cv2.resize(cv2.subtract(brightest, darkest, dst=brightest), small_size, interpolation=cv2.INTER_AREA)
+    del brightest
+    darkness = cv2.divide(darkest, paper, dst=darkest, scale=255.0)
+    cv2.bitwise_not(darkness, dst=darkness)  # 0 for paper, 255 for black or a saturated ink
+    del paper
 
-    reduced = cv2.resize(darkness, None, fx=_TINT_SCALE, fy=_TINT_SCALE, interpolation=cv2.INTER_AREA)
+    reduced = cv2.resize(darkness, None, fx=_TINT_SCALE, fy=_TINT_SCALE, interpolation=cv2.INTER_AREA)  # (by factor: not the same weights as by size)
     window = max(3, int(round(config.ink_window_fraction * max(height, width) * _TINT_SCALE)) | 1)
     tint_small = cv2.medianBlur(reduced, window)
 
-    small_size = (reduced.shape[1], reduced.shape[0])
-    luminance = cv2.resize(gray, small_size, interpolation=cv2.INTER_AREA).astype(np.float32)
     paper_here = cv2.resize(np.maximum(paper_small, _MIN_PAPER), small_size, interpolation=cv2.INTER_LINEAR)
     luminance_darkness = 255.0 - np.clip(luminance * (255.0 / paper_here), 0.0, 255.0)
-    typical = cv2.medianBlur(luminance_darkness.astype(np.uint8), window).astype(np.float32)
-    solid_small = (255.0 * _smoothstep(typical, config.ink_solid_low, config.ink_solid_high)).astype(np.uint8)
+    solid_darkness = (luminance_darkness + reduced.astype(np.float32)) / 2.0
+    typical = cv2.medianBlur(solid_darkness.astype(np.uint8), window).astype(np.float32)
+
+    chroma_typical = cv2.medianBlur(chroma, window).astype(np.float32)
+    neutral_shift = config.ink_solid_neutral_margin * (1.0 - _smoothstep(chroma_typical, 0.0, config.ink_solid_chroma_px))
+    solid_small = (
+        255.0 * _smoothstep(typical, config.ink_solid_low + neutral_shift, config.ink_solid_high + neutral_shift)
+    ).astype(np.uint8)
 
     tint = cv2.resize(tint_small, (width, height), interpolation=cv2.INTER_LINEAR)
     solid = cv2.resize(solid_small, (width, height), interpolation=cv2.INTER_LINEAR)
 
-    room = cv2.max(cv2.bitwise_not(tint), 1)  # what is left of the scale above the tint
-    relative = cv2.divide(cv2.subtract(darkness, tint), room, scale=255.0)
-    contrast = cv2.max(relative, cv2.multiply(darkness, solid, scale=1.0 / 255.0))
+    room = cv2.bitwise_not(tint)
+    cv2.max(room, 1, dst=room)  # what is left of the scale above the tint
+    relative = cv2.subtract(darkness, tint, dst=tint)
+    cv2.divide(relative, room, dst=relative, scale=255.0)
+    del room
+    ink_solid = cv2.multiply(darkness, solid, dst=solid, scale=1.0 / 255.0)
+    contrast = cv2.max(relative, ink_solid, dst=relative)
     return contrast, outside
 
 
@@ -219,9 +250,71 @@ def ink_image(
     config = config or DetectionConfig()
     contrast, outside = _ink_contrast(image, config, valid)
     result = cv2.LUT(contrast, _ramp(contrast, config))
+    _panels_opened(image, result)
     if outside is not None:
         result[outside] = 255
     return result
+
+
+_PANEL_CORE_PX = 15  # ink that survives being shrunk by this much (either way) is a solid panel, not strokes of type
+_PANEL_MIN_AREA_PX = 6000  # ...if its solid core is at least this big (~7 x 7 mm at 300 DPI)
+_PANEL_UNIFORM_SHARE = 0.6  # ...and this share of it is one colour (a flat panel, not a picture)
+_PANEL_SAME_COLOUR = 18.0  # pixels this close (Lab, 8-bit units) to the panel's colour are the panel
+_PANEL_INK_FROM = 30.0  # pixels this far from it are fully its lettering; between, partly (a ramp, as elsewhere)
+_PANEL_INK_TO = 60.0
+_PANEL_MIN_LETTERING = 0.01  # a panel with less than this share of other colour in it has nothing printed on it
+_PANEL_SCALE = 0.25  # panels are found on a copy this share of the size
+_PANEL_MIN_SOLID = 0.6  # a panel is mostly ink in the ink picture (its lettering is the rest)
+
+
+def _panels_opened(image: np.ndarray, ink: np.ndarray) -> None:
+    """Lettering printed on a solid coloured panel (dark type on a red warning box, white type reversed out of it) shown
+    as ink on paper, in place: every other colour counts as ink in `ink`, so a panel and its lettering come out as one
+    black block and its words cannot be read, or compared. Inside each solid, flat-coloured panel, what is the panel's
+    own colour becomes paper and what differs from it -- the lettering -- ink. A panel with nothing on it (a plain box,
+    a big bold letter) stays solid; a picture (not one flat colour) is left as it is."""
+    if image.ndim != 3:
+        return
+    height, width = ink.shape
+    small = cv2.resize(ink, (max(1, int(width * _PANEL_SCALE)), max(1, int(height * _PANEL_SCALE))), interpolation=cv2.INTER_AREA)
+    solid = (small < 128).astype(np.uint8)
+    core_px = max(1, round(_PANEL_CORE_PX * _PANEL_SCALE))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * core_px + 1, 2 * core_px + 1))
+    # closed first, so the gaps the lettering leaves in its panel do not break the panel up
+    closed = cv2.morphologyEx(solid, cv2.MORPH_CLOSE, kernel)
+    cores = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel)
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(cores)
+    min_area = _PANEL_MIN_AREA_PX * _PANEL_SCALE * _PANEL_SCALE
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area < min_area:
+            continue
+        x0, y0 = int(x / _PANEL_SCALE), int(y / _PANEL_SCALE)
+        x1, y1 = min(width, int(np.ceil((x + w) / _PANEL_SCALE))), min(height, int(np.ceil((y + h) / _PANEL_SCALE)))
+        inside = cv2.resize((labels[y : y + h, x : x + w] == label).astype(np.uint8), (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST) > 0
+        solid_there = ink[y0:y1, x0:x1][inside] < 128
+        if solid_there.mean() < _PANEL_MIN_SOLID:
+            continue  # mostly paper: lines of type closed up, not a panel
+        lab = cv2.cvtColor(np.ascontiguousarray(image[y0:y1, x0:x1, :3]), cv2.COLOR_RGB2LAB).astype(np.float32)
+        pixels = lab[inside][solid_there]
+        if len(pixels) < 100:
+            continue
+        colour = np.median(pixels, axis=0)
+        distance = np.linalg.norm(lab - colour, axis=2)
+        near = distance[inside][solid_there] < _PANEL_SAME_COLOUR
+        if near.mean() < _PANEL_UNIFORM_SHARE:
+            continue  # not one flat colour: a picture
+        # its lettering: DARKER than the panel (type printed on it). Lettering lighter than its panel -- reversed out of
+        # it -- already shows as white in the black block, and is read so; paper caught in the panel's outline is not ink.
+        darker = lab[..., 0] < colour[0] - _PANEL_DARKER_L
+        opened = np.clip((distance - _PANEL_INK_FROM) / (_PANEL_INK_TO - _PANEL_INK_FROM), 0.0, 1.0) * darker
+        if (opened[inside] > 0.5).mean() < _PANEL_MIN_LETTERING:
+            continue  # nothing printed on it in a darker ink: a plain box, a big bold letter, a reversed-out panel
+        region = ink[y0:y1, x0:x1]
+        region[inside] = (255.0 * (1.0 - opened[inside])).astype(np.uint8)
+
+
+_PANEL_DARKER_L = 12.0  # (8-bit Lab lightness) lettering at least this much darker than its panel is printed on it
 
 
 READING_SOURCES = ("ink", "gray", "flat", "darkest", "clahe", "adaptive")

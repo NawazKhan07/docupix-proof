@@ -90,7 +90,7 @@ class FindingCard(QFrame):
 
 
 class DiffListPanel(QWidget):
-    clusterSelected = Signal(int)
+    clusterSelected = Signal(object)  # int cluster id, or None: clicking the selected card again deselects it
     visibilityChanged = Signal()  # filters, ignoring or merging changed what should be shown
 
     def __init__(self, parent=None):
@@ -116,6 +116,7 @@ class DiffListPanel(QWidget):
 
         self.summary_label = QLabel("")
         self.summary_label.setTextFormat(Qt.TextFormat.RichText)
+        self.summary_label.setWordWrap(True)  # (a narrow panel wraps the counts rather than cut them off)
         layout.addWidget(self.summary_label)
 
         self.warnings_label = QLabel("")
@@ -145,6 +146,7 @@ class DiffListPanel(QWidget):
         checks.addStretch(1)
         layout.addLayout(checks)
 
+        # The one part of the app that scrolls: the list of findings can run to hundreds.
         self._cards_layout = QVBoxLayout()
         self._cards_layout.setSpacing(8)
         self._cards_layout.setContentsMargins(0, 0, 4, 0)
@@ -153,6 +155,7 @@ class DiffListPanel(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setWidget(container)
         layout.addWidget(self._scroll, stretch=1)
 
@@ -251,6 +254,8 @@ class DiffListPanel(QWidget):
             self._scroll_to(cluster_id)
 
     def _on_card_selected(self, cluster_id: int) -> None:
+        """Clicking the already-selected card again deselects it, rather than leaving it selected forever."""
+        cluster_id = None if cluster_id == self._selected_id else cluster_id
         self.select(cluster_id)
         self.clusterSelected.emit(cluster_id)
 

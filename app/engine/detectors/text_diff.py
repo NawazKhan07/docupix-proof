@@ -20,8 +20,10 @@ from __future__ import annotations
 import logging
 import math
 import os
+import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 import cv2
@@ -30,6 +32,7 @@ import pytesseract
 
 from app.config import DetectionConfig
 from app.engine.detectors.verify import marks_agreement
+from app.engine.preprocessing import deskew
 from app.logging_config import StageTimer
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
@@ -49,6 +52,7 @@ class OcrWord:
     text: str
     bbox: BoundingBox
     confidence: float
+    upright: bool | None = None  # runs across the page (False: up or down it); None where not known (a reading)
 
 
 _OCR_UNAVAILABLE = (
@@ -78,6 +82,74 @@ def _ocr_data(image: np.ndarray, page_segmentation: str | None = None, lang: str
         )
     except pytesseract.TesseractNotFoundError as exc:
         raise OcrUnavailableError(_OCR_UNAVAILABLE) from exc
+
+
+_TSV_COLUMNS = ("level", "page_num", "block_num", "par_num", "line_num", "word_num", "left", "top", "width", "height", "conf", "text")
+
+
+def _tsv_pages(tsv: str, count: int) -> list[dict]:
+    """Tesseract's TSV of a run over several pictures, as one `image_to_data` dict per picture (by its page number)."""
+    pages = [{column: [] for column in _TSV_COLUMNS} for _ in range(count)]
+    for row in tsv.splitlines()[1:]:
+        cells = row.split("\t")
+        if len(cells) < len(_TSV_COLUMNS) - 1:
+            continue
+        cells += [""] * (len(_TSV_COLUMNS) - len(cells))
+        try:
+            page = int(cells[1]) - 1
+            values = [int(float(cell)) for cell in cells[:-1]]
+        except ValueError:
+            continue
+        if 0 <= page < count:
+            for column, value in zip(_TSV_COLUMNS, values + [cells[-1]]):
+                pages[page][column].append(value)
+    return pages
+
+
+def _ocr_run(pictures: list[np.ndarray], page_segmentation: str, lang: str | None) -> list[dict]:
+    """Every picture read by ONE run of the reader (Tesseract takes a list of pictures and reads each on its own, just as
+    it reads one), so its start -- loading its models, which is most of what a reading of a small window costs -- is paid
+    once, not once per picture."""
+    if len(pictures) == 1:
+        return [_ocr_data(pictures[0], page_segmentation, lang)]
+    command = pytesseract.pytesseract.tesseract_cmd
+    with tempfile.TemporaryDirectory(prefix="docpix_ocr_") as folder:
+        names = []
+        for number, picture in enumerate(pictures):
+            name = os.path.join(folder, f"{number}.png")
+            cv2.imwrite(name, picture, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            names.append(name)
+        listing = os.path.join(folder, "pictures.txt")
+        with open(listing, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(names) + "\n")
+        args = [command, listing, "stdout", *page_segmentation.split(), *(["-l", lang] if lang else []), "tsv"]
+        startup = None
+        if hasattr(subprocess, "STARTUPINFO"):  # no console window flashing up for each run on Windows
+            startup = subprocess.STARTUPINFO()
+            startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startup.wShowWindow = subprocess.SW_HIDE
+        try:
+            run = subprocess.run(args, capture_output=True, stdin=subprocess.DEVNULL, startupinfo=startup, check=False)
+        except FileNotFoundError as exc:
+            raise OcrUnavailableError(_OCR_UNAVAILABLE) from exc
+    if run.returncode != 0:
+        logger.warning("the reader failed on a batch: %s", run.stderr.decode("utf-8", "replace")[-300:])
+        return [_ocr_data(picture, page_segmentation, lang) for picture in pictures]
+    return _tsv_pages(run.stdout.decode("utf-8", "replace"), len(pictures))
+
+
+def _ocr_many(pictures: list[np.ndarray], page_segmentation: str, lang: str | None = None) -> list[dict]:
+    """Each picture read on its own (as `_ocr_data` reads it), the lot shared among one run of the reader per core."""
+    if not pictures:
+        return []
+    runs = max(1, min(os.cpu_count() or 2, len(pictures)))
+    shares = [list(range(start, len(pictures), runs)) for start in range(runs)]  # dealt round, so each run gets big and small
+    found: list[dict] = [{}] * len(pictures)
+    with ThreadPoolExecutor(max_workers=runs) as pool:
+        for share, data in zip(shares, pool.map(lambda share: _ocr_run([pictures[i] for i in share], page_segmentation, lang), shares)):
+            for index, page in zip(share, data):
+                found[index] = page
+    return found
 
 
 def _words_of(data: dict, floor: float) -> list[tuple[tuple[int, int, int], OcrWord]]:
@@ -220,6 +292,7 @@ _MAX_LEFTOVER_SPREAD = 8.0  # words this scattered (box area / area of the words
 _SHAKY_DIGITAL_MAX = 75.0  # the digital file's words are read no more surely than this...
 _SURE_SCAN_MIN = 80.0  # ...where the scan's are read at least this surely...
 _SHAKY_MATCH_RATIO = 0.8  # ...and they are this alike
+_CUT_SHORT_CHARS = 2  # (one reading the other with this many letters more at an end is a word cut short, not a misread)
 _WINDOW_UPSCALE_BELOW_PX = 80  # a line's window is enlarged to at least this tall before it is read
 _DARK = 128  # an ink picture's pixels below this are ink
 _LINE_PAGE_SEGMENTATION = "--psm 7"  # a window holds one line
@@ -232,11 +305,23 @@ class TextScanResult:
     candidates: list[DiffCandidate]
     # Lines of the digital file whose ink is in the scan but which the scan is too soft to read: not compared.
     unreadable_lines: int = 0
+    # Where the words read the SAME in both files (each word's box in the digital file with its partner's in the scan):
+    # text compared as text and found unchanged, so what its ink looks like in the scan is the scan's, not a difference.
+    same_text: list[BoundingBox] = field(default_factory=list)
 
 
 def canonical(text: str) -> str:
     """What a word is, for comparing across a scan: no case, no punctuation, no l/i/1 or o/0 confusion."""
     return "".join(ch for ch in text.casefold() if ch.isalnum()).translate(_OCR_CONFUSABLE)
+
+
+_MIN_LONE_WORD_CHARS = 4  # a line of one word shorter than this is not compared...
+_MIN_LONE_NUMBER_CHARS = 2  # ...unless it is a number at least this long
+
+
+def _lone_number(text: str) -> bool:
+    token = canonical(text)
+    return len(token) >= _MIN_LONE_NUMBER_CHARS and sum(ch.isdigit() for ch in text) >= _MIN_LONE_NUMBER_CHARS
 
 
 def _has_digit(*texts: str) -> bool:
@@ -301,11 +386,18 @@ def _runs(words: list[OcrWord]) -> list[list[OcrWord]]:
 
 def _digital_reading_unsure(gone: list[OcrWord], new: list[OcrWord]) -> bool:
     """Whether a difference is the DIGITAL file's reading being unsure: what it read is a shaky near-miss of a word the
-    scan reads confidently ('Cilnidip' at 67% for 'Cilnidipine' at 87%: a hairline typeface is hard to read even in
-    a crisp file). A real change to a word is read surely on the digital side."""
+    scan reads confidently ('Cilnidipene' at 67% for 'Cilnidipine' at 87%: a hairline typeface is hard to read even
+    in a crisp file). A real change to a word is read surely on the digital side.
+
+    A word CUT SHORT is not a near-miss, however shaky its reading ('Cilnidip' for 'Cilnidipine' -- the digital file
+    really ends there): a reader misreads letters, it does not drop the end of a word it can see."""
     if not gone or not new or max(word.confidence for word in gone) >= _SHAKY_DIGITAL_MAX or min(word.confidence for word in new) < _SURE_SCAN_MIN:
         return False
-    ratio = SequenceMatcher(None, canonical(_join(gone)), canonical(_join(new)), autojunk=False).ratio()
+    old, fresh = canonical(_join(gone)), canonical(_join(new))
+    shorter, longer = sorted((old, fresh), key=len)
+    if len(longer) - len(shorter) >= _CUT_SHORT_CHARS and (longer.startswith(shorter) or longer.endswith(shorter)):
+        return False
+    ratio = SequenceMatcher(None, old, fresh, autojunk=False).ratio()
     return ratio >= _SHAKY_MATCH_RATIO
 
 
@@ -371,9 +463,10 @@ _BLOCK_MIN_SIDE_PX = 24
 _BLOCK_MIN_FILL = 0.55  # share of a block that is ink: a paragraph closed up is ~0.3, a bar with lettering ~0.75
 _BLOCK_CORE_PX = 13  # ink that survives being shrunk by this much is SOLID: a stroke of lettering is thinner
 _BLOCK_MIN_CORE = 0.15  # a block is at least this share solid ink (bold headings, whose closed lines fill as much, are not)
-_MONTAGE_GAP_PX = 44  # blank between the windows stacked to be read at once
-_MONTAGE_MAX_HEIGHT_PX = 6000
-_MONTAGE_MAX_WIDTH_PX = 4200
+_WINDOW_BORDER_PX = 22  # white set round a window before it is read
+_WINDOW_PAD_ACROSS = 0.15  # a line's window reaches this share of its height above and below it
+_WINDOW_PAD_ALONG = 2.0  # ...and at least this many of its heights along it, either end
+_WINDOW_MAX_WIDTH_PX = 4200  # a window is not enlarged past this width
 _MATCH_MIN_REACH_PX = 40  # a word in the scan is 'the same word' if it is this close to it (two word-heights, if more):
 _MATCH_REACH_HEIGHTS = 2.0  # a two-sheet scan of a carton was 45 px off in places
 _MATCH_GRID_PX = 96
@@ -484,78 +577,51 @@ def read_pages(pictures: list[np.ndarray], floor: float, lang: str | None = None
     return pages
 
 
-def _stack(crops: list[np.ndarray]) -> tuple[np.ndarray, list[tuple[int, int]]]:
-    """Pictures stacked one above the other with a blank band between, and the rows each one occupies."""
-    width = max(crop.shape[1] for crop in crops)
-    total = sum(crop.shape[0] for crop in crops) + _MONTAGE_GAP_PX * (len(crops) + 1)
-    montage = np.full((total, width), 255, np.uint8)
-    rows, y = [], _MONTAGE_GAP_PX
-    for crop in crops:
-        montage[y : y + crop.shape[0], : crop.shape[1]] = crop
-        rows.append((y, y + crop.shape[0]))
-        y += crop.shape[0] + _MONTAGE_GAP_PX
-    return montage, rows
-
-
 def read_windows(picture: np.ndarray, boxes: list[BoundingBox], config: DetectionConfig) -> list[list[OcrWord]]:
     """The words in a small window round each box (one line of text each), in the picture's own pixels.
 
-    The windows are stacked into pictures and each picture is read once: reading them one at a time, twice for
-    every line of a page, was most of the time Scan vs Digital took. Windows a little short of a line are
-    enlarged first; the words are sorted along the line.
+    Each window is read ON ITS OWN -- enlarged if a little short of a line, set in white -- but all of them by a few runs
+    of the reader (`_ocr_many`): reading them one program start at a time was most of the time Scan vs Digital took.
+    (They were once stacked into one picture and read together; how a line read then depended on which other lines
+    happened to be stacked with it.) The words are sorted along the line.
     """
-    prepared = []  # (window's corner, scale, picture)
+    prepared = []  # (window's corner, scale, picture), or None
     for box in boxes:
-        x0, y0, x1, y1 = _padded(box, config.text_line_pad_px, picture.shape)
+        # padded along the line, but hardly above and below it: the next line's ascenders and the last one's descenders
+        # in the window were read as words of this line ('SWe' of 'swallowed' above 'chew.')
+        # (and along it by two of its heights at least: a word that grew -- 'ch' to 'chew.' -- runs past the old one's end)
+        x0, _y0, x1, _y1 = _padded(box, max(config.text_line_pad_px, round(_WINDOW_PAD_ALONG * box.height)), picture.shape)
+        _x0, y0, _x1, y1 = _padded(box, min(config.text_line_pad_px, max(1, round(_WINDOW_PAD_ACROSS * box.height))), picture.shape)
         if x1 - x0 < 8 or y1 - y0 < 8:
             prepared.append(None)
             continue
         crop = picture[y0:y1, x0:x1]
-        factor = min(max(1.0, _WINDOW_UPSCALE_BELOW_PX / crop.shape[0]), _MONTAGE_MAX_WIDTH_PX / crop.shape[1])
+        factor = min(max(1.0, _WINDOW_UPSCALE_BELOW_PX / crop.shape[0]), _WINDOW_MAX_WIDTH_PX / crop.shape[1])
         if factor > 1.0:
             crop = cv2.resize(crop, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+        border = _WINDOW_BORDER_PX
+        crop = cv2.copyMakeBorder(crop, border, border, border, border, cv2.BORDER_CONSTANT, value=255)
         prepared.append((x0, y0, factor, crop))
 
-    batches: list[list[int]] = [[]]
-    height = 0
-    for index, item in enumerate(prepared):
-        if item is None:
-            continue
-        rows = item[3].shape[0] + _MONTAGE_GAP_PX
-        if batches[-1] and height + rows > _MONTAGE_MAX_HEIGHT_PX:
-            batches.append([])
-            height = 0
-        batches[-1].append(index)
-        height += rows
-
-    def read(batch: list[int]) -> list[tuple[int, list[OcrWord]]]:
-        if not batch:
-            return []
-        montage, rows = _stack([prepared[i][3] for i in batch])
-        placed = {i: [] for i in batch}
-        for _line, word in _words_of(_ocr_data(montage, _BLOCK_PAGE_SEGMENTATION, config.ocr_language), config.ocr_min_confidence):
-            b = word.bbox
-            middle = (b.y0 + b.y1) / 2
-            for i, (top, bottom) in zip(batch, rows):
-                if top - _MONTAGE_GAP_PX / 2 <= middle < bottom + _MONTAGE_GAP_PX / 2:
-                    x0, y0, factor, _crop = prepared[i]
-                    placed[i].append(
-                        OcrWord(word.text, BoundingBox(b.x0 / factor + x0, (b.y0 - top) / factor + y0, b.x1 / factor + x0, (b.y1 - top) / factor + y0), word.confidence)
-                    )
-                    break
-        return list(placed.items())
-
+    chosen = [i for i, item in enumerate(prepared) if item is not None]
     words: list[list[OcrWord]] = [[] for _ in boxes]
     with StageTimer(logger, "read_windows"):
-        if len(batches) == 1:
-            outcomes = [read(batches[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=max(1, min(_MAX_READERS, os.cpu_count() or 2))) as pool:
-                outcomes = list(pool.map(read, batches))
-    for outcome in outcomes:
-        for index, found in outcome:
-            found.sort(key=lambda word: word.bbox.x0)
-            words[index] = _trustworthy(found, config)
+        readings = _ocr_many([prepared[i][3] for i in chosen], _BLOCK_PAGE_SEGMENTATION, config.ocr_language)
+    for index, data in zip(chosen, readings):
+        x0, y0, factor, _crop = prepared[index]
+        border = _WINDOW_BORDER_PX
+        found = []
+        for _line, word in _words_of(data, config.ocr_min_confidence):
+            b = word.bbox
+            found.append(
+                OcrWord(
+                    word.text,
+                    BoundingBox((b.x0 - border) / factor + x0, (b.y0 - border) / factor + y0, (b.x1 - border) / factor + x0, (b.y1 - border) / factor + y0),
+                    word.confidence,
+                )
+            )
+        found.sort(key=lambda word: word.bbox.x0)
+        words[index] = _trustworthy(found, config)
     return words
 
 
@@ -662,6 +728,11 @@ def _is_upright_unreadable(words: list[OcrWord]) -> bool:
     return tall * 2 > len(words)
 
 
+def _unrotated(word: OcrWord, level: "deskew.Deskew") -> OcrWord:
+    """`word`, read from a picture levelled by `level`, with its box turned back to the picture's own frame."""
+    return OcrWord(word.text, level.unrotate_box(word.bbox), word.confidence) if not level.is_identity else word
+
+
 def detect_scan(
     original: np.ndarray,
     suspect: np.ndarray,
@@ -682,20 +753,38 @@ def detect_scan(
     `original` and `suspect` are the ink pictures (what the ink agreement of a difference is judged on); `reading` is
     the pair of pictures the words are read from, if not those (see `DetectionConfig.scan_reading_scan`), and `alternate`
     another pair the lines that differ are read from as well (see `DetectionConfig.scan_reading_alternate`).
+
+    The WHOLE-PAGE reading below is what a residual tilt breaks (see `preprocessing.deskew`): each picture is
+    levelled for that one reading only, and every word it returns is turned back to the shared, unrotated frame
+    everything else in this function works in -- the re-reads further down (a line's own small window) see the
+    picture exactly as `reading` gave it, untouched.
     """
     with StageTimer(logger, "detector_text"):
         reading_original, reading_suspect = (reading_picture(picture) for picture in (reading or (original, suspect)))
-        digital_page, scan_page = read_pages([reading_original, reading_suspect], config.ocr_min_confidence, config.ocr_language)
+        level_original, level_suspect = deskew.measured(reading_original, config), deskew.measured(reading_suspect, config)
+        raw_digital_page, raw_scan_page = read_pages(
+            [level_original.picture(reading_original), level_suspect.picture(reading_suspect)],
+            config.ocr_min_confidence,
+            config.ocr_language,
+        )
+        digital_page = [(line, _unrotated(word, level_original)) for line, word in raw_digital_page]
+        scan_page = [(line, _unrotated(word, level_suspect)) for line, word in raw_scan_page]
 
         lines: dict[tuple, list[OcrWord]] = {}
         for line, word in digital_page:
             if word.confidence >= config.ocr_min_confidence_scan:
                 lines.setdefault(line, []).append(word)
-        anchors = [_trustworthy(sorted(words, key=lambda w: w.bbox.x0), config) for words in lines.values()]
+        # (a 'line' of the reader's layout is split where its words lie on different rows: two printed lines taken for
+        # one made a window over both, and both were then misread)
+        anchors = [_trustworthy(sorted(row, key=lambda w: w.bbox.x0), config) for words in lines.values() for row in _rows(words)]
+        # A line of one short word is usually a speck read as letters, and is not compared -- unless it is a number:
+        # a strength or a quantity ("10" of "10 g", its unit read too unsurely to count) is what matters most on a pack.
         anchors = [
             words
             for words in anchors
-            if words and (len(words) > 1 or len(canonical(words[0].text)) >= 4) and not _is_upright_unreadable(words)
+            if words
+            and (len(words) > 1 or len(canonical(words[0].text)) >= _MIN_LONE_WORD_CHARS or _lone_number(words[0].text))
+            and not _is_upright_unreadable(words)
         ]
         scan_words = _trustworthy([word for _line, word in scan_page], config)
 
@@ -763,6 +852,10 @@ def detect_scan(
         windows = [_span_bbox(words) for words in anchors]
         added = [scan_words[i] for i in sorted(extra)]
         candidates += _added_text(added, pairs, flat, scan_words, original, suspect, windows, config)
+        same_text = [flat[i].bbox.union(scan_words[j].bbox) for i, j in pairs]
+        # a line read again and found to say the same is the same text too
+        changed_boxes = [candidate.bbox for candidate in candidates]
+        same_text += [box for box in boxes if not any(box.intersection_area(other) > 0 for other in changed_boxes)]
 
     logger.info(
         "text detector finished (scan)",
@@ -773,7 +866,23 @@ def detect_scan(
             "unreadable_lines": unreadable,
         },
     )
-    return TextScanResult(candidates, unreadable)
+    return TextScanResult(candidates, unreadable, same_text)
+
+
+def _rows(words: list[OcrWord]) -> list[list[OcrWord]]:
+    """Words split into the rows they lie on: a word joins a row whose middle is within half a word-height of its own."""
+    rows: list[list[OcrWord]] = []
+    for word in sorted(words, key=lambda w: (w.bbox.y0 + w.bbox.y1) / 2):
+        middle = (word.bbox.y0 + word.bbox.y1) / 2
+        if rows:
+            last = rows[-1]
+            row_middle = float(np.median([(w.bbox.y0 + w.bbox.y1) / 2 for w in last]))
+            height = float(np.median([w.bbox.height for w in last + [word]]))
+            if abs(middle - row_middle) <= 0.5 * height:
+                last.append(word)
+                continue
+        rows.append([word])
+    return rows
 
 
 def _added_text(
@@ -1026,13 +1135,16 @@ _DESCRIBE_UPSCALES = ((24, 4.0), (60, 3.0))  # (finding no bigger than this, enl
 _DESCRIBE_UPSCALE = 2.0  # enlarged (a real pair: '100g' beside '10' 'g' became '100' 'g'; a 5 px serial number needs 4x)
 _DESCRIBE_ROTATE_MAX_PX = 100  # a finding this small, read as nothing upright, is tried as text on its side
 _DESCRIBE_SIDEWAYS_WINDOW = (24, 128)  # (across, along) padding for text on its side: a serial number runs a long way
+_DESCRIBE_WAYS = tuple((pad_x, pad_y, None, False) for pad_x, pad_y in _DESCRIBE_WINDOWS) + tuple(
+    (*_DESCRIBE_SIDEWAYS_WINDOW, rotation, True) for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE)
+)  # (x padding, y padding, turned, sideways): the ways a box is looked at, in turn
 _DESCRIBE_MAX_AREA_PX = 3_500_000  # a finding this big is a panel, not a phrase: not read
 _DESCRIBE_REACH_PX = 24  # the phrase a finding belongs to reaches this far along its line (a word's height and a half, if more)
 _BLOCK_PAGE_SEGMENTATION = "--psm 6"  # a window holds a block of text
 _MAX_DETAIL_CHARS = 70
 _SMALL_FINDING_PX = 24  # a finding no bigger than this either way is a speck (or a glyph), not a phrase
 _DARK_BACKGROUND = 110  # a crop whose median tone is darker than this is light text on dark, and is read reversed
-_MAX_READERS = 8
+_MAX_READERS = 16  # readers started side by side (each is a program of its own: starting it is what costs)
 
 
 def _clip(text: str) -> str:
@@ -1062,25 +1174,44 @@ def _enlargement(box: BoundingBox) -> float:
 
 
 def _read_around(
-    image: np.ndarray, box: BoundingBox, config: DetectionConfig, pad_x: int, pad_y: int, rotation: int | None = None
+    image: np.ndarray,
+    box: BoundingBox,
+    config: DetectionConfig,
+    pad_x: int,
+    pad_y: int,
+    rotation: int | None = None,
+    factor: float | None = None,
 ) -> list[OcrWord]:
     """The words in a window around `box`, in reading order and in the whole picture's pixels.
 
     `rotation` (cv2.ROTATE_90_CLOCKWISE / _COUNTERCLOCKWISE) turns the window before it is read, for text that runs up
     or down the page (a serial number down a flap): the words come back where they lie on the page, not in the turned window.
     """
-    height, width = image.shape[:2]
-    x0, x1 = max(0, int(box.x0) - pad_x), min(width, math.ceil(box.x1) + pad_x)
-    y0, y1 = max(0, int(box.y0) - pad_y), min(height, math.ceil(box.y1) + pad_y)
-    if x1 - x0 < 8 or y1 - y0 < 8:
+    window = _window(image, box, pad_x, pad_y, rotation)
+    if window is None:
         return []
-    factor = _enlargement(box)
-    enlarged = cv2.resize(_readable(image[y0:y1, x0:x1]), None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
-    enlarged_height, enlarged_width = enlarged.shape[:2]
-    crop = enlarged if rotation is None else cv2.rotate(enlarged, rotation)
-    crop_width = crop.shape[1]
+    if factor:
+        window.factor = factor
+    picture = _window_picture(image, window)
+    return _window_words(_ocr_data(picture, _BLOCK_PAGE_SEGMENTATION, config.ocr_language), window, picture, image.shape[:2], config)
+
+
+def _window_picture(image: np.ndarray, window: "_Window") -> np.ndarray:
+    """The window as it is given to the reader: dark on light, enlarged, and turned as the window says."""
+    crop = image[window.y0 : window.y1, window.x0 : window.x1]
+    factor = window.factor
+    enlarged = cv2.resize(_readable(crop), None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
+    return enlarged if window.rotation is None else cv2.rotate(enlarged, window.rotation)
+
+
+def _window_words(data: dict, window: "_Window", picture: np.ndarray, shape: tuple[int, int], config: DetectionConfig) -> list[OcrWord]:
+    """The words a reading of a window's `picture` found, where they lie in the whole picture (of `shape`)."""
+    height, width = shape
+    x0, y0, x1, y1, factor, rotation = window.x0, window.y0, window.x1, window.y1, window.factor, window.rotation
+    crop_width = picture.shape[1]
+    enlarged_height, enlarged_width = picture.shape[:2] if rotation is None else picture.shape[1::-1]
     words = []
-    for _line, word in _words_of(_ocr_data(crop, _BLOCK_PAGE_SEGMENTATION, config.ocr_language), config.ocr_min_confidence):
+    for _line, word in _words_of(data, config.ocr_min_confidence):
         b = word.bbox
         if rotation is None:
             ex0, ey0, ex1, ey1 = b.x0, b.y0, b.x1, b.y1
@@ -1380,45 +1511,230 @@ def _set_differently(
     return _candidate(box, DiffType.TEXT, subtype, 0.8, detail, magnitude=magnitude)
 
 
+_TEXT_LAYER_CONFIDENCE = 99.0  # a word taken from a PDF's own text is not a guess
+_INK_LEVEL = 200  # a window with nothing darker than this (in its darkest channel) has nothing printed to read
+
+
+def text_layer_words(page, dpi: float, shape: tuple[int, int]) -> list[OcrWord] | None:
+    """A PDF page's own words (its live text), in the rendered picture's pixels -- exact, and instant beside reading the
+    picture. None if the page has no text of its own (it is outlined to paths, or a picture): it must be read."""
+    try:
+        textpage = page.get_textpage()
+        raw = page.get_text("words", textpage=textpage)
+        # which way each line runs: a short word's box ('to', 'c)') is as tall as it is wide either way
+        lines = {
+            (block["number"], number): abs(line["dir"][0]) >= abs(line["dir"][1])
+            for block in page.get_text("dict", textpage=textpage)["blocks"]
+            if block.get("type") == 0
+            for number, line in enumerate(block["lines"])
+        }
+    except Exception:  # noqa: BLE001 -- a page whose text cannot be extracted is read instead
+        logger.exception("could not read the page's text")
+        return None
+    if not raw:
+        return None
+    turned = page.rotation % 180 == 90  # the page is shown turned a quarter: what ran across it runs up it
+    to_pixels = dpi / 72.0
+    rotation = page.rotation_matrix if page.rotation else None
+    height, width = shape
+    words = []
+    for x0, y0, x1, y1, text, block, line, *_rest in raw:
+        text = str(text).strip()
+        if not text:
+            continue
+        rect = fitz_rect(x0, y0, x1, y1)
+        if rotation is not None:
+            rect = rect * rotation
+        box = BoundingBox(
+            max(0.0, rect.x0 * to_pixels), max(0.0, rect.y0 * to_pixels),
+            min(float(width), rect.x1 * to_pixels), min(float(height), rect.y1 * to_pixels),
+        )
+        if box.width > 0 and box.height > 0:
+            across = lines.get((block, line))
+            upright = None if across is None else across != turned
+            words.append(OcrWord(text, box, _TEXT_LAYER_CONFIDENCE, upright))
+    return words or None
+
+
+def fitz_rect(x0: float, y0: float, x1: float, y1: float):
+    import pymupdf as fitz
+
+    return fitz.Rect(x0, y0, x1, y1)
+
+
+@dataclass
+class _Window:
+    """One window of one file to find the words in: its corner and far corner in the picture, how much it is enlarged
+    before it is read, and which way it is turned (None: upright)."""
+
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    factor: float
+    rotation: int | None
+
+
+def _window(image: np.ndarray, box: BoundingBox, pad_x: int, pad_y: int, rotation: int | None) -> _Window | None:
+    height, width = image.shape[:2]
+    x0, x1 = max(0, int(box.x0) - pad_x), min(width, math.ceil(box.x1) + pad_x)
+    y0, y1 = max(0, int(box.y0) - pad_y), min(height, math.ceil(box.y1) + pad_y)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return _Window(x0, y0, x1, y1, _enlargement(box), rotation)
+
+
+def _layer_words_in(layer: list[OcrWord], window: _Window, shape: tuple[int, int]) -> list[OcrWord]:
+    """The text-layer words that lie in a window, as a reading of that window would give them: whole words only (one
+    running off the window's edge would be read cut short, so it is left out, as a reading leaves it out), and the ones
+    that run the window's way (up the page for a window turned on its side)."""
+    height, width = shape
+    words = []
+    for word in layer:
+        if not any(ch.isalnum() for ch in word.text):
+            continue  # a mark (':', a bullet) is not a word -- a reading drops it too (`_trustworthy`)
+        b = word.bbox
+        cx, cy = (b.x0 + b.x1) / 2, (b.y0 + b.y1) / 2
+        if not (window.x0 <= cx <= window.x1 and window.y0 <= cy <= window.y1):
+            continue
+        upright = word.upright if word.upright is not None else not (len(word.text) > 1 and b.height > 1.5 * b.width)
+        if window.rotation is None:
+            if not upright:
+                continue  # a word up the page is read with the window turned
+            cut = (b.x0 < window.x0 and window.x0 > 0) or (b.x1 > window.x1 and window.x1 < width)
+        else:
+            if upright if word.upright is not None else (len(word.text) > 1 and b.width > 1.5 * b.height):
+                continue
+            cut = (b.y0 < window.y0 and window.y0 > 0) or (b.y1 > window.y1 and window.y1 < height)
+        if not cut:
+            words.append(word)
+    return words
+
+
+def _printed(image: np.ndarray, window: _Window) -> bool:
+    crop = image[window.y0 : window.y1, window.x0 : window.x1]
+    darkest = crop.min(axis=2) if crop.ndim == 3 else crop
+    return bool((darkest < _INK_LEVEL).any())
+
+
+def _words_for(
+    image: np.ndarray, windows: list[_Window | None], layer: list[OcrWord] | None
+) -> tuple[list[list[OcrWord]], list[int]]:
+    """The words in each window of one file where its own text gives them (exact, instant), and the windows that must
+    be read instead: ink with no text of its own under it (lettering outlined to paths, a picture, a scan)."""
+    found: list[list[OcrWord]] = [[] for _ in windows]
+    to_read: list[int] = []
+    for index, window in enumerate(windows):
+        if window is None:
+            continue
+        if layer is not None:
+            words = _layer_words_in(layer, window, image.shape[:2])
+            if words:
+                found[index] = words
+                continue
+        if _printed(image, window):
+            to_read.append(index)
+    return found, to_read
+
+
+def _read_windows_of(
+    jobs: list[tuple[np.ndarray, _Window]], config: DetectionConfig, page_segmentation: str = _BLOCK_PAGE_SEGMENTATION
+) -> list[list[OcrWord]]:
+    """The words in each (picture, window): every window read on its own (small type enlarged, a window is read far more
+    surely alone than stacked with others), all of them shared among a few runs of the reader."""
+    pictures = [_window_picture(image, window) for image, window in jobs]
+    readings = _ocr_many(pictures, page_segmentation, config.ocr_language)
+    return [
+        _window_words(data, window, picture, image.shape[:2], config)
+        for (image, window), picture, data in zip(jobs, pictures, readings)
+    ]
+
+
 def describe(
-    boxes: list[BoundingBox], original: np.ndarray, suspect: np.ndarray, config: DetectionConfig
+    boxes: list[BoundingBox],
+    original: np.ndarray,
+    suspect: np.ndarray,
+    config: DetectionConfig,
+    original_layer: list[OcrWord] | None = None,
+    suspect_layer: list[OcrWord] | None = None,
 ) -> list[DiffCandidate | None]:
     """For each box where the pixels differ: the text change the words there show (None if they read the same,
-    or there are none). Each box is read in both files, alone; the reads run side by side."""
+    or there are none).
 
-    def read(box: BoundingBox) -> DiffCandidate | None:
-        if box.area > _DESCRIBE_MAX_AREA_PX:
-            return None
-        for pad_x, pad_y in _DESCRIBE_WINDOWS:
-            found = _described(
-                box,
-                _read_around(original, box, config, pad_x, pad_y),
-                _read_around(suspect, box, config, pad_x, pad_y),
-                original,
-                suspect,
-                config,
-            )
-            if found is not None:
-                return found
-        if max(box.width, box.height) <= _DESCRIBE_ROTATE_MAX_PX:
-            # Nothing read upright: it may be text up or down the page (a serial number down a flap), so it is tried turned.
-            pad_across, pad_along = _DESCRIBE_SIDEWAYS_WINDOW
-            for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE):
-                found = _described(
-                    box,
-                    _read_around(original, box, config, pad_across, pad_along, rotation),
-                    _read_around(suspect, box, config, pad_across, pad_along, rotation),
-                    original,
-                    suspect,
-                    config,
-                    sideways=True,
-                )
-                if found is not None:
-                    return found
-        return None
-
+    Every box is looked at the same ways, in turn -- a close window, a wider one, then (a small box read as nothing)
+    the window turned on its side -- and the words in a window come from the file's own text where it has any there
+    (`original_layer`, `suspect_layer`: `text_layer_words`, in these pictures' pixels), and are read otherwise. What
+    has to be read, for every box and every way it might be looked at, is read at once, before any is judged: a
+    reading costs little beside starting the reader, so reading a window that turns out not to be needed is cheaper
+    than waiting for the ways one after the other."""
     with StageTimer(logger, "describe_text"):
-        if len(boxes) <= 1:
-            return [read(box) for box in boxes]
-        with ThreadPoolExecutor(max_workers=max(1, min(_MAX_READERS, os.cpu_count() or 2))) as pool:
-            return list(pool.map(read, boxes))
+        pending = [index for index, box in enumerate(boxes) if box.area <= _DESCRIBE_MAX_AREA_PX]
+        pictures = (original, suspect)
+        layers = (original_layer, suspect_layer)
+        windows = {
+            (way, index, side): _window(pictures[side], boxes[index], pad_x, pad_y, rotation)
+            for way, (pad_x, pad_y, rotation, sideways) in enumerate(_DESCRIBE_WAYS)
+            for index in pending
+            if not sideways or max(boxes[index].width, boxes[index].height) <= _DESCRIBE_ROTATE_MAX_PX
+            for side in (0, 1)
+        }
+
+        def given(key, layer_used: bool) -> list[OcrWord] | None:
+            """A window's words from its file's own text, or None if they have to be read ([] if it is blank)."""
+            window = windows[key]
+            if window is None:
+                return []
+            layer = layers[key[2]] if layer_used else None
+            if layer is not None:
+                words = _layer_words_in(layer, window, pictures[key[2]].shape[:2])
+                if words:
+                    return words
+            return None if _printed(pictures[key[2]], window) else []
+
+        read: dict = {}
+
+        def read_all(keys) -> None:
+            keys = [key for key in dict.fromkeys(keys) if key not in read]
+            jobs = [(pictures[key[2]], windows[key]) for key in keys]
+            for key, words in zip(keys, _read_windows_of(jobs, config)):
+                read[key] = words
+
+        def run(indices: list[int], layer_used: bool) -> dict[int, DiffCandidate | None]:
+            wanted = set(indices)
+            known = {key: given(key, layer_used) for key in windows if key[1] in wanted}
+            to_read = [key for key, words in known.items() if words is None]
+            if layer_used:
+                # Where the two files' own text differs, what it says is to be confirmed by reading (below): those
+                # windows are read now, with the rest, rather than in a second round after.
+                disputed = {
+                    key[1] for key, words in known.items()
+                    if key[2] == 0 and words and [w.text for w in words] != [w.text for w in (known[(key[0], key[1], 1)] or [])]
+                }
+                to_read += [key for key in windows if key[1] in disputed and given(key, False) is None]
+            read_all(to_read)
+            results: dict[int, DiffCandidate | None] = {}
+            for index in indices:
+                results[index] = None
+                for way, (_pad_x, _pad_y, _rotation, sideways) in enumerate(_DESCRIBE_WAYS):
+                    if (way, index, 0) not in windows:
+                        continue
+                    found = [known[(way, index, side)] for side in (0, 1)]
+                    found = [read[(way, index, side)] if words is None else words for side, words in enumerate(found)]
+                    results[index] = _described(boxes[index], *found, original, suspect, config, sideways=sideways)
+                    if results[index] is not None:
+                        break
+            return results
+
+        results: list[DiffCandidate | None] = [None] * len(boxes)
+        with_layers = original_layer is not None or suspect_layer is not None
+        for index, result in run(pending, with_layers).items():
+            results[index] = result
+        if with_layers:
+            # A file's own text is what it SAYS it prints -- a barcode's digits or a logo's letters can be set in a font
+            # whose text maps to other characters than it draws. So where it says the words CHANGED, the pictures are
+            # read to say so (what is printed decides); where it says they are the same, that stands.
+            changed = [i for i in pending if results[i] is not None and results[i].type in (DiffType.TEXT, DiffType.NUMBER)
+                       and results[i].subtype is not DiffSubtype.MOVED and "font" not in results[i].detail.lower()]
+            for index, result in run(changed, False).items():
+                results[index] = result
+    return results

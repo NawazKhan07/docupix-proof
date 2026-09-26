@@ -110,10 +110,163 @@ def cluster_candidates(
     components: dict[int, list[DiffCandidate]] = defaultdict(list)
     for position, candidate in enumerate(candidates):
         components[sets.find(position)].append(candidate)
-    groups = list(components.values())
+    groups = _merge_elements(list(components.values()))
     for members in groups:
         members.sort(key=lambda c: (c.bbox.y0, c.bbox.x0))
     return sorted(groups, key=_reading_order_key)
+
+
+_ELEMENT_OVERLAP = 0.6  # two parts of one element (a word, a wordmark) share at least this much of the shorter's height...
+_ELEMENT_HEIGHT_RATIO = 1.6  # ...are about as tall as each other (a letter and the line it is in, not a panel beside it)...
+_ELEMENT_GAP = 0.35  # ...and, found as the same kind, are at most this share of their height apart (a letter's space)...
+_ELEMENT_CROSS_OVERLAP = 0.25  # ...or, found as different kinds (a recoloured letter, a reshaped one), overlap this much
+_ELEMENT_NESTED = 0.5  # pieces side by side overlap by no more than this share of the smaller (else one is inside the other)
+_ELEMENT_PART_HEIGHT = 0.2  # a finding inside a joined element, at least this share of its height, is a part of it
+_SPECK_HOST_MAX_PX = 300  # a changed graphic takes in the colour specks inside it only if it is a mark (a badge), not a panel
+_ELEMENT_MAX_ASPECT = 25.0  # an element is not a rule or a band drawn across the whole panel
+_ELEMENT_TOUCH_SHARE = 0.06  # pieces of different kinds this close (a share of the line's height, plus...
+_ELEMENT_TOUCH_PX = 2.0  # ...this) along one line of type...
+_ELEMENT_TOUCH_LINE = 0.8  # ...sharing this much of its height are pieces of one word
+_PATTERN_MAX_PX = 40  # the marks of a pattern (the dots of a Braille cell) are small...
+_PATTERN_SIZE_RATIO = 1.3  # ...the same size and round or square (either way within this)...
+_PATTERN_GAP = 2.0  # ...and at most this many times their size apart (a cell's dots are set on a grid, rows and diagonals)
+
+
+def _merge_elements(groups: list[list[DiffCandidate]]) -> list[list[DiffCandidate]]:
+    """The findings that are pieces of ONE changed element, joined (a word recoloured or retyped, found letter by letter
+    by different detectors -- a colour change on one letter, a graphics change on the next two, the counter of an A;
+    the dots of one Braille cell): see `_one_element`. Then whatever lies inside a joined element and is a real part of
+    it (a letter's counter). A changed word is one finding, not one per letter; two changes a word's width apart, a
+    digit changed in a recoloured panel, a moved word beside a changed one, stay what they were."""
+    pieces = [group for group in groups if not any(c.type in _SYMBOL_TYPES for c in group)]
+    symbols = [group for group in groups if any(c.type in _SYMBOL_TYPES for c in group)]
+    if len(pieces) < 2:
+        return groups
+    boxes = [union_box(group) for group in pieces]
+    kinds = [{c.category for c in group} for group in pieces]
+    moves = [_move_of(group) for group in pieces]
+    dots = [_dot_size(group) for group in pieces]
+    sets = _DisjointSet(len(pieces))
+    order = sorted(range(len(pieces)), key=lambda index: boxes[index].x0)
+    for offset, i in enumerate(order):
+        a = boxes[i]
+        reach = max(_ELEMENT_GAP * _ELEMENT_HEIGHT_RATIO * a.height, _PATTERN_GAP * _PATTERN_MAX_PX)
+        for j in order[offset + 1 :]:
+            b = boxes[j]
+            if b.x0 - a.x1 > reach:
+                break
+            if not _moves_agree(moves[i], moves[j]):
+                continue
+            if _one_element(a, b, same_kind=bool(kinds[i] & kinds[j])) or _one_dot_pattern(a, b, dots[i], dots[j]):
+                sets.union(i, j)
+    components: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(pieces)):
+        components[sets.find(index)].append(index)
+    merged: list[list[DiffCandidate]] = []
+    merged_boxes: list[BoundingBox] = []
+    joined: list[bool] = []
+    for indices in components.values():
+        merged.append([c for index in indices for c in pieces[index]])
+        box = boxes[indices[0]]
+        for index in indices[1:]:
+            box = box.union(boxes[index])
+        merged_boxes.append(box)
+        joined.append(len(indices) > 1)
+    # what lies inside a joined element and is a real part of it (a letter's counter, the rest of a letter) joins it; so
+    # does a colour speck inside a changed graphic (a recoloured badge seen in pieces) -- but a digit or a mark changed
+    # inside a recoloured panel is still its own finding
+    order = sorted(range(len(merged)), key=lambda index: merged_boxes[index].x0)
+    for i in range(len(merged)):
+        outer = merged_boxes[i]
+        outer_graphic = max(outer.width, outer.height) <= _SPECK_HOST_MAX_PX and any(
+            c.type is DiffType.GRAPHICS and c.subtype is DiffSubtype.CHANGED for c in merged[i]
+        )
+        if not (joined[i] or outer_graphic):
+            continue
+        for j in order:
+            inner = merged_boxes[j]
+            if inner.x0 > outer.x1:
+                break
+            if j == i or not merged[j] or not merged[i] or not _inside(inner, outer):
+                continue
+            part = joined[i] and inner.height >= _ELEMENT_PART_HEIGHT * outer.height
+            speck = outer_graphic and all(c.type is DiffType.COLOUR for c in merged[j])
+            if part or speck:
+                merged[i] = merged[i] + merged[j]
+                merged[j] = []
+    return [group for group in merged if group] + symbols
+
+
+def _move_of(group: list[DiffCandidate]) -> float | None:
+    """How far a finding's words moved (None if it is not a move)."""
+    moved = [c.magnitude for c in group if c.subtype is DiffSubtype.MOVED]
+    return max(moved) if moved and len(moved) == len(group) else (None if not moved else -1.0)
+
+
+def _moves_agree(a: float | None, b: float | None) -> bool:
+    """A moved word joins only a word moved about as far; never a changed one (see `_moved_alike`)."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None or a < 0 or b < 0:
+        return False
+    return abs(a - b) <= max(6.0, 0.3 * max(a, b))
+
+
+def _one_pattern(a: BoundingBox, b: BoundingBox) -> bool:
+    """Two marks of one pattern: small, the same round or square size, close together."""
+    for box in (a, b):
+        if max(box.width, box.height) > _PATTERN_MAX_PX or min(box.width, box.height) <= 0:
+            return False
+        if max(box.width, box.height) > _PATTERN_SIZE_RATIO * min(box.width, box.height):
+            return False  # round or square: a word or a line of type is not a dot
+    if max(a.width, b.width) > _PATTERN_SIZE_RATIO * min(a.width, b.width):
+        return False
+    size = max(a.width, a.height, b.width, b.height)
+    return 0 < box_gap(a, b) <= _PATTERN_GAP * size  # (touching marks are one mark cut in two, handled elsewhere)
+
+
+def _dot_size(group: list[DiffCandidate]) -> float | None:
+    """The size of the marks a finding is made of, if every one is a small round or square mark (a dot of a pattern)."""
+    sizes = []
+    for candidate in group:
+        box = candidate.bbox
+        big, small = max(box.width, box.height), min(box.width, box.height)
+        if big > _PATTERN_MAX_PX or small <= 0 or big > _PATTERN_SIZE_RATIO * small:
+            return None
+        sizes.append(big)
+    return max(sizes) if sizes else None
+
+
+def _one_dot_pattern(a: BoundingBox, b: BoundingBox, dots_a: float | None, dots_b: float | None) -> bool:
+    """Two findings made of dots of one size, a few dots apart: one pattern (a row of dots found, then the next row)."""
+    if dots_a is None or dots_b is None or max(dots_a, dots_b) > _PATTERN_SIZE_RATIO * min(dots_a, dots_b):
+        return False
+    return 0 < box_gap(a, b) <= _PATTERN_GAP * max(dots_a, dots_b)
+
+
+def _one_element(a: BoundingBox, b: BoundingBox, same_kind: bool) -> bool:
+    """Whether two findings' boxes are pieces of one element on one line, or two marks of one pattern."""
+    if _one_pattern(a, b):
+        return True
+    short, tall = sorted((max(a.height, 1.0), max(b.height, 1.0)))
+    if tall > _ELEMENT_HEIGHT_RATIO * short:
+        return False
+    if max(a.width / max(a.height, 1.0), b.width / max(b.height, 1.0)) > _ELEMENT_MAX_ASPECT:
+        return False
+    shared = min(a.y1, b.y1) - max(a.y0, b.y0)
+    if shared < _ELEMENT_OVERLAP * short:
+        return False
+    overlap = a.intersection_area(b)
+    smaller = max(min(a.area, b.area), 1.0)
+    if overlap > _ELEMENT_NESTED * smaller:
+        return False  # one inside the other (an icon on a recoloured band) is not two pieces side by side
+    gap = max(a.x0 - b.x0 - b.width, b.x0 - a.x0 - a.width, 0.0)
+    if not same_kind:
+        # different kinds: where they really overlap -- or where they butt up against each other along one line of type
+        # (a word recoloured letter by letter: one letter's colour, the next two's shape), a letter space apart at most
+        touching = gap <= _ELEMENT_TOUCH_SHARE * short + _ELEMENT_TOUCH_PX and shared >= _ELEMENT_TOUCH_LINE * short
+        return overlap >= _ELEMENT_CROSS_OVERLAP * smaller or touching
+    return gap <= _ELEMENT_GAP * tall
 
 
 def _joined(

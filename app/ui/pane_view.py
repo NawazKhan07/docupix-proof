@@ -40,6 +40,8 @@ from app.ui.gestures import enable_zoom_gestures, zoom_from_viewport_event, zoom
 _MIN_LEVEL_EDGE_PX = 64  # never reduce an image below this on its long edge
 _CLICK_SLOP_PX = 5  # a press-release within this distance is a click, not a drag
 _MARKER_Z = 10
+_HIGHLIGHT_COLOUR = "#1d64f2"  # a region chosen in a results panel (a symbol, the Braille)
+_HIGHLIGHT_PAD_PX = 6
 _COMPARED_AREA_Z = 2  # over the page and its detail tile, under the findings
 _OUTSIDE_TINT = QColor(255, 255, 255)  # what the comparison left out is erased: plain white, as it was compared
 
@@ -108,6 +110,9 @@ class PaneView(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHints(QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        # No scroll bars: the picture is moved by dragging it and zoomed by pinch / Ctrl + wheel / the zoom buttons.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
@@ -117,6 +122,7 @@ class PaneView(QGraphicsView):
         self._zoom = 1.0
         self._marker_items: dict[int, QGraphicsRectItem] = {}
         self._halo_items: list[QGraphicsRectItem] = []
+        self._highlight_items: list[QGraphicsRectItem] = []
         self._press_pos = None
         self._selecting = False  # region selection: a drag draws a rectangle instead of panning
         self._region_from: QPointF | None = None
@@ -125,6 +131,9 @@ class PaneView(QGraphicsView):
         self._outline_item: QGraphicsPathItem | None = None
         self._compared_area: list[list[tuple[float, float]]] | None = None
         self._show_compared_area = True
+        self._block_outline_item: QGraphicsPathItem | None = None
+        self._block_outlines: list[list[tuple[float, float]]] | None = None
+        self._show_block_outlines = True
         enable_zoom_gestures(self)
 
         # A screen-resolution tile drawn over the base image once zoomed in
@@ -327,6 +336,43 @@ class PaneView(QGraphicsView):
         self._outline_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self._scene.addItem(self._outline_item)
 
+    # -- block-wise segmentation: each panel's own outline ----------------------
+    def set_block_outlines(self, polygons: list[list[tuple[float, float]]] | None) -> None:
+        """Outline each panel a block-wise comparison found (None: no blocks, or block alignment is off)."""
+        self._block_outlines = polygons
+        self._draw_block_outlines()
+
+    def show_block_outlines(self, visible: bool) -> None:
+        self._show_block_outlines = visible
+        self._draw_block_outlines()
+
+    @property
+    def block_outlines_visible(self) -> bool:
+        return self._block_outline_item is not None and self._block_outline_item.isVisible()
+
+    def _draw_block_outlines(self) -> None:
+        if self._block_outline_item is not None and self._block_outline_item.scene() is not None:
+            self._scene.removeItem(self._block_outline_item)
+        self._block_outline_item = None
+        if not self._block_outlines or not self._show_block_outlines or self.image_size == (0, 0):
+            return
+
+        path = QPainterPath()
+        for polygon in self._block_outlines:
+            sub = QPainterPath()
+            sub.addPolygon(QPolygonF([QPointF(x, y) for x, y in polygon]))
+            sub.closeSubpath()
+            path.addPath(sub)
+
+        pen = QPen(QColor(230, 140, 20), 1.5, Qt.PenStyle.DashLine)  # orange: distinct from the compared-area blue
+        pen.setCosmetic(True)
+        self._block_outline_item = QGraphicsPathItem(path)
+        self._block_outline_item.setPen(pen)
+        self._block_outline_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._block_outline_item.setZValue(_COMPARED_AREA_Z + 0.2)
+        self._block_outline_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._scene.addItem(self._block_outline_item)
+
     # -- markers -------------------------------------------------------------
     def set_markers(self, clusters: list[DiffCluster], selected_id: int | None = None) -> None:
         """Draw one box per finding, in the colour of its category (text, colour, graphics, barcode, Braille).
@@ -372,6 +418,37 @@ class PaneView(QGraphicsView):
     @property
     def marker_count(self) -> int:
         return len(self._marker_items)
+
+    def set_highlight(self, box: BoundingBox | None) -> None:
+        """Mark one region (a decoded symbol, the Braille, a dot difference) that was just chosen in a results panel:
+        a bold dashed outline on a white halo, a little outside the region, over everything else. None clears it."""
+        for item in self._highlight_items:
+            self._scene.removeItem(item)
+        self._highlight_items = []
+        if box is None:
+            return
+        pad = _HIGHLIGHT_PAD_PX
+        rect = (box.x0 - pad, box.y0 - pad, box.width + 2 * pad, box.height + 2 * pad)
+        halo = QGraphicsRectItem(*rect)
+        halo_pen = QPen(QColor(255, 255, 255, 235), 7)
+        halo_pen.setCosmetic(True)
+        halo.setPen(halo_pen)
+        outline = QGraphicsRectItem(*rect)
+        outline_pen = QPen(QColor(_HIGHLIGHT_COLOUR), 3, Qt.PenStyle.DashLine)
+        outline_pen.setCosmetic(True)
+        outline.setPen(outline_pen)
+        fill = QColor(_HIGHLIGHT_COLOUR)
+        fill.setAlpha(35)
+        outline.setBrush(fill)
+        for z, item in enumerate((halo, outline)):
+            item.setZValue(_MARKER_Z + 10 + z)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._scene.addItem(item)
+            self._highlight_items.append(item)
+
+    @property
+    def highlighted(self) -> bool:
+        return bool(self._highlight_items)
 
     def center_on_box(self, box: BoundingBox) -> None:
         cx, cy = box.center

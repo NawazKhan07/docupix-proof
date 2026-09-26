@@ -224,6 +224,30 @@ def test_choosing_a_card_reports_the_finding(panel, outcome):
     assert chosen == [card.cluster_id]
 
 
+def test_choosing_the_already_selected_card_again_deselects_it(panel, outcome):
+    chosen = []
+    panel.clusterSelected.connect(chosen.append)
+    card = _cards(panel)[0]
+    card.selectRequested.emit(card.cluster_id)  # select it first
+
+    card.selectRequested.emit(card.cluster_id)  # click it again
+
+    assert chosen == [card.cluster_id, None]
+    assert panel._selected_id is None
+    assert not any(c.property("selected") == "true" for c in _cards(panel))
+
+
+def test_choosing_a_different_card_selects_it_rather_than_deselecting(panel, outcome):
+    chosen = []
+    panel.clusterSelected.connect(chosen.append)
+    first, second = _cards(panel)[0], _cards(panel)[1]
+    first.selectRequested.emit(first.cluster_id)
+
+    second.selectRequested.emit(second.cluster_id)
+
+    assert chosen == [first.cluster_id, second.cluster_id]
+
+
 def test_the_alignment_error_is_shown_as_a_pill(panel, outcome):
     assert "px" in panel.alignment_pill.text()
     assert panel.alignment_pill.property("pill") == "loaded"

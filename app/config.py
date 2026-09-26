@@ -45,6 +45,26 @@ class AlignmentConfig:
     # and a scan (scale factor up to 5x either way).
     max_scale_factor: float = 5.0
     polygon_resample_points: int = 64
+    # A block (see `DetectionConfig.block_alignment_enabled`) is smaller than the whole artwork, so it
+    # credibly has fewer of its own keypoints to match on -- its own, more forgiving versions of
+    # `min_match_count`/`min_inlier_count` above, so a genuinely small panel is not rejected out of hand.
+    block_min_match_count: int = 6
+    block_min_inlier_count: int = 8
+    # A flat, solid-colour panel has no corners of its own for ORB/AKAZE to find at all: `block_alignment`'s
+    # phase-correlation fallback (a pure shift, tried only once feature matching finds nothing to work with)
+    # is trusted only above this correlation confidence (0-1) and within this many pixels of drift.
+    block_phase_min_response: float = 0.12
+    block_phase_max_drift_px: float = 40.0
+    # A block takes its own transform only where the whole artwork's is measurably wrong for it: by at least this
+    # many pixels on the block's own matched points. Where the whole-artwork transform already fits a panel (two
+    # files the same size, the ordinary case), the panel keeps it -- no seam is drawn round it for nothing.
+    block_min_improvement_px: float = 1.0
+    # Where a block's counterpart is looked for in the other file, beyond where the whole-artwork transform puts
+    # it: this share of the block's own larger side (two cartons of different proportions put a panel hundreds
+    # of pixels from where one transform for the whole sheet predicts).
+    block_search_margin_share: float = 0.35
+    # How many of the other file's own blocks nearest the predicted place are tried as the counterpart.
+    block_candidates: int = 3
 
 
 @dataclass(frozen=True)
@@ -232,10 +252,24 @@ class DetectionConfig:
     ink_ramp_min_low: float = 20.0
     ink_solid_low: float = 100.0
     ink_solid_high: float = 160.0
-    # Scan vs Digital compares TEXT (and barcode bars as marks). Its graphics are compared only if this is set: a scan
+    # A neutral grey this dark is at least as often a photograph's own backdrop (a scan's surface, a desk) as
+    # printed artwork -- unlike a printed reversed panel, which is always some definite ink colour (a navy, a
+    # green, a maroon), never a colourless grey. Below this much colour (max channel - min, 0-255) a region
+    # needs to be `ink_solid_neutral_margin` levels darker again before counting as solid, so a backdrop in
+    # this ambiguous middle band renders as background, not a false solid black block; true black (or any
+    # colour dark enough to be solid on darkness alone) is already past `ink_solid_high` and unaffected.
+    ink_solid_chroma_px: float = 40.0
+    ink_solid_neutral_margin: float = 60.0
+    # Scan vs Digital compares TEXT (and barcode bars as marks). Its graphics are SHOWN only if this is set: a scan
     # changes every colour, blurs every edge and never registers exactly, and comparing the two pictures gave dozens
     # of false 'graphics' differences (a fold line, the scanner's own edge, every dark block) round the few real ones.
+    # Graphics are still compared either way -- this only decides what the results page shows by default -- so
+    # ticking its checkbox there is instant, with nothing recompared (`app.models.diff.visible_clusters`).
     scan_compare_graphics: bool = False
+    # Scan vs Digital reads text (OCR) by default; the reviewer can turn this off from the results page to compare
+    # pure visual pixels only (graphics, above, and barcode marks) -- e.g. a scan too soft or skewed for OCR to be
+    # worth it, or when only a visual check is wanted. Text is still read either way, for the same reason as above.
+    scan_compare_text: bool = True
     # What each file is READ from in Scan vs Digital (see scan_normalizer.reading_source): 'ink' (the ink picture: background
     # removed, ink black), 'gray' (the file's own grey), 'flat' (grey with the paper divided out), 'darkest' (the darkest
     # channel, paper divided out), 'clahe' (flat, local contrast stretched) or 'adaptive' (flat, thresholded locally).
@@ -247,6 +281,16 @@ class DetectionConfig:
     # Text is read from the ink pictures at no more than this long edge (px): Tesseract reads best at
     # about 300 DPI, so an A4 page (3508 px) is read as it is and a larger sheet is reduced to this.
     ocr_long_edge_px: int = 3600
+    # A scan is never perfectly square, and even the fraction of a degree that alignment leaves behind is enough
+    # to make Tesseract's OWN line segmentation lose its footing on packed, repeating lines (words of one line
+    # merge with the next, or a stray letter's worth of drift reads as a whole scrambled line): before the WHOLE
+    # PAGE is read, each file's picture is levelled to make its lines as horizontal as possible, and only the
+    # reading sees the levelled copy -- every word it returns is turned back to the shared, unrotated frame, so
+    # nothing downstream (matching, ink agreement, the boxes shown) ever knows the picture was turned at all.
+    deskew_enabled: bool = True
+    deskew_search_long_edge_px: int = 1000  # the angle is measured on a copy no bigger than this: fast, and precise enough
+    deskew_max_angle_deg: float = 6.0  # a scan tilted more than this is not "levelled", it is turned -- outside what this corrects
+    deskew_min_correction_deg: float = 0.05  # smaller than this is not worth turning the picture for (or reliably measurable)
 
     # Pharmacode (see pharmacode.py): bars of one length, at least this long and this
     # many times longer than thick (px at 300 DPI: ~1.4 mm up to ~50 mm), in a row of
@@ -366,6 +410,19 @@ class DetectionConfig:
     legacy_pixel_detectors: bool = False
     # Automatic mode with no crop or lift finds the artwork on each sheet itself and compares only that.
     auto_artwork: bool = True
+    # Block-wise alignment: the artwork is divided into its panels and flaps by its own fold and cut lines, in
+    # both files (`app.engine.isolation.block_grid`), and each block is aligned on its own against its
+    # counterpart (`app.engine.alignment.block_alignment`), the way cropping just that block in both files and
+    # aligning them would -- two cartons with panels of different sizes, or a fold not flat in a photograph, cannot
+    # be fitted by one transform for the whole sheet. Applies after any lift, auto-found or the reviewer's own, and
+    # to a crop, in every comparison mode; a block whose own fit is no better keeps the whole-sheet transform.
+    block_alignment_enabled: bool = True
+    block_min_area_fraction: float = 0.015  # a block is at least this share of the artwork (a logo or a line of text is not)
+    # A margin this wide either side of a locally-aligned block's own edge is left out of detection: where its
+    # own warp meets its neighbour's is this composite's own construction (feathered, not removed, by
+    # `composite_warp`), never a real difference in either file -- the same reasoning `edge_inset_norm` already
+    # applies to the artwork's own outer boundary, extended to a block's interior ones.
+    block_seam_margin_px: int = 16
     # Something missing where it was and added where it is, looking alike, is one finding: that it moved. And a finding whose
     # crop of the original fits the suspect a few pixels away is that picture moved.
     pair_moves: bool = True
@@ -554,10 +611,12 @@ class LeafletConfig:
     """Comparing a multi-page document (a leaflet, an insert) page by page, however it was made -- outlined to a
     picture, live text, closed or open, one language or several (`app/engine/leaflet.py`).
 
-    Every page's pixels are compared exactly as Automatic mode compares a single pair (alignment, every detector,
-    clustering): a page needs no border or die-line, only its two renders. OCR only ever DESCRIBES a difference the
-    pixels already found (never decides one), so a page in a language nobody has installed tessdata for is still
-    compared correctly -- its findings are just not captioned with the words.
+    Two independent strategies, either, both or neither on (a leaflet's results page has the toggles): reading and
+    comparing the words on each page (`compare_text`, on by default -- a leaflet's pages are what they say, not
+    what colour they are, so graphics comparison is not needed for most reviews) and a pure pixel-by-pixel
+    comparison marking the exact areas that differ, with what a marked area says read afterwards to describe it
+    (`compare_visual`, off by default). A page in a language nobody has installed tessdata for still compares
+    correctly under `compare_visual` -- its findings are just not captioned with the words.
     """
 
     # A Tesseract language code, or several joined with "+" (e.g. "eng+fra+deu"): whichever of them has its tessdata
@@ -570,6 +629,11 @@ class LeafletConfig:
     # unpaired (a whole page added or missing) rather than compared with something it is not.
     min_page_match_score: float = 0.3
     thumbnail_long_edge_px: int = 300  # pages are paired on copies this small (fast; only which page matches which)
+    compare_text: bool = True  # reads and compares the words on each page (word-for-word, not just describing a pixel finding)
+    compare_visual: bool = False  # pure pixel-by-pixel comparison, marking the exact areas that differ
+    # Which of the ORIGINAL's pages to compare, 1-indexed (e.g. "1,3-5"; blank -- the default -- is every page).
+    # A page left out is not compared and not reported as missing or added: it is simply not part of this review.
+    compare_pages: str = ""
 
 
 @dataclass(frozen=True)

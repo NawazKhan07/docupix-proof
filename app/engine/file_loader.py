@@ -11,8 +11,11 @@ scale it for display rather than this loader silently downsampling it.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import math
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -54,6 +57,63 @@ class InputTooLargeError(ArtworkLoadError):
 
 
 _BYTES_PER_MB = 1024 * 1024
+
+# A comparison holds each file's page several times over while it aligns and detects: measured at ~70 bytes per pixel
+# of page for the pair (a 93 MP shipper peaked at 6.4 GB). So a page is held at no more than memory can take:
+#  * this machine's memory -- a share of what is installed, since the app's own window and the OS need the rest;
+#  * and the memory actually free when the comparison starts -- a machine with an IDE, a browser and a database open
+#    has far less than it has installed, and a page sized to the installed memory alone ran it out mid-comparison.
+# What is free changes by the minute, so the resolution does not follow it smoothly: it steps down through a few fixed
+# levels, and a page held below `WORKING_DPI` says so on the results page. A carton at full resolution (~18-25 MP) is
+# never reduced.
+_PEAK_BYTES_PER_PIXEL = 70
+_MEMORY_SHARE = 0.45  # of the installed memory, the most one comparison may take
+_FREE_MEMORY_SHARE = 0.8  # of the memory free now, the most one comparison may take (other programs keep running)
+_BUDGET_LEVELS = (100.0, 80.0, 64.0, 50.0, 40.0, 32.0, 25.0, 18.0)  # megapixels; never below the last
+
+
+class _MemoryStatus(ctypes.Structure):
+    """Windows' MEMORYSTATUSEX."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _memory_bytes() -> tuple[int, int] | None:
+    """(installed, free now) memory in bytes, or None where it cannot be told. "Free" is what can still be committed
+    (on Windows, allocations fail on the commit limit, not on physical memory), and no more than twice the physical
+    memory free (beyond that a comparison would crawl, paging)."""
+    try:
+        if sys.platform == "win32":
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(_MemoryStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys), int(min(status.ullAvailPageFile, status.ullAvailPhys * 2))
+            return None
+        page = os.sysconf("SC_PAGE_SIZE")
+        return int(os.sysconf("SC_PHYS_PAGES") * page), int(os.sysconf("SC_AVPHYS_PAGES") * page)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def affordable_megapixels(limit: float) -> float:
+    """`limit` (`RuntimeConfig.max_render_megapixels`), lowered to the highest of `_BUDGET_LEVELS` that memory can hold."""
+    memory = _memory_bytes()
+    if memory is None:
+        return limit
+    installed, free = memory
+    fits = min(_MEMORY_SHARE * installed, _FREE_MEMORY_SHARE * free) / _PEAK_BYTES_PER_PIXEL / 1e6
+    level = next((level for level in _BUDGET_LEVELS if level <= fits), _BUDGET_LEVELS[-1])
+    return float(min(limit, level))
 
 
 @dataclass
@@ -237,7 +297,7 @@ def _load_pdf(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
         color_profile=None,
         native_mode="RGB",
         _pdf_doc=doc,
-        budget_megapixels=float(limits.max_render_megapixels),
+        budget_megapixels=affordable_megapixels(float(limits.max_render_megapixels)),
     )
 
 
@@ -255,5 +315,5 @@ def _load_image(path: Path, limits: RuntimeConfig) -> LoadedArtwork:
         color_profile=image.info.get("icc_profile"),
         native_mode=image.mode,
         _pil_image=image,
-        budget_megapixels=float(limits.max_render_megapixels),
+        budget_megapixels=affordable_megapixels(float(limits.max_render_megapixels)),
     )

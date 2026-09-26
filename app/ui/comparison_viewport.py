@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.engine.alignment.block_alignment import feathered_alpha
 from app.engine.file_loader import LoadedArtwork
 from app.engine.tile_renderer import (
     TileRect,
@@ -42,10 +43,16 @@ from app.ui.composition import (
     SINGLE_PANE_MODES,
     VIEW_MODE_LABELS,
     ViewMode,
+    compose_flicker,
     compose_grayscale,
     compose_overlay,
 )
+from app.ui.flow_layout import flow_widget
 from app.ui.pane_view import ImageStack, PaneView
+
+# Each locally-aligned block's own transform (suspect pixels -> original pixels), with its polygon in the
+# shared/original frame -- see `ComparisonOutcome.block_alignments`.
+BlockAlignments = list[tuple[list[tuple[float, float]], np.ndarray]]
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +101,15 @@ class ComparisonViewport(QWidget):
         self._colour_pair: tuple[np.ndarray, np.ndarray] | None = None
         self._ink_pair: tuple[np.ndarray, np.ndarray] | None = None
         self._showing_ink = False
-        self._sources: tuple[LoadedArtwork | None, LoadedArtwork | None, np.ndarray | None] = (None, None, None)
+        self._sources: tuple[LoadedArtwork | None, LoadedArtwork | None, np.ndarray | None, BlockAlignments] = (None, None, None, [])
         self._stacks: dict[str, ImageStack] = {}
         self._original_artwork: LoadedArtwork | None = None
         self._suspect_artwork: LoadedArtwork | None = None
         self._alignment_transform: np.ndarray | None = None
+        # Each locally-aligned block's own transform, with its polygon (in the shared/original frame): lets a
+        # zoomed-in vector re-render use each panel's own correction too, not just the whole artwork's --
+        # the raster views (`compose_overlay` and friends) already do, via the pre-built composite.
+        self._block_alignments: BlockAlignments = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -147,9 +158,20 @@ class ComparisonViewport(QWidget):
         self._apply_mode_layout()
 
     # -- construction --------------------------------------------------------
-    def _build_toolbar(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(6)
+    def _build_toolbar(self) -> QVBoxLayout:
+        """View/zoom controls above, display toggles below, each a row that wraps onto another line when the
+        window is too narrow for it (`FlowLayout`) -- a fixed row of this many controls (four view modes, merge,
+        four zoom controls, four toggles) would otherwise force the whole window wider than a small screen, or
+        a window snapped to half of one. The view buttons, and the zoom controls, wrap as groups, never apart."""
+        rows = QVBoxLayout()
+        rows.setSpacing(6)
+        top_widget, top_flow = flow_widget(self, spacing=16)
+        bottom_widget, bottom_flow = flow_widget(self, spacing=12)
+        rows.addWidget(top_widget)
+        rows.addWidget(bottom_widget)
+        view_group, top = self._group()
+        zoom_group, zoom = self._group()
+        bottom = bottom_flow
 
         self._mode_buttons: dict[ViewMode, QPushButton] = {}
         group = QButtonGroup(self)
@@ -160,36 +182,12 @@ class ComparisonViewport(QWidget):
             button.setProperty("variant", "segment")
             group.addButton(button)
             button.clicked.connect(lambda _checked=False, m=mode: self.set_view_mode(m))
-            row.addWidget(button)
+            top.addWidget(button)
             self._mode_buttons[mode] = button
         self._mode_buttons[ViewMode.SIDE_BY_SIDE].setChecked(True)
         self._composite_modes_enabled = True
+        top_flow.addWidget(view_group)
 
-        row.addSpacing(16)
-        self.scroll_lock_check = QCheckBox("Scroll lock")
-        self.scroll_lock_check.setChecked(True)
-        self.scroll_lock_check.toggled.connect(self.set_scroll_lock)
-        row.addWidget(self.scroll_lock_check)
-        self.ink_check = QCheckBox("Black && white")
-        self.ink_check.setToolTip(
-            "Show each file as ink on paper: background colours removed, everything printed in black. "
-            "This is the picture that was read for text and compared. Untick for the colour originals."
-        )
-        self.ink_check.setChecked(True)
-        self.ink_check.setVisible(False)  # only in Scan vs Digital
-        self.ink_check.toggled.connect(self._on_ink_toggled)
-        row.addWidget(self.ink_check)
-        self.compared_area_check = QCheckBox("Show compared area only")
-        self.compared_area_check.setToolTip(
-            "Erase everything the comparison left out (white background) and outline what it covered. "
-            "Untick to see the whole page."
-        )
-        self.compared_area_check.setChecked(True)
-        self.compared_area_check.setVisible(False)  # only when part of the page was left out
-        self.compared_area_check.toggled.connect(self._on_compared_area_toggled)
-        row.addWidget(self.compared_area_check)
-
-        row.addSpacing(16)
         self.merge_button = QPushButton("Merge findings")
         self.merge_button.setCheckable(True)
         self.merge_button.setProperty("variant", "segment")
@@ -214,10 +212,8 @@ class ComparisonViewport(QWidget):
         self.merge_row.setVisible(False)
         self.merge_button.toggled.connect(self.set_merge_mode)
         self.undo_merge_button.clicked.connect(self.undoMergeRequested)
-        for widget in (self.merge_button,):
-            row.addWidget(widget)
+        top_flow.addWidget(self.merge_button)
 
-        row.addStretch(1)
         self.zoom_out_button = QPushButton("−")
         self.zoom_in_button = QPushButton("+")
         self.fit_button = QPushButton("Reset")
@@ -231,8 +227,49 @@ class ComparisonViewport(QWidget):
         self.zoom_in_button.clicked.connect(self.zoom_in)
         self.fit_button.clicked.connect(self.fit_to_view)
         for widget in (self.zoom_out_button, self.zoom_label, self.zoom_in_button, self.fit_button):
-            row.addWidget(widget)
-        return row
+            zoom.addWidget(widget)
+        top_flow.addWidget(zoom_group)
+
+        self.scroll_lock_check = QCheckBox("Scroll lock")
+        self.scroll_lock_check.setChecked(True)
+        self.scroll_lock_check.toggled.connect(self.set_scroll_lock)
+        bottom.addWidget(self.scroll_lock_check)
+        self.ink_check = QCheckBox("Black && white")
+        self.ink_check.setToolTip(
+            "Show each file as ink on paper: background colours removed, everything printed in black. "
+            "This is the picture that was read for text and compared. Untick for the colour originals."
+        )
+        self.ink_check.setChecked(True)
+        self.ink_check.setVisible(False)  # only in Scan vs Digital
+        self.ink_check.toggled.connect(self._on_ink_toggled)
+        bottom.addWidget(self.ink_check)
+        self.compared_area_check = QCheckBox("Show compared area only")
+        self.compared_area_check.setToolTip(
+            "Erase everything the comparison left out (white background) and outline what it covered. "
+            "Untick to see the whole page."
+        )
+        self.compared_area_check.setChecked(True)
+        self.compared_area_check.setVisible(False)  # only when part of the page was left out
+        self.compared_area_check.toggled.connect(self._on_compared_area_toggled)
+        bottom.addWidget(self.compared_area_check)
+        self.block_outline_check = QCheckBox("Show panel outlines")
+        self.block_outline_check.setToolTip(
+            "Outline each panel a block-wise comparison found and aligned on its own, the way manually "
+            "cropping and aligning just that panel would."
+        )
+        self.block_outline_check.setChecked(True)
+        self.block_outline_check.setVisible(False)  # only when the artwork was split into blocks
+        self.block_outline_check.toggled.connect(self._on_block_outline_toggled)
+        bottom.addWidget(self.block_outline_check)
+        return rows
+
+    def _group(self) -> tuple[QWidget, QHBoxLayout]:
+        """Controls that belong together on one line, kept together when the toolbar wraps."""
+        group = QWidget(self)
+        row = QHBoxLayout(group)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        return group, row
 
     def _holder(self, caption: QLabel, pane: PaneView) -> QFrame:
         holder = QFrame(self)
@@ -287,10 +324,12 @@ class ComparisonViewport(QWidget):
         self._original_rgb, self._suspect_rgb = original, suspect
         self._stacks = {"original": ImageStack(original), "suspect": ImageStack(suspect)}
         # Zoomed-in tiles are re-rendered from a PDF's vector data; the ink pictures exist only as pixels.
-        original_source, suspect_source, transform = self._sources
+        original_source, suspect_source, transform, block_alignments = self._sources
         if self._showing_ink:
             original_source = suspect_source = transform = None
+            block_alignments = []
         self._original_artwork, self._suspect_artwork, self._alignment_transform = original_source, suspect_source, transform
+        self._block_alignments = block_alignments
         for pane in (self.original_pane, self.suspect_pane):
             pane.clear_detail()
         self._rebuild_for_mode()
@@ -311,18 +350,24 @@ class ComparisonViewport(QWidget):
         original: LoadedArtwork | None,
         suspect: LoadedArtwork | None,
         alignment_transform: np.ndarray | None,
+        block_alignments: BlockAlignments | None = None,
     ) -> None:
         """Give the viewer the files themselves, so zoomed-in views can be re-rendered.
 
         Without these (or for image files, which have no vector data) the
-        viewer still works: it falls back to resampling the 300 DPI pair.
+        viewer still works: it falls back to resampling the 300 DPI pair. `block_alignments`, if given, lets a
+        zoomed-in vector re-render of the suspect use each locally-aligned panel's own correction, the way the
+        non-zoomed views already do (`ComparisonOutcome.block_alignments`).
         """
-        self._sources = (original, suspect, alignment_transform)
+        block_alignments = block_alignments or []
+        self._sources = (original, suspect, alignment_transform, block_alignments)
         if self._showing_ink:
             original = suspect = alignment_transform = None
+            block_alignments = []
         self._original_artwork = original
         self._suspect_artwork = suspect
         self._alignment_transform = alignment_transform
+        self._block_alignments = block_alignments
         self._schedule_detail()
 
     def release_sources(self) -> None:
@@ -330,10 +375,11 @@ class ComparisonViewport(QWidget):
         # Set the fields directly: going through `set_sources` would schedule
         # a render, which is exactly what releasing is meant to prevent.
         self._detail_timer.stop()
-        self._sources = (None, None, None)
+        self._sources = (None, None, None, [])
         self._original_artwork = None
         self._suspect_artwork = None
         self._alignment_transform = None
+        self._block_alignments = []
         for pane in (self.original_pane, self.suspect_pane):
             pane.clear_detail()
 
@@ -387,17 +433,14 @@ class ComparisonViewport(QWidget):
         if not self.has_images:
             return
 
-        for key in ("overlay", "gray0", "gray1"):
+        for key in ("overlay", "gray0", "gray1", "flicker0", "flicker1"):
             self._stacks.pop(key, None)  # composites are rebuilt per mode
 
         if self._mode is ViewMode.SIDE_BY_SIDE:
             self.original_pane.set_stacks({"original": self._stacks["original"]})
             self.suspect_pane.set_stacks({"suspect": self._stacks["suspect"]})
         elif self._mode is ViewMode.FLICKER:
-            self.original_pane.set_stacks(
-                {"original": self._stacks["original"], "suspect": self._stacks["suspect"]}
-            )
-            self.original_pane.show_stack("original")
+            self._build_flicker_stacks()
         elif self._mode is ViewMode.OVERLAY:
             self._stacks["overlay"] = ImageStack(
                 compose_overlay(self._original_rgb, self._suspect_rgb)
@@ -407,6 +450,17 @@ class ComparisonViewport(QWidget):
             self._build_grayscale_stacks()
 
         self._refresh_markers()
+
+    def _build_flicker_stacks(self) -> None:
+        boxes = [cluster.bbox_in_original for cluster in self._marker_clusters]
+        for phase in (0, 1):
+            self._stacks[f"flicker{phase}"] = ImageStack(
+                compose_flicker(self._original_rgb, self._suspect_rgb, boxes, phase)
+            )
+        self.original_pane.set_stacks(
+            {"flicker0": self._stacks["flicker0"], "flicker1": self._stacks["flicker1"]}
+        )
+        self.original_pane.show_stack(f"flicker{self._phase}")
 
     def _build_grayscale_stacks(self) -> None:
         boxes = [cluster.bbox_in_original for cluster in self._marker_clusters]
@@ -422,7 +476,7 @@ class ComparisonViewport(QWidget):
     def _on_tick(self) -> None:
         self._phase ^= 1
         if self._mode is ViewMode.FLICKER:
-            self.original_pane.show_stack("original" if self._phase == 0 else "suspect")
+            self.original_pane.show_stack(f"flicker{self._phase}")
         elif self._mode is ViewMode.GRAYSCALE:
             self.original_pane.show_stack(f"gray{self._phase}")
 
@@ -477,8 +531,11 @@ class ComparisonViewport(QWidget):
     def set_marker_clusters(self, clusters: list[DiffCluster]) -> None:
         """The findings to draw (the caller filters out ignored/hidden ones)."""
         self._marker_clusters = list(clusters)
-        if self._mode is ViewMode.GRAYSCALE and self.has_images:
-            self._build_grayscale_stacks()  # the coloured regions follow the findings
+        if self.has_images:
+            if self._mode is ViewMode.FLICKER:
+                self._build_flicker_stacks()  # the flickering regions follow the findings
+            elif self._mode is ViewMode.GRAYSCALE:
+                self._build_grayscale_stacks()  # the coloured regions follow the findings
         self._refresh_markers()
         self._schedule_detail()
 
@@ -492,6 +549,18 @@ class ComparisonViewport(QWidget):
     def _on_compared_area_toggled(self, checked: bool) -> None:
         for pane in (self.original_pane, self.suspect_pane):
             pane.show_compared_area(checked)
+
+    def set_block_outlines(self, polygons: list[list[tuple[float, float]]] | None) -> None:
+        """Outline each panel a block-wise comparison found (None: the artwork was not split into blocks) --
+        the same shared aligned space both panes already draw from (FR-7.4), so one set of polygons fits both."""
+        self.block_outline_check.setVisible(bool(polygons))
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_block_outlines(polygons)
+            pane.show_block_outlines(self.block_outline_check.isChecked())
+
+    def _on_block_outline_toggled(self, checked: bool) -> None:
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.show_block_outlines(checked)
 
     def set_selected(self, cluster_id: int | None) -> None:
         self._selected_id = cluster_id
@@ -508,8 +577,20 @@ class ComparisonViewport(QWidget):
 
     def focus_cluster(self, cluster: DiffCluster) -> None:
         """Select a finding and bring it into view in every visible pane."""
+        self.clear_highlight()
         self.set_selected(cluster.id)
         self.focus_box(cluster.bbox_in_original)
+
+    def highlight_box(self, box: BoundingBox | None) -> None:
+        """Bring a region chosen in a results panel (a decoded symbol, the Braille) into view, and mark it in every pane."""
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_highlight(box)
+        if box is not None:
+            self.focus_box(box)
+
+    def clear_highlight(self) -> None:
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_highlight(None)
 
     def focus_box(self, box: BoundingBox) -> None:
         """Bring a region (a finding, a decoded symbol) into view in every visible pane."""
@@ -533,13 +614,19 @@ class ComparisonViewport(QWidget):
     def zoom_percent(self) -> int:
         return round(self._zoom * 100)
 
+    def _lowest_zoom(self) -> float:
+        """Zooming out stops at MIN_ZOOM, or at whatever shows the whole document if that is smaller."""
+        return min(MIN_ZOOM, getattr(self, "_fit_zoom", MIN_ZOOM))
+
     def set_zoom(self, zoom: float, from_fit: bool = False, anchor: QPointF | None = None) -> None:
         """Zoom both panes together, and show the resulting percentage.
 
         `anchor` is a position in a pane's viewport that stays put (a pinch's
         centre, the cursor); both panes are the same size, so it applies to both.
         """
-        self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, zoom))
+        if from_fit:
+            self._fit_zoom = zoom  # a very large document (a whole leaflet) fits only below MIN_ZOOM: it may go that far
+        self._zoom = max(self._lowest_zoom(), min(MAX_ZOOM, zoom))
         if not from_fit:
             self._fit_mode = False
         if anchor is None:
@@ -560,7 +647,7 @@ class ComparisonViewport(QWidget):
                 self._sync_scroll(self.suspect_pane.verticalScrollBar(), self.original_pane.verticalScrollBar().value())
         self.zoom_label.setText(f"{self.zoom_percent}%")
         self.zoom_in_button.setEnabled(self._zoom < MAX_ZOOM)
-        self.zoom_out_button.setEnabled(self._zoom > MIN_ZOOM)
+        self.zoom_out_button.setEnabled(self._zoom > self._lowest_zoom() + 1e-9)
         self.zoomChanged.emit(self._zoom)
         self._schedule_detail()
 
@@ -651,9 +738,15 @@ class ComparisonViewport(QWidget):
 
     def _suspect_tile(self, rect: TileRect) -> np.ndarray:
         if is_vector(self._suspect_artwork) and self._alignment_transform is not None:
-            return render_aligned_vector_tile(
-                self._suspect_artwork, self._alignment_transform, self._zoom, rect
-            )
+            base = render_aligned_vector_tile(self._suspect_artwork, self._alignment_transform, self._zoom, rect)
+            for polygon, transform in self._block_alignments:
+                xs, ys = [p[0] * self._zoom for p in polygon], [p[1] * self._zoom for p in polygon]
+                if max(xs) < rect.x or min(xs) > rect.x + rect.width or max(ys) < rect.y or min(ys) > rect.y + rect.height:
+                    continue  # this block does not touch the visible tile at all
+                block_tile = render_aligned_vector_tile(self._suspect_artwork, transform, self._zoom, rect)
+                alpha = feathered_alpha((rect.height, rect.width), polygon, scale=self._zoom, shift=(rect.x, rect.y))
+                base = (alpha[..., None] * block_tile + (1.0 - alpha[..., None]) * base).astype(np.uint8)
+            return base
         return render_raster_tile(self._suspect_rgb, self._zoom, rect)
 
     def _tiles_for(self, pane: PaneView, rect: TileRect) -> dict[str, np.ndarray]:
@@ -664,8 +757,6 @@ class ComparisonViewport(QWidget):
             return {"suspect": self._suspect_tile(rect)}
 
         original, suspect = self._original_tile(rect), self._suspect_tile(rect)
-        if self._mode is ViewMode.FLICKER:
-            return {"original": original, "suspect": suspect}
         if self._mode is ViewMode.OVERLAY:
             return {"overlay": compose_overlay(original, suspect)}
 
@@ -676,6 +767,8 @@ class ComparisonViewport(QWidget):
             )
             for b in (cluster.bbox_in_original for cluster in self._marker_clusters)
         ]
+        if self._mode is ViewMode.FLICKER:
+            return {f"flicker{phase}": compose_flicker(original, suspect, boxes, phase) for phase in (0, 1)}
         return {f"gray{phase}": compose_grayscale(original, suspect, boxes, phase) for phase in (0, 1)}
 
     # -- scroll lock (FR-8.5) --------------------------------------------------

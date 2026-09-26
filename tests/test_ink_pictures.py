@@ -143,6 +143,21 @@ def test_white_lettering_on_a_dark_block_stays_visible_as_white_on_black():
     assert 0.08 < (letters > 235).mean() < 0.6  # and the letters read as white holes in it
 
 
+def test_a_neutral_grey_backdrop_stays_white_not_a_false_solid_block():
+    """A photograph's own backdrop (a scan bed, a desk) is often a moderately dark, colourless grey -- unlike a
+    printed reversed panel, which is always some definite ink colour. At the same darkness a colourless
+    region must not cross into 'solid' the way a genuinely coloured one still correctly does."""
+    page = _page()
+    cv2.rectangle(page, (100, 100), (900, 600), (110, 110, 110), -1)  # a neutral grey backdrop
+    ink = ink_image(page, CONFIG)
+    assert (ink[120:580, 120:880] >= 200).mean() > 0.99  # stays background, not a false solid black block
+
+    coloured = _page()
+    cv2.rectangle(coloured, (100, 100), (900, 600), (140, 120, 100), -1)  # a real (if muted) ink colour, same darkness
+    ink_coloured = ink_image(coloured, CONFIG)
+    assert (ink_coloured[120:580, 120:880] < 60).mean() > 0.99  # still correctly solid
+
+
 def test_a_solid_dark_graphic_is_kept_black_not_reduced_to_its_outline():
     page = _page()
     cv2.rectangle(page, (200, 150), (800, 550), (20, 20, 20), -1)
@@ -292,7 +307,30 @@ def test_a_scans_graphics_are_not_compared_unless_asked_for():
     cv2.rectangle(changed, (150, 350), (450, 500), (226, 238, 246), -1)
     cv2.rectangle(changed, (300, 420), (600, 570), (200, 60, 50), -1)
     scan = simulate_scan(changed, LIGHT)
-    assert run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig()).clusters == []
+    outcome = run_comparison(original, scan, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    assert outcome.clusters == []
+    # It was still found, just not shown: ticking the results page's checkbox back on is instant, nothing
+    # recompared (`app.models.diff.visible_clusters`).
+    assert any(c.type is DiffType.GRAPHICS for c in outcome.all_clusters)
+
+
+def test_the_graphics_and_text_checkboxes_filter_findings_already_found_not_a_new_comparison(monkeypatch):
+    """Both are always compared in Scan vs Digital; the results page's checkboxes decide what is shown, by
+    filtering `all_clusters` (a results-page toggle applies this same filter itself, with no new comparison)."""
+    fake_text = DiffCandidate(BoundingBox(50, 50, 150, 90), DiffType.TEXT, DiffSubtype.CHANGED, 0.9, "text changed")
+    monkeypatch.setattr(text_diff, "detect_scan", lambda *a, **k: text_diff.TextScanResult([fake_text]))
+
+    original = _label()
+    changed = _label()
+    cv2.rectangle(changed, (150, 350), (450, 500), (226, 238, 246), -1)
+    cv2.rectangle(changed, (300, 420), (600, 570), (200, 60, 50), -1)  # a real graphics change
+
+    outcome = run_comparison(original, changed, ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+
+    assert any(c.type is DiffType.TEXT for c in outcome.all_clusters)
+    assert any(c.type is DiffType.GRAPHICS for c in outcome.all_clusters)
+    assert any(c.type is DiffType.TEXT for c in outcome.clusters)  # text shown by default
+    assert not any(c.type is DiffType.GRAPHICS for c in outcome.clusters)  # graphics hidden by default
 
 
 # ---- barcodes: compared as marks, never decoded ---------------------------------------------------------------------------------

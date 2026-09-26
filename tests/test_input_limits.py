@@ -37,8 +37,12 @@ def test_the_default_limits_turn_nothing_away():
     assert limits.max_file_size_mb == 0 and limits.max_pdf_pages == 0  # (0 = no limit)
 
 
-def test_a_huge_page_loads_and_is_rendered_at_the_dpi_that_fits(tmp_path):
-    """A 2.2 m x 1.1 m shipper is 332 megapixels at 300 DPI, which used to be refused."""
+def test_a_huge_page_loads_and_is_rendered_at_the_dpi_that_fits(tmp_path, monkeypatch):
+    """A 2.2 m x 1.1 m shipper is 332 megapixels at 300 DPI, which used to be refused. (On a machine with plenty of
+    memory: how much is free also lowers the budget -- see `test_file_loader`.)"""
+    from app.engine import file_loader
+
+    monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (64 * 2**30, 48 * 2**30))
     path = _pdf(tmp_path / "shipper.pdf", size=(6200, 3080))  # points: 2187 x 1087 mm
     with load_artwork(path, RuntimeConfig(max_render_megapixels=100)) as artwork:
         dpi = artwork.working_dpi()

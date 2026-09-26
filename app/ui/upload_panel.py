@@ -25,6 +25,7 @@ from app.engine.isolation.cutout import Cutout
 from app.models.isolation import IsolationGeometry
 from app.models.job import ComparisonMode
 from app.ui.isolation_dialog import IsolationDialog, SubjectReference
+from app.ui.page_picker import PagePicker
 from app.ui.theme import set_variant
 
 _FILE_DIALOG_FILTER = "Artwork files (*" + " *".join(sorted(SUPPORTED_EXTENSIONS)) + ")"
@@ -71,6 +72,11 @@ class UploadSlot(QWidget):
         self.isolate_button.setEnabled(False)
         button_row.addWidget(self.browse_button)
         button_row.addWidget(self.isolate_button)
+        # Leaflet mode: which of a multi-page file's pages to compare (the original's slot only).
+        self.pages_picker = PagePicker()
+        self.pages_picker.setVisible(False)
+        self.pages_picker.pagesChanged.connect(lambda _spec: self._refresh_status() if self.loaded is not None else None)
+        button_row.addWidget(self.pages_picker)
         button_row.addStretch(1)
         outer.addLayout(button_row)
 
@@ -96,10 +102,22 @@ class UploadSlot(QWidget):
         self.mode_hint_label.setVisible(bool(text))
 
     def set_mode(self, mode: ComparisonMode) -> None:
-        """Only the status line's wording changes (e.g. Leaflet mode compares every page, not just the first)."""
+        """The status line's wording changes (e.g. Leaflet mode compares every page, not just the first), and in Leaflet
+        mode the original's slot offers its pages to choose from."""
         self.mode = mode
         if self.loaded is not None:
             self._refresh_status()
+        self._sync_pages_picker()
+
+    def _sync_pages_picker(self) -> None:
+        self.pages_picker.setVisible(
+            self.mode is ComparisonMode.LEAFLET and self.title == "Original" and self.loaded is not None and self.loaded.page_count > 1
+        )
+
+    @property
+    def pages_to_compare(self) -> str:
+        """The page choice for a Leaflet comparison ("" = every page)."""
+        return self.pages_picker.spec() if self.pages_picker.isVisibleTo(self) else ""
 
     def _on_browse(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(
@@ -121,10 +139,20 @@ class UploadSlot(QWidget):
         self.geometry = None
         self.cutout = None
         self.isolate_button.setEnabled(True)
+        self.pages_picker.set_page_count(artwork.page_count)
+        self._sync_pages_picker()
         set_variant(self.status_pill, "pill", "loaded")
         self.status_pill.setText("Loaded")
         self._refresh_status()
         self.changed.emit()
+
+    def edit_artwork_area(self) -> bool:
+        """Open the Edit Artwork Area dialog, as the button does; returns whether it was accepted (a caller
+        elsewhere, e.g. the results page, needs to know whether to act on a change -- `geometry` is only ever
+        replaced with a new object on Accept, never touched on Cancel, so identity says which happened)."""
+        before = self.geometry
+        self._on_edit_artwork_area()
+        return self.geometry is not before
 
     def _on_edit_artwork_area(self) -> None:
         assert self.loaded is not None
@@ -154,7 +182,11 @@ class UploadSlot(QWidget):
         if self.loaded.kind == "pdf":
             pages = f", {self.loaded.page_count} page(s)"
             if self.loaded.page_count > 1:
-                pages += " \u2014 every page is compared" if self.mode is ComparisonMode.LEAFLET else " \u2014 only page 1 is compared"
+                if self.mode is ComparisonMode.LEAFLET:
+                    chosen = self.pages_to_compare
+                    pages += f" \u2014 page(s) {chosen} compared" if chosen else " \u2014 every page is compared"
+                else:
+                    pages += " \u2014 only page 1 is compared"
         geometry_note = ""
         if self.geometry is not None and self.geometry.boundary is not None:
             origin = self.geometry.boundary_origin
@@ -215,9 +247,12 @@ class UploadPanel(QGroupBox):
         divider.setFrameShape(QFrame.Shape.HLine)
         divider.setStyleSheet("color: #e3e5ea;")
 
+        # Each file has its half of the panel (when the mode panel beside it makes it tall), not both bunched at the top.
         layout.addWidget(self.original_slot)
+        layout.addStretch(1)
         layout.addWidget(divider)
         layout.addWidget(self.suspect_slot)
+        layout.addStretch(1)
 
         self.original_slot.changed.connect(self.filesChanged)
         self.suspect_slot.changed.connect(self.filesChanged)

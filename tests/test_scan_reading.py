@@ -9,8 +9,11 @@ from its digital file is compared where it actually is.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cv2
 import numpy as np
+import pytesseract
 import pytest
 
 from app.config import DetectionConfig
@@ -24,15 +27,25 @@ from app.engine.detectors.text_diff import (
     _marked_if_misread,
     _stroked,
     _unmatched,
+    detect_scan,
     ink_agreement,
     read_pages,
     read_windows,
     reading_picture,
 )
 from app.engine.detectors.text_diff import LIKELY_MISREAD_CONFIDENCE
+from app.engine.ocr_locator import find_tesseract
+from app.engine.preprocessing.scan_normalizer import ink_image
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
+
+tesseract_required = pytest.mark.skipif(find_tesseract() is None, reason="Tesseract OCR binary is not installed")
+
+
+@pytest.fixture
+def real_ocr(monkeypatch):
+    monkeypatch.setattr(pytesseract.pytesseract, "tesseract_cmd", str(find_tesseract()))
 
 
 def _word(text, x, y=100, confidence=90.0, width=None, height=30) -> OcrWord:
@@ -126,6 +139,102 @@ def test_strips_are_read_side_by_side_and_their_words_put_back_in_page_coordinat
     assert len({line for line, _word in first}) == len(first)  # every strip's line is its own
 
 
+# ---- a residual tilt is levelled before the whole page is read, then turned back (`preprocessing.deskew`) --------------------
+
+
+def _dense_tilted_page(angle: float, rows: int = 60, width: int = 1600, height: int = 1600) -> np.ndarray:
+    """Many tightly-packed, near-identical lines (a repeated batch/expiry stamp, worst case for line segmentation)
+    turned by `angle` about its own centre -- as a reading picture (255 = paper, dark = ink)."""
+    page = np.full((height, width, 3), 255, np.uint8)
+    spacing = (height - 160) // rows
+    for row in range(rows):
+        cv2.putText(
+            page, f"BATCH 2109{row:04d} EXP 2027-06 MNB/05/109 Mfd by CIPLA reach protect moisture", (60, 80 + row * spacing),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA,
+        )
+    grey = cv2.cvtColor(page, cv2.COLOR_RGB2GRAY)
+    if angle:
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+        grey = cv2.warpAffine(grey, matrix, (width, height), flags=cv2.INTER_LINEAR, borderValue=255)
+    return grey
+
+
+@tesseract_required
+def test_a_severely_tilted_dense_page_still_reads_every_line_once_levelled(real_ocr):
+    """Left as it is, a residual tilt on packed, near-identical lines makes Tesseract's OWN line segmentation lose
+    its footing (lines merge or drop words); levelled first, it reads the page cleanly."""
+    tilted = _dense_tilted_page(6.0)
+
+    (untouched,) = read_pages([tilted], CONFIG.ocr_min_confidence, CONFIG.ocr_language)
+    lines_untouched = {line for line, _word in untouched}
+
+    from app.engine.preprocessing import deskew
+
+    level = deskew.measured(tilted, CONFIG)
+    (raw,) = read_pages([level.picture(tilted)], CONFIG.ocr_min_confidence, CONFIG.ocr_language)
+    levelled = [(line, OcrWord(word.text, level.unrotate_box(word.bbox), word.confidence)) for line, word in raw]
+    lines_levelled = {line for line, _word in levelled}
+
+    assert len(lines_levelled) == 60  # every one of the 60 lines is its own, not merged with a neighbour
+    assert len(lines_levelled) > len(lines_untouched)
+    assert len(levelled) > len(untouched)  # words lost to a merged/broken line are recovered
+
+
+@tesseract_required
+def test_deskewing_does_not_change_a_reading_that_was_already_level(real_ocr):
+    """The common case -- a scan already close enough to square -- must not be perturbed by this at all."""
+    level_page = _dense_tilted_page(0.0)
+
+    (with_deskew,) = read_pages([level_page], CONFIG.ocr_min_confidence, CONFIG.ocr_language)
+
+    from app.engine.preprocessing import deskew
+
+    level = deskew.measured(level_page, CONFIG)
+    assert level.is_identity  # nothing measured worth correcting
+    (without_deskew,) = read_pages([level.picture(level_page)], CONFIG.ocr_min_confidence, CONFIG.ocr_language)
+
+    assert len(with_deskew) == len(without_deskew)  # identity: reading it again changes nothing
+
+
+_VARIED_WORDS = (
+    "Each", "capsule", "contains", "Indacaterol", "Glycopyrronium", "Store", "below", "protect", "from",
+    "moisture", "Keep", "out", "reach", "children", "Mfd", "CIPLA", "Batch", "Expiry", "Rx", "only",
+    "inhalation", "powder", "dosage", "physician", "not", "swallow", "MNB", "109", "2027", "500", "mcg",
+)
+
+
+def _varied_page(rows: int = 40, seed: int = 4) -> np.ndarray:
+    """Rows of GENUINELY different small print (not one template with a digit changed): the ordinary case, as
+    opposed to `_dense_tilted_page`'s worst-case repetition, which stresses word MATCHING as much as reading."""
+    rng = np.random.default_rng(seed)
+    page = np.full((1600, 1600, 3), 255, np.uint8)
+    for row in range(rows):
+        words = " ".join(rng.choice(_VARIED_WORDS, size=int(rng.integers(6, 11))))
+        cv2.putText(page, words, (60, 80 + row * 36), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2, cv2.LINE_AA)
+    return page
+
+
+@tesseract_required
+def test_detect_scan_reports_fewer_shown_findings_on_a_tilted_scan_once_levelled(real_ocr):
+    """End to end, on the same tilted scan: levelling it before the whole page is read leaves fewer findings shown
+    by default than reading it as it is, since fewer real lines are lost to a segmentation failure the levelling
+    avoids (what is left over from a genuinely poorer reading is ranked down and hidden by default either way --
+    `_marked_if_misread` -- so this compares what stays SHOWN, which is what the reviewer actually sees)."""
+    digital_rgb = _varied_page()
+    matrix = cv2.getRotationMatrix2D((800, 800), 2.0, 1.0)
+    scan_rgb = cv2.warpAffine(digital_rgb, matrix, (1600, 1600), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+    digital_ink, scan_ink = ink_image(digital_rgb, CONFIG), ink_image(scan_rgb, CONFIG)
+
+    from dataclasses import replace
+
+    levelled = detect_scan(digital_ink, scan_ink, replace(CONFIG, deskew_enabled=True))
+    as_is = detect_scan(digital_ink, scan_ink, replace(CONFIG, deskew_enabled=False))
+    shown_levelled = sum(1 for c in levelled.candidates if not c.uncertain)
+    shown_as_is = sum(1 for c in as_is.candidates if not c.uncertain)
+
+    assert shown_levelled <= shown_as_is
+
+
 # ---- words are matched by what they say and where they are ----------------------------------------------------------------------------
 
 
@@ -207,8 +316,15 @@ def test_the_same_word_in_fatter_strokes_still_agrees():
 
 
 def test_a_shaky_reading_of_the_digital_file_beside_a_sure_one_of_the_scan_is_a_likely_misread():
-    (found,) = _findings([_word("Cilnidip", 100, confidence=67.0)], [_word("Cilnidipine", 100, confidence=87.0)])
+    (found,) = _findings([_word("Cilnidipene", 100, confidence=67.0)], [_word("Cilnidipine", 100, confidence=87.0)])
     assert found.confidence == LIKELY_MISREAD_CONFIDENCE and "likely a misread" in found.detail
+
+
+def test_a_word_cut_short_in_the_digital_file_is_a_change_however_shakily_it_was_read():
+    """'Cilnidip' for 'Cilnidipine' is the digital file really ending the word there (the reported Met XL change): a
+    reader misreads letters, it does not drop the end of a word it can see."""
+    (found,) = _findings([_word("Cilnidip", 100, confidence=67.0)], [_word("Cilnidipine", 100, confidence=87.0)])
+    assert found.confidence > LIKELY_MISREAD_CONFIDENCE and "likely a misread" not in found.detail
 
 
 def test_a_surely_read_digital_word_that_the_scan_reads_differently_is_still_a_change():
@@ -250,30 +366,26 @@ def test_any_reading_of_a_line_that_agrees_makes_it_no_difference():
     assert _fewest_differences(real, scan) != []
 
 
-# ---- windows are read together --------------------------------------------------------------------------------------------------------------------
+# ---- windows are read together, each on its own ------------------------------------------------------------------------------------------------
 
 
-def test_the_windows_of_several_lines_are_read_in_one_call_and_their_words_go_back_to_their_own_line(monkeypatch):
-    seen = []
+def test_each_window_is_read_on_its_own_in_one_batch_and_its_words_go_back_to_their_own_line(monkeypatch):
+    """Each line's window is its own picture (how one line reads must not depend on which others are read with it),
+    all of them handed to the reader in one batch; each word goes back to its own line of the page."""
+    batches = []
 
-    def fake(image, page_segmentation=None, lang=None):
-        seen.append(image.shape)
-        # one word in the middle of each stacked window: find the windows by their (dark) marks
-        rows = np.flatnonzero((image < 128).any(axis=1))
-        bands = np.split(rows, np.flatnonzero(np.diff(rows) > 5) + 1)
-        return {
-            "text": [f"line{i}" for i in range(len(bands))],
-            "conf": [90] * len(bands),
-            "left": [10] * len(bands),
-            "top": [int(band[0]) for band in bands],
-            "width": [60] * len(bands),
-            "height": [int(band[-1] - band[0] + 1) for band in bands],
-            "block_num": [1] * len(bands),
-            "par_num": [1] * len(bands),
-            "line_num": list(range(1, len(bands) + 1)),
-        }
+    def fake(pictures, page_segmentation=None, lang=None):
+        batches.append(len(pictures))
+        found = []
+        for number, image in enumerate(pictures):
+            rows = np.flatnonzero((image < 128).any(axis=1))
+            found.append({
+                "text": [f"line{number}"], "conf": [90], "left": [30], "top": [int(rows[0])], "width": [60],
+                "height": [int(rows[-1] - rows[0] + 1)], "block_num": [1], "par_num": [1], "line_num": [1],
+            })
+        return found
 
-    monkeypatch.setattr(text_diff, "_ocr_data", fake)
+    monkeypatch.setattr(text_diff, "_ocr_many", fake)
     picture = _ink(600, 800)
     for y in (100, 250, 400):
         picture[y : y + 30, 60:200] = 0
@@ -281,6 +393,15 @@ def test_the_windows_of_several_lines_are_read_in_one_call_and_their_words_go_ba
 
     readings = read_windows(picture, boxes, CONFIG)
 
-    assert len(seen) == 1  # one call for all three lines
+    assert batches == [3]  # one batch of three pictures, not one stacked picture
     assert [words[0].text for words in readings] == ["line0", "line1", "line2"]
     assert [round(words[0].bbox.y0 / 50) for words in readings] == [2, 5, 8]  # each is at its own line of the page
+
+
+def test_a_lone_number_is_compared_but_a_lone_speck_is_not():
+    """A line of one short word is usually a speck read as letters -- but '10' of '10 g', whose unit was read too
+    unsurely to count, is a quantity, and a change to it ('10 g' -> '100 g') must be found."""
+    from app.engine.detectors.text_diff import _lone_number
+
+    assert _lone_number("10") and _lone_number("500") and _lone_number("24.")
+    assert not _lone_number("5") and not _lone_number("ab") and not _lone_number("B2")

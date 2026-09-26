@@ -91,7 +91,10 @@ def decode(thick: list[bool]) -> int:
 def _dark_mask(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     background = local_background(gray, _BACKGROUND_WINDOW_PX)
-    return (gray < np.minimum(_DARK_LEVEL, background * 0.5)).astype(np.uint8)
+    # "darker than half the background", in whole numbers (gray < bg / 2 is gray < ceil(bg / 2)): kept in 8 bits,
+    # where `background * 0.5` made a float64 copy of the page (763 MB on a 2 m shipper)
+    half = (background >> 1) + (background & 1)
+    return (gray < np.minimum(np.uint8(_DARK_LEVEL), half)).astype(np.uint8)
 
 
 def _bar_candidates(dark: np.ndarray, config: DetectionConfig, along_y: bool) -> np.ndarray:

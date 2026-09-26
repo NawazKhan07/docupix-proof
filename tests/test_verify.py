@@ -275,7 +275,7 @@ def test_a_finding_over_a_blank_crop_reads_nothing_and_a_panel_is_not_read_at_al
     blank = np.full((300, 300, 3), 255, np.uint8)
 
     assert text_diff.describe([BoundingBox(0, 0, 300, 300)], blank, blank.copy(), CONFIG) == [None]
-    assert len(calls) == 2 * len(text_diff._DESCRIBE_WINDOWS)  # each window is read in both files
+    assert calls == []  # nothing printed in either file's window: there is nothing to read
 
     calls.clear()
     assert text_diff.describe([BoundingBox(0, 0, 3000, 3000)], blank, blank.copy(), CONFIG) == [None]

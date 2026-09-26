@@ -43,6 +43,16 @@ def test_clicking_a_marker_selects_its_finding_in_the_list(results, outcome):
     assert results.viewport._selected_id == target.id
 
 
+def test_choosing_the_selected_finding_again_deselects_it_in_both(results, outcome):
+    target = outcome.clusters[-1]
+    results.panel._on_card_selected(target.id)
+
+    results.panel._on_card_selected(target.id)  # click it again
+
+    assert results.panel._selected_id is None
+    assert results.viewport._selected_id is None
+
+
 def test_ignoring_a_finding_removes_its_marker_from_every_pane(results, outcome):
     """FR-7.5 with FR-7.4: a dismissed finding disappears from both views."""
     target = outcome.clusters[0]
