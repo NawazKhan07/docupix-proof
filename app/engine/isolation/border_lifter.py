@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import math
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -45,12 +44,12 @@ import numpy as np
 
 from app.config import SubjectConfig
 from app.engine.isolation.mask_ops import disc_kernel, fill_holes
+from app.engine.isolation.pdf_paths import stroked_paths
 
 logger = logging.getLogger(__name__)
 
 Point = tuple[float, float]
 
-_PDF_LOCK = threading.Lock()
 _BRIDGES_PX = (0, 1, 2, 3, 5)  # wall thickening tried, in working pixels
 _GROWTH_TO_KEEP_GOING = 1.08  # a thicker wall must seal in this much more area to be preferred
 _MAX_DRAWINGS = 300_000  # a page with more vector paths than this is not scanned for lines
@@ -123,9 +122,8 @@ def vector_walls(page, dpi: float, size: tuple[int, int], scale: float) -> np.nd
     Only strokes count: a filled swatch is not a line, and text is not a path. A page
     that has no visible strokes gives None.
     """
-    with _PDF_LOCK:  # the PDF library is not safe to call from two threads at once (the two files are lifted side by side)
-        drawings = page.get_drawings()
-    if not drawings or len(drawings) > _MAX_DRAWINGS:
+    total, drawings = stroked_paths(page)  # (under the PDF library's lock: the two files are lifted side by side)
+    if not drawings or total > _MAX_DRAWINGS:
         return None
     to_pixels = dpi / 72.0 * scale
     canvas = np.zeros((size[1], size[0]), np.uint8)

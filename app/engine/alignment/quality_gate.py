@@ -59,6 +59,34 @@ def rejection_reason(
     return None
 
 
+def distortion(transform: np.ndarray, points: np.ndarray) -> tuple[float, float, float]:
+    """How a fit bends the artwork over the area its matched `points` (in the frame it maps from) span: (the ratio of
+    its largest to its smallest local scale there, its largest stretch -- scale along one way over the other -- and its
+    largest shear, as the cosine between where two square directions go). A flat print, rendered, scanned or
+    photographed square on, is turned and scaled the same all over: (1, 1, 0), give or take a little."""
+    points = np.asarray(points, np.float64).reshape(-1, 2)
+    if len(points) < 3:
+        return 1.0, 1.0, 0.0
+    h = np.asarray(transform, np.float64)
+    (x0, y0), (x1, y1) = points.min(axis=0), points.max(axis=0)
+    scales, stretches, shears = [], [], []
+    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1), ((x0 + x1) / 2, (y0 + y1) / 2)):
+        w = h[2, 0] * x + h[2, 1] * y + h[2, 2]
+        u = h[0, 0] * x + h[0, 1] * y + h[0, 2]
+        v = h[1, 0] * x + h[1, 1] * y + h[1, 2]
+        local = np.array(
+            [[h[0, 0] * w - u * h[2, 0], h[0, 1] * w - u * h[2, 1]], [h[1, 0] * w - v * h[2, 0], h[1, 1] * w - v * h[2, 1]]]
+        ) / (w * w)
+        singular = np.linalg.svd(local, compute_uv=False)
+        if singular[1] <= 0:
+            return float("inf"), float("inf"), 1.0
+        scales.append(float(np.sqrt(singular[0] * singular[1])))
+        stretches.append(float(singular[0] / singular[1]))
+        a, b = local[:, 0], local[:, 1]
+        shears.append(abs(float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))))
+    return max(scales) / min(scales), max(stretches), max(shears)
+
+
 def is_low_confidence(residual_px: float, config: AlignmentConfig) -> bool:
     """Whether this registration should be surfaced as low-confidence.
 

@@ -289,3 +289,28 @@ def test_the_real_worker_reports_a_missing_file_as_an_input_error_and_carries_on
         assert controller.worker_pid == first_worker
     finally:
         controller.shutdown()
+
+
+def test_a_result_sent_ahead_is_followed_by_its_rest_for_that_job(qapp, tmp_path):
+    """Automatic's pixel findings are sent as soon as they are made, its words after: the controller hands on the result,
+    then the update -- for that job -- and does not recycle the worker in between (that would lose the rest)."""
+    import time
+
+    from app.config import RuntimeConfig
+    from app.ui.job_controller import JobController
+
+    controller = JobController(RuntimeConfig(worker_recycle_after_jobs=1), target=fake_workers.ahead_main)
+    results, updates = [], []
+    controller.completed.connect(results.append)
+    controller.updated.connect(lambda job, outcome: updates.append((job, outcome)))
+    try:
+        job = controller.start(_request(tmp_path))
+        deadline = time.monotonic() + 20
+        while not updates:
+            assert time.monotonic() < deadline, "timed out"
+            qapp.processEvents()
+            time.sleep(0.01)
+    finally:
+        controller.shutdown()
+    assert results[0].label == "pixels" and controller.last_completed_job == job
+    assert updates == [(job, updates[0][1])] and updates[0][1].label == "whole"

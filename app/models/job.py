@@ -6,12 +6,9 @@ phase.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
 
-from app.models.isolation import IsolationGeometry
 
 
 class ComparisonMode(Enum):
@@ -115,18 +112,3 @@ def options_for_mode(mode: ComparisonMode) -> DetectorOptions:
     return _MODE_OPTIONS[mode]
 
 
-@dataclass
-class ComparisonJob:
-    """A single original-vs-suspect comparison request.
-
-    `original_geometry`/`suspect_geometry` are independent (FR-3.1: the user
-    selects the comparison area separately per file) and are None until the
-    user (or, from Phase 3, automatic dieline detection) resolves one.
-    """
-
-    original_path: Path
-    suspect_path: Path
-    mode: ComparisonMode = ComparisonMode.AUTOMATIC
-    original_geometry: Optional[IsolationGeometry] = None
-    suspect_geometry: Optional[IsolationGeometry] = None
-    options: dict[str, Any] = field(default_factory=dict)

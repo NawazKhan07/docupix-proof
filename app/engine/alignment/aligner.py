@@ -149,7 +149,7 @@ def _refine_with_features(
     registration worse than the boundary fit it started from.
     """
     matches = match_features(suspect_image, original_image, config, suspect_mask, original_mask)
-    estimate = homography.estimate_homography(matches, config)
+    estimate = homography.estimate_homography(matches, config, whole_sheet=True, extent=_extent_corners(suspect_image, suspect_mask))
     if estimate is None:
         return None
 
@@ -171,6 +171,7 @@ def _refine_with_features(
         match_count=len(matches),
         inlier_count=int(inliers.sum()),
         config=config,
+        matched_points=dst,
     )
 
 
@@ -182,7 +183,7 @@ def _align_via_features(
     config: AlignmentConfig,
 ) -> AlignmentResult:
     matches = match_features(suspect_image, original_image, config, suspect_mask, original_mask)
-    estimate = homography.estimate_homography(matches, config)
+    estimate = homography.estimate_homography(matches, config, whole_sheet=True, extent=_extent_corners(suspect_image, suspect_mask))
     if estimate is None:
         raise AlignmentError(
             "Could not register these two files: too few matching features were found. "
@@ -198,6 +199,15 @@ def _align_via_features(
         )
 
     src, dst = matches.src_points[inliers], matches.dst_points[inliers]
+    spread, stretch, shear = quality_gate.distortion(transform, src)
+    sheet = quality_gate.distortion(transform, _extent_corners(suspect_image, suspect_mask))
+    logger.info(
+        "fit distortion",
+        extra={
+            "scale_spread": round(spread, 3), "stretch": round(stretch, 3), "shear": round(shear, 3),
+            "sheet_spread": round(sheet[0], 3), "sheet_stretch": round(sheet[1], 3), "sheet_shear": round(sheet[2], 3),
+        },
+    )
     return _build_result(
         transform=transform,
         residual_px=quality_gate.mean_residual_px(transform, src, dst),
@@ -206,7 +216,18 @@ def _align_via_features(
         match_count=len(matches),
         inlier_count=int(inliers.sum()),
         config=config,
+        matched_points=dst,
     )
+
+
+def _extent_corners(image: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    """The corners of what of `image` is compared (its mask's box, or the whole page), as points."""
+    height, width = image.shape[:2]
+    x0, y0, x1, y1 = 0, 0, width, height
+    if mask is not None and mask.any():
+        ys, xs = np.nonzero(mask)
+        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+    return np.array([[x0, y0], [x1, y0], [x0, y1], [x1, y1]], np.float64)
 
 
 def _build_result(
@@ -217,6 +238,7 @@ def _build_result(
     match_count: int,
     inlier_count: int,
     config: AlignmentConfig,
+    matched_points: np.ndarray | None = None,
 ) -> AlignmentResult:
     return AlignmentResult(
         transform=transform,
@@ -232,4 +254,5 @@ def _build_result(
         inlier_ratio=inlier_count / match_count if match_count else 0.0,
         low_confidence=quality_gate.is_low_confidence(residual_px, config),
         threshold_px=config.residual_threshold_px,
+        matched_points=None if matched_points is None else np.asarray(matched_points, np.float32).reshape(-1, 2),
     )

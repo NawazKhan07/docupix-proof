@@ -666,7 +666,51 @@ def align_blocks(
         wanted = sorted({index for nearest in nearest_of for index in nearest})
         counterparts = dict(zip(wanted, pool.map(counterpart_keypoints, wanted)))
         aligned = list(pool.map(lambda job: align_one(*job), zip(blocks, nearest_of)))
-    return [alignment for parts in aligned for alignment in parts]
+    results = [alignment for parts in aligned for alignment in parts]
+    return _neighbours_taken(results, original_gray, suspect_gray)
+
+
+_NEIGHBOUR_GAP_SHARE = 0.02  # blocks this close (a share of the larger's longer side) are neighbours
+
+
+def _neighbours_taken(
+    results: list[ArtworkBlockAlignment], original_gray: np.ndarray, suspect_gray: np.ndarray
+) -> list[ArtworkBlockAlignment]:
+    """A block that could not be aligned on its own (a flap, a strip above or below a panel, too plain to match by)
+    kept the whole sheet's transform; it is joined on to the panel it borders, and moves with it on the carton -- so the
+    transform of a neighbour that was aligned on its own is tried for it, and taken where it brings the block's pixels
+    clearly closer than the whole sheet's. (A whole-sheet transform of a re-laid proof is a compromise between panels
+    moved each their own way: it fits no strip well.)"""
+    own = [result for result in results if result.locally_aligned]
+    if not own:
+        return results
+    out = []
+    for result in results:
+        if result.locally_aligned:
+            out.append(result)
+            continue
+        neighbours = [other for other in own if _bordering(result.block.bbox, other.block.bbox)]
+        if not neighbours:
+            out.append(result)
+            continue
+        current = _window_difference(original_gray, suspect_gray, result.block, result.transform)
+        tried = [(_window_difference(original_gray, suspect_gray, result.block, other.transform), other) for other in neighbours]
+        difference, best = min(tried, key=lambda item: item[0])
+        if difference < _WINDOW_GAIN * current:
+            out.append(ArtworkBlockAlignment(result.block, best.transform, True))
+        else:
+            out.append(result)
+    return out
+
+
+def _bordering(a, b) -> bool:
+    """Whether two blocks' boxes touch (or nearly) along a side they share."""
+    gap = _NEIGHBOUR_GAP_SHARE * max(a.width, a.height, b.width, b.height)
+    overlap_x = min(a.x1, b.x1) - max(a.x0, b.x0)
+    overlap_y = min(a.y1, b.y1) - max(a.y0, b.y0)
+    beside = overlap_y > 0 and (abs(a.x1 - b.x0) <= gap or abs(b.x1 - a.x0) <= gap)
+    above = overlap_x > 0 and (abs(a.y1 - b.y0) <= gap or abs(b.y1 - a.y0) <= gap)
+    return beside or above
 
 
 def _phase_shift_transform(

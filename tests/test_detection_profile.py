@@ -97,6 +97,8 @@ def test_the_old_behaviour_was_fragmentary_which_is_why_the_profile_exists():
         region_max_area_fraction=0.0,
         graphics_when_misregistered="ssim",  # the similarity map, which is what erased thin print
         local_enabled=False,  # (the full-size local comparison came later, and sees the whole sentence too)
+        group_text_lines=False,  # (and so did grouping a line's pieces into one finding)
+        group_pictures=False,
     )
 
     outcome = run_comparison(

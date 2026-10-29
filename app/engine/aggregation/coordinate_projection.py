@@ -43,6 +43,3 @@ def original_to_suspect(box_in_original: BoundingBox, alignment_transform: np.nd
     return project_box(box_in_original, np.linalg.inv(alignment_transform))
 
 
-def suspect_to_original(box_in_suspect: BoundingBox, alignment_transform: np.ndarray) -> BoundingBox:
-    """Where a box in the suspect's own pixels sits in the shared (original) frame."""
-    return project_box(box_in_suspect, alignment_transform)

@@ -140,3 +140,10 @@ def test_reduction_keeps_a_one_pixel_line(qapp):
     assert reduced.shape[:2] == (200, 200)
     assert (reduced < 255).any()  # area averaging keeps it as a grey line
     assert reduced.min() < 200  # ...clearly visible, not a faint ghost
+
+
+def test_flicker_of_the_whole_file_shows_the_suspect_entire_on_its_frame():
+    original = np.zeros((10, 10, 3), np.uint8)
+    suspect = np.full((10, 10, 3), 200, np.uint8)
+    assert np.array_equal(compose_flicker(original, suspect, [], 1, whole=True), suspect)
+    assert np.array_equal(compose_flicker(original, suspect, [], 0, whole=True), original)

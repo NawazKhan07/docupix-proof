@@ -17,7 +17,7 @@ import pytest
 
 from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import text_diff
-from app.engine.detectors.text_diff import detect_scan, ink_agreement, reading_picture
+from app.engine.detectors.text_diff import detect_scan, ink_agreement
 from app.engine.ocr_locator import find_tesseract
 from app.engine.preprocessing.scan_normalizer import READING_SOURCES, ink_image, reading_source
 from app.engine.worker import run_comparison

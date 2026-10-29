@@ -142,7 +142,7 @@ def test_a_changed_word_is_still_a_changed_word():
 def test_an_icon_set_a_little_aside_is_one_graphic_moved_not_a_strip_here_and_a_strip_there():
     cluster = _only(_compare(_page(icon_at=(915, 705))))
     assert cluster.category == "graphics" and cluster.subtype is DiffSubtype.MOVED
-    assert cluster.detail == "Graphic moved 15 px right, 5 px down"
+    assert cluster.detail.startswith("Graphic moved 15 px right, 5 px down")
 
 
 def test_an_icon_moved_far_is_one_finding_shown_where_it_was_and_where_it_is():

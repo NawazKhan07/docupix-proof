@@ -19,15 +19,17 @@ and Erase selected area leaves it out of the comparison. Any number of areas can
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -57,7 +60,9 @@ from app.models.isolation import (
     NormalizedRect,
 )
 from app.ui.flow_layout import flow_widget
-from app.ui.interactive_canvas import InteractiveCanvas
+from app.ui.interactive_canvas import InteractiveCanvas, _numpy_rgb_to_qpixmap as _to_pixmap
+
+logger = logging.getLogger(__name__)
 
 _STATUS_TEXT = {
     IsolationTool.CROP: "Drag on the page to draw a crop. Drag its edges or corners to resize it, or its inside to move it.",
@@ -75,7 +80,10 @@ _STATUS_TEXT = {
     ),
 }
 _NAVIGATION_HINT = "Pinch or Ctrl + wheel to zoom  ·  two-finger scroll, Space + drag or middle-drag to pan"
-_SCREEN_SHARE = 0.85  # how much of the screen the dialog may take, so the whole page can be seen
+_SCREEN_SHARE = 0.85
+_MAX_PAGE_THUMBS = 24  # a file's pages are shown as pictures up to this many
+_THUMB_DPI = 12.0
+_THUMB_PX = 96  # each page's picture, this long on its long edge  # how much of the screen the dialog may take, so the whole page can be seen
 _MM_PER_INCH = 25.4
 _METHODS = (("Automatic", "auto"), ("Border line", "border"), ("Colour", "colour"))
 _BRUSH_UNIT = 1 / 1000  # the brush slider is in thousandths of the page's long edge
@@ -173,6 +181,7 @@ class IsolationDialog(QDialog):
         self._size_to_screen()
         self._artwork = artwork
         self._config = config or AppConfig()
+        self._start_page = artwork.page  # (Cancel leaves the file on this page, whatever was looked at)
         self._rendered = artwork.render()
         self._reference = reference
         self._partner_title = partner_title or "the other file"
@@ -239,6 +248,9 @@ class IsolationDialog(QDialog):
         layout.addWidget(tool_widget)
 
         layout.addWidget(self._build_reference_banner())
+        # Every page of a file of several, to look at and pick: the area is drawn on the page on show, and that page is
+        # the one compared.
+        layout.addWidget(self._build_page_strip())
 
         # The options of the current tool.
         self.options = _OptionsStack()
@@ -344,6 +356,70 @@ class IsolationDialog(QDialog):
         self.brush_slider.valueChanged.connect(self._on_brush_size_changed)
         self.save_cutout_button.clicked.connect(self._save_cutout)
         return bar
+
+    def _build_page_strip(self) -> QWidget:
+        strip, row = flow_widget(self, spacing=8)
+        self.page_buttons: list[QToolButton] = []
+        strip.setVisible(self._artwork.page_count > 1)
+        if self._artwork.page_count <= 1:
+            return strip
+        label = QLabel(f"Pages ({self._artwork.page_count}):")
+        label.setProperty("secondary", "true")
+        row.addWidget(label)
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for index in range(min(self._artwork.page_count, _MAX_PAGE_THUMBS)):
+            button = QToolButton()
+            button.setCheckable(True)
+            button.setText(f"Page {index + 1}")
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            button.setToolTip(f"Show page {index + 1}: the area is drawn on it, and it is the page compared.")
+            try:
+                thumb = self._artwork.render(dpi=_THUMB_DPI if self._artwork.kind == "pdf" else None, page=index)
+                scale = _THUMB_PX / max(thumb.shape[:2])
+                thumb = cv2.resize(thumb, (max(1, round(thumb.shape[1] * scale)), max(1, round(thumb.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+                button.setIcon(QIcon(_to_pixmap(thumb)))
+                button.setIconSize(QSize(thumb.shape[1], thumb.shape[0]))
+            except Exception:  # noqa: BLE001 -- a page that cannot be pictured small is still offered by its number
+                logger.exception("could not picture page %d", index + 1)
+            button.setChecked(index == self._artwork.page)
+            button.clicked.connect(lambda _checked=False, page=index: self._show_page(page))
+            group.addButton(button)
+            row.addWidget(button)
+            self.page_buttons.append(button)
+        if self._artwork.page_count > _MAX_PAGE_THUMBS:
+            more = QLabel(f"(the first {_MAX_PAGE_THUMBS} of {self._artwork.page_count} are shown; pick another with the page selector)")
+            more.setProperty("secondary", "true")
+            row.addWidget(more)
+        return strip
+
+    def _show_page(self, page: int) -> None:
+        """Show another page of the file: what was drawn on the one before is let go (an area means nothing on another
+        page), and this page is the one compared if saved."""
+        if page == self._artwork.page:
+            return
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._artwork.select_page(page)
+            self._rendered = self._artwork.render()
+            self._subject, self._subject_seed, self._hints = None, None, []
+            self._outline, self._outline_inset_px, self._banner_hint = None, 0.0, None
+            self._cutout = None
+            self.canvas.set_image(self._rendered)
+            self.crop_readout.setText("")
+            self._update_option_states()
+            self._say(f"Page {page + 1}. " + _STATUS_TEXT[self.canvas.tool])
+        finally:
+            QGuiApplication.restoreOverrideCursor()
+
+    def reject(self) -> None:
+        if self._artwork.page != self._start_page:
+            self._artwork.select_page(self._start_page)  # cancelled: the file is compared by the page it was before
+        super().reject()
+
+    def result_page(self) -> int:
+        """The page the area was drawn on (the page to compare)."""
+        return self._artwork.page
 
     def _build_reference_banner(self) -> QWidget:
         """A strip above the page offering the other file's lifted artwork, so the way to place it is in plain sight."""
@@ -617,7 +693,7 @@ class IsolationDialog(QDialog):
                 seed,
                 self._config.subject,
                 hints=self._hints,
-                page=self._artwork.pdf_page(0) if is_pdf else None,
+                page=self._artwork.pdf_page() if is_pdf else None,
                 dpi=self._artwork.working_dpi() if is_pdf else None,
                 method=self.method_combo.currentData(),
             )
@@ -630,7 +706,10 @@ class IsolationDialog(QDialog):
         self._subject, self._subject_seed = subject, seed
         self._banner_hint = self._partial_lift_hint(subject)
         self._set_outline(subject.normalized_polygon(), "lifted", subject.edge_inset_px)
-        how = "inside its closed border line" if subject.source == "border" else "by colour, from its background"
+        how = {
+            "border": "inside its closed border line",
+            "print": "by what is printed (no closed border line was found)",
+        }.get(subject.source, "by colour, from its background")
         follow_up = ""
         if self._reference is None:
             follow_up = f" Then open Edit Artwork Area on {self._partner_title} and place this artwork over it."

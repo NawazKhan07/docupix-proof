@@ -15,7 +15,6 @@ import pytest
 import subject_scenes as scenes
 
 from app.config import SubjectConfig
-from app.engine.isolation import subject_lifter as lifter
 from app.engine.isolation.subject_lifter import HintStroke, NoSubjectFoundError, lift_subject
 
 CONFIG = SubjectConfig()
@@ -29,6 +28,12 @@ def _scene(edge="coloured", bg="grey desk", **kwargs):
 def _centre(truth: np.ndarray) -> tuple[float, float]:
     ys, xs = np.nonzero(truth)
     return float(xs.mean()), float(ys.mean())
+
+
+def _polygon_mask(shape, polygon):
+    mask = np.zeros(shape, np.uint8)
+    cv2.fillPoly(mask, [np.round(np.array(polygon)).astype(np.int32)], 1)
+    return mask.astype(bool)
 
 
 # ---- the outline is right, on the surfaces a carton is photographed or printed on ------------------
@@ -69,7 +74,7 @@ def test_a_rectangular_subject_comes_back_as_a_rectangle():
     subject = lift_subject(image, _centre(truth), CONFIG)
 
     assert len(subject.polygon) == 4
-    assert scenes.iou(lifter.polygon_mask(image.shape[:2], subject.polygon), truth) > 0.97
+    assert scenes.iou(_polygon_mask(image.shape[:2], subject.polygon), truth) > 0.97
     assert subject.source == "segmented"
 
 
@@ -86,7 +91,7 @@ def test_an_irregular_subject_keeps_its_shape_within_a_point_budget():
     subject = lift_subject(notched, _centre(truth_notched), CONFIG)
 
     assert 8 < len(subject.polygon) <= CONFIG.max_outline_points
-    assert scenes.iou(lifter.polygon_mask(image.shape[:2], subject.polygon), truth_notched) > 0.96
+    assert scenes.iou(_polygon_mask(image.shape[:2], subject.polygon), truth_notched) > 0.96
 
 
 # ---- it is the pressed object that comes back ---------------------------------------------------------------------------
@@ -506,3 +511,28 @@ def test_a_cutout_carries_the_inset_so_a_file_it_is_laid_over_starts_the_same_di
     sheet, _truth, _ = scenes.dieline_sheet(line_px=3)
     subject = lift_subject(sheet, (600, 800), CONFIG)
     assert Cutout.from_subject(sheet, subject).edge_inset_px == subject.edge_inset_px > 3
+
+
+def test_a_carton_whose_dieline_is_not_closed_is_lifted_whole_by_what_is_printed():
+    """A flattened file whose dieline is dashed, faint or broken off has no closed border to lift: Auto-detect lifts the
+    artwork by what is printed instead -- all of it, a barcode on a far flap included -- rather than nothing."""
+    import cv2
+    import numpy as np
+
+    from app.engine.isolation.subject_lifter import lift_subject
+
+    page = np.full((1400, 1100, 3), 255, np.uint8)
+    for y in range(200, 1200, 40):  # a dashed, broken outline: never closed
+        cv2.line(page, (200, y), (200, y + 15), (190, 190, 190), 2)
+    cv2.putText(page, "Cilnidipine Tablets", (260, 400), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (40, 40, 40), 3)
+    cv2.putText(page, "IP 5 mg", (420, 480), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (40, 40, 40), 3)
+    for row in range(8):
+        cv2.putText(page, "Store below 30 C. Keep out of reach.", (260, 650 + 35 * row), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (40, 40, 40), 2)
+    for k in range(14):  # a barcode on a flap, far from the rest
+        cv2.rectangle(page, (950 + 8 * k, 1150), (953 + 8 * k, 1300), (0, 0, 0), -1)
+
+    subject = lift_subject(page, None)
+
+    assert subject.source == "print"
+    assert subject.mask[400, 300] and subject.mask[1250, 960]  # the type and the far barcode both inside
+    assert not subject.mask[50, 50]  # the blank margin outside

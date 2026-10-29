@@ -36,8 +36,9 @@ def build_clusters(
     candidates: list[DiffCandidate],
     alignment_transform: np.ndarray,
     config: ClusteringConfig,
+    panel_area: float | None = None,
 ) -> list[DiffCluster]:
-    """Cluster `candidates` and bind each cluster to both files' coordinates."""
+    """Cluster `candidates` and bind each cluster to both files' coordinates. `panel_area`: see `cluster_candidates`."""
     with StageTimer(logger, "aggregation"):
         clusters = []
         for members in cluster_candidates(
@@ -50,16 +51,23 @@ def build_clusters(
             config.duplicate_iou,
             (config.moved_displacement_tolerance_px, config.moved_displacement_tolerance_share),
             config.line_max_gap_px,
+            panel_area,
         ):
             box = union_box(members)
+            # (a thing that moved is shown where it is in the suspect, not where it was)
+            moved_to = [member.moved_to for member in members if member.moved_to is not None]
+            there = moved_to[0] if moved_to else box
+            for other in moved_to[1:]:
+                there = there.union(other)
             clusters.append(
                 DiffCluster(
                     id=0,  # numbered below, once the reading order is known
                     bbox_in_original=box,
-                    bbox_in_suspect=original_to_suspect(box, alignment_transform),
+                    bbox_in_suspect=original_to_suspect(there, alignment_transform),
                     type=_dominant_type(members),
                     members=members,
                     detail=_summarise(members),
+                    moved_to=there if moved_to else None,
                 )
             )
 
@@ -94,9 +102,12 @@ def merge_clusters(clusters: list[DiffCluster]) -> DiffCluster:
     ordered = sorted(clusters, key=lambda cluster: cluster.id)
     members = [member for cluster in ordered for member in cluster.members]
     original_box, suspect_box = ordered[0].bbox_in_original, ordered[0].bbox_in_suspect
+    shown = ordered[0].shown_in_suspect
     for cluster in ordered[1:]:
         original_box = original_box.union(cluster.bbox_in_original)
         suspect_box = suspect_box.union(cluster.bbox_in_suspect)
+        shown = shown.union(cluster.shown_in_suspect)
+    moved = any(cluster.moved_to is not None for cluster in ordered)
     return DiffCluster(
         id=ordered[0].id,
         bbox_in_original=original_box,
@@ -104,7 +115,16 @@ def merge_clusters(clusters: list[DiffCluster]) -> DiffCluster:
         type=_dominant_type(members),
         members=members,
         detail=f"{len(ordered)} findings merged: {_summarise(members)}",
+        moved_to=shown if moved else None,
     )
+
+
+def combined(clusters: list[DiffCluster]) -> DiffCluster:
+    """One finding from several that are pieces of one thing (the letters of one line of text): all their members, a box
+    round them in both files, the lowest number, and said the way one finding is (not as a merge the reviewer made)."""
+    merged = merge_clusters(clusters)
+    merged.detail = _summarise(merged.members)
+    return merged
 
 
 def _dominant_type(members: list[DiffCandidate]) -> DiffType:

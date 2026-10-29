@@ -30,10 +30,14 @@ class _RecordingJobs(QObject):
     def __init__(self):
         super().__init__()
         self.requests = []
+        self.prepared = []
 
     def start(self, request):
         self.requests.append(request)
         return len(self.requests)
+
+    def prepare(self, request):
+        self.prepared.append(request)
 
     def cancel(self):
         pass
@@ -152,7 +156,8 @@ def test_the_origin_button_is_hidden_when_already_showing_the_origin_mode(qapp, 
     window.close()
 
 
-def test_the_origin_button_appears_after_switching_to_barcode_and_names_the_origin_mode(qapp, tmp_path):
+def test_the_origin_mode_appears_in_tools_dropdown_and_separate_button_is_removed(qapp, tmp_path):
+    """Switching to Barcode offers Automatic in Tools dropdown, while separate button is removed."""
     window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
     window.show()
     window.stack.setCurrentWidget(window.results_view)
@@ -162,8 +167,19 @@ def test_the_origin_button_appears_after_switching_to_barcode_and_names_the_orig
     window.results_view.barcode_button.click()
     window._on_completed(_outcome(ComparisonMode.BARCODE))
 
-    assert window.results_view.origin_mode_button.isVisible()
-    assert window.results_view.origin_mode_button.text() == "Automatic"
+    # Separate origin button is removed from toolbar
+    assert not window.results_view.origin_mode_button.isVisible()
+    # Tools menu has "Automatic"
+    assert window.results_view.automatic_action.text() == "Automatic"
+
+    # Selecting "Automatic" resets Tools button text to "Tools"
+    window.results_view.automatic_action.trigger()
+    assert window.results_view.tools_button.text() == "Tools"
+
+    # Clicking Recompare triggers comparison in Automatic mode
+    window.results_view.recompare_button.click()
+    assert len(jobs.requests) == 3
+    assert jobs.requests[2].mode is ComparisonMode.AUTOMATIC
     window.close()
 
 
@@ -222,7 +238,8 @@ def test_a_switch_between_barcode_and_braille_does_not_move_the_origin_mode(qapp
     window.results_view.braille_button.click()
     window._on_completed(_outcome(ComparisonMode.BRAILLE))
 
-    assert window.results_view.origin_mode_button.text() == "Automatic"
+    assert window.results_view.automatic_action.text() == "Automatic"
+    assert not window.results_view.origin_mode_button.isVisible()
     window.close()
 
 
@@ -231,6 +248,8 @@ def test_a_switch_between_barcode_and_braille_does_not_move_the_origin_mode(qapp
 
 def test_editing_a_file_and_accepting_compares_again_with_the_new_geometry(qapp, tmp_path, monkeypatch):
     window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
     window._on_compare()
     (first,) = jobs.requests
     window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
@@ -245,11 +264,178 @@ def test_editing_a_file_and_accepting_compares_again_with_the_new_geometry(qapp,
 
     window.results_view.editFilesRequested.emit("original")
 
+    # Editing starts an align-only request first to display aligned files in viewer:
     assert len(jobs.requests) == 2
     again = jobs.requests[1]
+    assert again.align_only is True
     assert again.original_geometry is new_geometry
     assert (again.original_path, again.suspect_path) == (first.original_path, first.suspect_path)
+
+    # When alignment finishes, viewer displays the aligned files and waits for user to click Recompare:
+    window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
+    assert window.results_view.recompare_button.isVisible()
+    assert len(jobs.prepared) == 1
+    assert jobs.prepared[0].align_only is False
+    assert jobs.prepared[0].original_geometry is new_geometry
+    assert jobs.prepared[0].mode is ComparisonMode.AUTOMATIC
+
+    # User clicks Recompare to run the full comparison:
+    window.results_view.recompare_button.click()
+    assert len(jobs.requests) == 3
+    full = jobs.requests[2]
+    assert full.align_only is False
+    assert full.original_geometry is new_geometry
+    assert full.mode is ComparisonMode.AUTOMATIC
     window.close()
+
+
+def test_editing_files_in_scan_vs_digital_mode_aligns_first_and_prepares_in_background(qapp, tmp_path, monkeypatch):
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.SCAN_VS_DIGITAL))
+
+    new_geometry = IsolationGeometry(boundary=NormalizedRect(0.15, 0.15, 0.85, 0.85))
+    monkeypatch.setattr(type(window.upload_panel.original_slot), "edit_artwork_area", lambda self: setattr(self, "geometry", new_geometry) or True)
+
+    window.results_view.editFilesRequested.emit("original")
+
+    # Editing starts an align-only request first to display aligned files in viewer:
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.align_only is True
+    assert again.mode is ComparisonMode.SCAN_VS_DIGITAL
+    assert again.original_geometry is new_geometry
+
+    # When alignment finishes, viewer displays the aligned files and prepares in the background:
+    window._on_completed(_outcome(ComparisonMode.SCAN_VS_DIGITAL))
+    assert window.results_view.recompare_button.isVisible()
+    assert len(jobs.prepared) == 1
+    assert jobs.prepared[-1].align_only is False
+    assert jobs.prepared[-1].mode is ComparisonMode.SCAN_VS_DIGITAL
+    assert jobs.prepared[-1].original_geometry is new_geometry
+
+    # User clicks Recompare to run full comparison:
+    window.results_view.recompare_button.click()
+    assert len(jobs.requests) == 3
+    full = jobs.requests[2]
+    assert full.align_only is False
+    assert full.mode is ComparisonMode.SCAN_VS_DIGITAL
+    assert full.original_geometry is new_geometry
+    window.close()
+
+
+def test_editing_files_in_series_mode_aligns_first_and_prepares_in_background(qapp, tmp_path, monkeypatch):
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SERIES)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.SERIES))
+
+    new_geometry = IsolationGeometry(boundary=NormalizedRect(0.2, 0.2, 0.8, 0.8))
+    monkeypatch.setattr(type(window.upload_panel.original_slot), "edit_artwork_area", lambda self: setattr(self, "geometry", new_geometry) or True)
+
+    window.results_view.editFilesRequested.emit("original")
+
+    # Align-only request started first:
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.align_only is True
+    assert again.mode is ComparisonMode.SERIES
+    assert again.original_geometry is new_geometry
+
+    # When alignment finishes, viewer displays aligned files and prepares in background:
+    window._on_completed(_outcome(ComparisonMode.SERIES))
+    assert window.results_view.recompare_button.isVisible()
+    assert len(jobs.prepared) == 1
+    assert jobs.prepared[-1].align_only is False
+    assert jobs.prepared[-1].mode is ComparisonMode.SERIES
+    assert jobs.prepared[-1].original_geometry is new_geometry
+
+    # User clicks Recompare:
+    window.results_view.recompare_button.click()
+    assert len(jobs.requests) == 3
+    full = jobs.requests[2]
+    assert full.align_only is False
+    assert full.mode is ComparisonMode.SERIES
+    assert full.original_geometry is new_geometry
+    window.close()
+
+
+def test_editing_files_in_leaflet_mode_aligns_first_and_prepares_in_background(qapp, tmp_path, monkeypatch):
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.LEAFLET))
+
+    page_geometry = IsolationGeometry(boundary=NormalizedRect(0.05, 0.05, 0.95, 0.95))
+
+    def _accept_leaflet(self):
+        self.page_areas = {0: page_geometry}
+        return True
+
+    monkeypatch.setattr(type(window.upload_panel.original_slot), "edit_artwork_area", _accept_leaflet)
+
+    window.results_view.editFilesRequested.emit("original")
+
+    # Align-only request started first:
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.align_only is True
+    assert again.mode is ComparisonMode.LEAFLET
+    assert again.original_page_areas == ((0, page_geometry),)
+
+    # When alignment finishes, viewer displays aligned files and prepares in background:
+    window._on_completed(_outcome(ComparisonMode.LEAFLET))
+    assert window.results_view.recompare_button.isVisible()
+    assert len(jobs.prepared) == 1
+    assert jobs.prepared[-1].align_only is False
+    assert jobs.prepared[-1].mode is ComparisonMode.LEAFLET
+    assert jobs.prepared[-1].original_page_areas == ((0, page_geometry),)
+
+    # User clicks Recompare:
+    window.results_view.recompare_button.click()
+    assert len(jobs.requests) == 3
+    full = jobs.requests[2]
+    assert full.align_only is False
+    assert full.mode is ComparisonMode.LEAFLET
+    assert full.original_page_areas == ((0, page_geometry),)
+    window.close()
+
+
+def test_editing_files_in_barcode_and_braille_modes_aligns_first_and_prepares_in_background(qapp, tmp_path, monkeypatch):
+    for mode in (ComparisonMode.BARCODE, ComparisonMode.BRAILLE):
+        window, jobs = _loaded_window(qapp, tmp_path, mode)
+        window.show()
+        window.stack.setCurrentWidget(window.results_view)
+        window._on_compare()
+        window._on_completed(_outcome(mode))
+
+        new_geometry = IsolationGeometry(boundary=NormalizedRect(0.1, 0.1, 0.9, 0.9))
+        monkeypatch.setattr(type(window.upload_panel.original_slot), "edit_artwork_area", lambda self: setattr(self, "geometry", new_geometry) or True)
+
+        window.results_view.editFilesRequested.emit("original")
+
+        assert len(jobs.requests) == 2
+        assert jobs.requests[1].align_only is True
+        assert jobs.requests[1].mode is mode
+
+        window._on_completed(_outcome(mode))
+        assert window.results_view.recompare_button.isVisible()
+        assert len(jobs.prepared) == 1
+        assert jobs.prepared[-1].align_only is False
+        assert jobs.prepared[-1].mode is mode
+
+        window.results_view.recompare_button.click()
+        assert len(jobs.requests) == 3
+        assert jobs.requests[2].align_only is False
+        assert jobs.requests[2].mode is mode
+        window.close()
 
 
 def test_cancelling_the_edit_dialog_does_not_start_another_comparison(qapp, tmp_path, monkeypatch):
@@ -273,4 +459,126 @@ def test_editing_files_is_locked_while_a_comparison_is_running(qapp, tmp_path):
     window.results_view.barcode_button.click()  # starts a job, still "running" (jobs.is_busy is False by default...)
 
     assert not window.results_view.edit_files_button.isEnabled()
+    window.close()
+
+
+# ---- tools dropdown and recompare button -------------------------------------------------------------
+
+
+def test_tools_and_recompare_buttons_appear_from_the_start(qapp, tmp_path):
+    """In Automatic mode, Tools dropdown and Recompare button appear from the start."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
+
+    results = window.results_view
+    assert results.tools_button.isVisible()
+    assert results.tools_button.text() == "Tools"
+    assert results.recompare_button.isVisible()
+    assert results.recompare_button.text() == "Recompare"
+    assert results.barcode_action.text() == "Barcode"
+    assert results.braille_action.text() == "Braille"
+
+    # Clicking Recompare directly re-compares in current mode (Automatic):
+    results.recompare_button.click()
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.mode is ComparisonMode.AUTOMATIC
+    assert again.align_only is False
+    window.close()
+
+
+def test_selecting_barcode_from_tools_updates_text_and_shows_recompare(qapp, tmp_path):
+    """Selecting Barcode changes the Tools button label to Barcode and Recompare runs Barcode mode."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
+
+    results = window.results_view
+    results.barcode_action.trigger()
+
+    assert results.tools_button.text() == "Barcode"
+    assert results.recompare_button.isVisible()
+    assert results.recompare_button.text() == "Recompare"
+
+    # Clicking Recompare triggers the Barcode comparison
+    results.recompare_button.click()
+
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.mode is ComparisonMode.BARCODE
+    assert (again.original_path, again.suspect_path) == (first.original_path, first.suspect_path)
+    window.close()
+
+
+def test_selecting_braille_from_tools_updates_text_and_shows_recompare(qapp, tmp_path):
+    """Selecting Braille changes the Tools button label to Braille and Recompare runs Braille mode."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    (first,) = jobs.requests
+    window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
+
+    results = window.results_view
+    results.braille_action.trigger()
+
+    assert results.tools_button.text() == "Braille"
+    assert results.recompare_button.isVisible()
+
+    results.recompare_button.click()
+
+    assert len(jobs.requests) == 2
+    again = jobs.requests[1]
+    assert again.mode is ComparisonMode.BRAILLE
+    assert (again.original_path, again.suspect_path) == (first.original_path, first.suspect_path)
+    window.close()
+
+
+def test_selecting_automatic_deselects_tool_mode_and_resets_tools_button(qapp, tmp_path):
+    """Selecting Automatic from Tools dropdown deselects Barcode and resets the button label to Tools."""
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.AUTOMATIC)
+    window.show()
+    window.stack.setCurrentWidget(window.results_view)
+    window._on_compare()
+    window._on_completed(_outcome(ComparisonMode.AUTOMATIC))
+
+    results = window.results_view
+    results.barcode_action.trigger()
+    assert results.tools_button.text() == "Barcode"
+
+    # Selecting Automatic deselects tool and resets label to "Tools"
+    results.automatic_action.trigger()
+    assert results.tools_button.text() == "Tools"
+
+    # Recompare compares in Automatic mode
+    results.recompare_button.click()
+    assert len(jobs.requests) == 2
+    assert jobs.requests[1].mode is ComparisonMode.AUTOMATIC
+    window.close()
+
+
+def test_tools_button_hidden_in_modes_without_tools(qapp, tmp_path):
+    """Modes like Scan vs Digital, Series, or Leaflet do not show the Tools button."""
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.SCAN_VS_DIGITAL)
+    window.show()
+    results = window.results_view
+    window.stack.setCurrentWidget(results)
+    results.show_outcome(_outcome(ComparisonMode.SCAN_VS_DIGITAL), "a vs b")
+    assert not results.tools_button.isVisible()
+    assert results.recompare_button.isVisible()
+
+    results.show_outcome(_outcome(ComparisonMode.SERIES), "a vs b")
+    assert not results.tools_button.isVisible()
+    assert results.recompare_button.isVisible()
+
+    results.show_outcome(_outcome(ComparisonMode.LEAFLET), "a vs b")
+    assert not results.tools_button.isVisible()
+    assert results.recompare_button.isVisible()
     window.close()

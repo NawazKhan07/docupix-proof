@@ -18,6 +18,8 @@ are compared.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -25,13 +27,13 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from app.config import AlignmentConfig, SubjectConfig
+from app.config import AlignmentConfig, SeriesConfig, SubjectConfig
 from app.engine.alignment.aligner import AlignmentError
 from app.engine.isolation.border_lifter import border_regions
 from app.engine.isolation.cutout import Cutout
 from app.engine.isolation.placement import fit_placement
 from app.engine.isolation.subject_lifter import LiftedSubject, outline_from_mask
-from app.models.isolation import IsolationGeometry, NormalizedPolygon
+from app.models.isolation import IsolationGeometry, NormalizedRect, NormalizedPolygon
 
 logger = logging.getLogger(__name__)
 
@@ -289,4 +291,224 @@ def find_artwork(
         _geometry(second, suspect.shape[:2]),
         f"The artwork was found automatically in both files ({first.area_fraction:.0%} and {second.area_fraction:.0%} of their pages) "
         "and only it was compared.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Found by what is printed (the last resort: no border to go by)
+# ---------------------------------------------------------------------------
+
+_BLOB_LONG_EDGE_PX = 800  # a page's print is gathered on a copy this size
+_BLOB_FROM_PAPER = 40  # (grey levels) darker than the page's paper by this much is print
+_BLOB_THIN_SHARE = 0.004  # a line thinner than this share of the page (a scanner's edge, a rule) is not the artwork...
+_BLOB_GATHER_SHARE = 0.03  # ...and print this close together (share of the page) is one piece of artwork
+_BLOB_MARGIN_SHARE = 0.03  # the area compared is the piece with this much (share of its size) round it
+
+
+def print_block(image: np.ndarray) -> tuple[int, int, int, int]:
+    """(x0, y0, x1, y1): the largest piece of print on a page -- one artwork on a sheet, a label laid on a scanner's
+    glass -- with thin lines (the scanner's edges, a rule) left out and nearby print gathered into it."""
+    height, width = image.shape[:2]
+    scale = min(1.0, _BLOB_LONG_EDGE_PX / max(height, width))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    darkest = small.min(axis=2) if small.ndim == 3 else small
+    paper = float(np.percentile(darkest, 90))
+    ink = (darkest.astype(np.int16) < paper - _BLOB_FROM_PAPER).astype(np.uint8)
+    long_edge = max(small.shape[:2])
+    thin = max(3, round(_BLOB_THIN_SHARE * long_edge)) | 1
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((thin, thin), np.uint8))
+    gather = max(5, round(_BLOB_GATHER_SHARE * long_edge)) | 1
+    pieces = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((gather, gather), np.uint8))
+    count, _labels, stats, _centres = cv2.connectedComponentsWithStats(pieces)
+    if count <= 1:
+        return 0, 0, width, height
+    best = max(range(1, count), key=lambda label: stats[label][cv2.CC_STAT_AREA])
+    x, y, w, h, _area = stats[best]
+    return round(x / scale), round(y / scale), min(width, round((x + w) / scale)), min(height, round((y + h) / scale))
+
+
+_EXTENT_MIN_PIECE = 0.02  # (a piece of print at least this share of the largest one...
+_EXTENT_NEAR_SHARE = 0.25  # ...and at most this share of the item's size from it belongs to the item)
+
+
+def _print_pieces(image: np.ndarray) -> tuple[np.ndarray, int, np.ndarray, np.ndarray]:
+    """A page's print gathered into pieces, on a copy at most `_BLOB_LONG_EDGE_PX` long (thin lines left out): the copy,
+    and the pieces as `cv2.connectedComponentsWithStats` gives them."""
+    height, width = image.shape[:2]
+    scale = min(1.0, _BLOB_LONG_EDGE_PX / max(height, width))
+    small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    darkest = small.min(axis=2) if small.ndim == 3 else small
+    paper = float(np.percentile(darkest, 90))
+    ink = (darkest.astype(np.int16) < paper - _BLOB_FROM_PAPER).astype(np.uint8)
+    long_edge = max(small.shape[:2])
+    thin = max(3, round(_BLOB_THIN_SHARE * long_edge)) | 1
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((thin, thin), np.uint8))
+    gather = max(5, round(_BLOB_GATHER_SHARE * long_edge)) | 1
+    pieces = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((gather, gather), np.uint8))
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(pieces)
+    return small, count, labels, stats
+
+
+def item_in_artwork(artwork: np.ndarray, item: np.ndarray) -> np.ndarray:
+    """`item` (a mask over `artwork`, e.g. a scanned label's extent laid over the digital file) widened by every piece
+    of `artwork`'s own print lying mostly inside it, whole: what the item should hold, even where the item lacks it (a
+    line missing at a label's foot is part of the label's print in the digital file, and is compared), while print of
+    its own beside it (a proof sheet's note, another artwork) is not."""
+    height, width = artwork.shape[:2]
+    small, count, labels, _stats = _print_pieces(artwork)
+    if count <= 1:
+        return item
+    inside = cv2.resize(item.astype(np.uint8), (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
+    totals = np.bincount(labels.ravel(), minlength=count)
+    within = np.bincount(labels.ravel(), weights=inside.ravel(), minlength=count)
+    wanted = np.flatnonzero(within[1:] >= _ITEM_PIECE_INSIDE * totals[1:]) + 1
+    if not len(wanted):
+        return item
+    pieces = np.isin(labels, wanted).astype(np.uint8)
+    return item | (cv2.resize(pieces, (width, height), interpolation=cv2.INTER_NEAREST) > 0)
+
+
+_ITEM_PIECE_INSIDE = 0.5  # (a piece of the artwork's print at least this much inside the item belongs to it)
+
+
+def scan_extent(image: np.ndarray) -> np.ndarray | None:
+    """Where a scanned item lies on the scanner's page, as a mask the page's size: the hull of its print -- every
+    sizable piece of it, the largest (the label) and those beside it (a barcode, a code block) -- with thin lines left
+    out (the glass's edges, a lid's shadow, a fold) and its margin round it. None where the print is most of the page
+    (the scan IS the item) or there is none."""
+    height, width = image.shape[:2]
+    small, count, labels, stats = _print_pieces(image)
+    if count <= 1:
+        return None
+    # the largest piece is the item; a sizable piece beside it (within a share of the item's size) is part of it too,
+    # and so on as the item grows -- specks out on the glass, or its far edges, are not
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = 1 + int(np.argmax(areas))
+    x0, y0 = stats[largest, cv2.CC_STAT_LEFT], stats[largest, cv2.CC_STAT_TOP]
+    x1, y1 = x0 + stats[largest, cv2.CC_STAT_WIDTH], y0 + stats[largest, cv2.CC_STAT_HEIGHT]
+    members, grown = {largest}, True
+    while grown:
+        grown = False
+        near = _EXTENT_NEAR_SHARE * max(x1 - x0, y1 - y0)
+        for label in range(1, count):
+            if label in members or areas[label - 1] < _EXTENT_MIN_PIECE * areas.max():
+                continue
+            lx0, ly0 = stats[label, cv2.CC_STAT_LEFT], stats[label, cv2.CC_STAT_TOP]
+            lx1, ly1 = lx0 + stats[label, cv2.CC_STAT_WIDTH], ly0 + stats[label, cv2.CC_STAT_HEIGHT]
+            if lx0 - near <= x1 and x0 - near <= lx1 and ly0 - near <= y1 and y0 - near <= ly1:
+                members.add(label)
+                x0, y0, x1, y1 = min(x0, lx0), min(y0, ly0), max(x1, lx1), max(y1, ly1)
+                grown = True
+    kept = np.isin(labels, sorted(members))
+    points = cv2.findNonZero(kept.astype(np.uint8))
+    hull = np.zeros(small.shape[:2], np.uint8)
+    cv2.fillConvexPoly(hull, cv2.convexHull(points), 1)
+    x, y, w, h = cv2.boundingRect(points)
+    margin = max(1, round(_BLOB_MARGIN_SHARE * max(w, h))) | 1
+    hull = cv2.dilate(hull, np.ones((2 * margin + 1, 2 * margin + 1), np.uint8))
+    if hull.mean() > _EXTENT_MOST_OF_PAGE:
+        return None
+    return cv2.resize(hull, (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
+_EXTENT_MOST_OF_PAGE = 0.8  # (an item filling more of the page than this is the page: nothing to narrow)
+
+
+def _rect(box: tuple[int, int, int, int], shape: tuple[int, int]) -> IsolationGeometry:
+    height, width = shape
+    x0, y0, x1, y1 = box
+    mx, my = _BLOB_MARGIN_SHARE * (x1 - x0), _BLOB_MARGIN_SHARE * (y1 - y0)
+    return IsolationGeometry(
+        boundary=NormalizedRect(max(0.0, (x0 - mx) / width), max(0.0, (y0 - my) / height), min(1.0, (x1 + mx) / width), min(1.0, (y1 + my) / height)),
+        boundary_origin="manual",
+    )
+
+
+_PRINT_TURNS = (0, 1, 3, 2)  # quarter turns the piece of print is looked for at (a label laid on the glass any way round)
+_PRINT_SIZES = (1.0, 2.0, 0.5, 3.0, 1.0 / 3.0)  # ...and sizes: a proof sheet also shows its artwork enlarged 200% or 300%
+_PRINT_STEP = 1.03  # (each size give or take a few steps of this)
+_PRINT_STEPS_EACH_WAY = 4
+
+
+def _located_any_way(
+    sheet: np.ndarray, piece: np.ndarray, config: SeriesConfig, scale: float | None
+) -> tuple[float, tuple[int, int, int, int]] | None:
+    """(how well, where on `sheet`) the piece of print is found, turned any quarter turn and at any of the sizes a proof
+    sheet shows an artwork at; None if nowhere. The upright, same-size match is tried first and kept if it is sure."""
+    from app.engine.series import _locate, _search_picture  # (a search the Series mode already makes)
+
+    if min(piece.shape[:2]) < 8:
+        return None
+    centre = 1.0 / scale if scale and scale > 0 else 1.0
+
+    def ways() -> list[tuple[int, float, np.ndarray]]:
+        out = []
+        for turns in _PRINT_TURNS:
+            turned = np.ascontiguousarray(np.rot90(piece, turns)) if turns else piece
+            out += [(turns, size, turned) for size in _PRINT_SIZES]
+        return out
+
+    def scales_of(size: float) -> list[float]:
+        return [centre * size * _PRINT_STEP**step for step in range(-_PRINT_STEPS_EACH_WAY, _PRINT_STEPS_EACH_WAY + 1)]
+
+    looked_in = _search_picture(sheet, config)
+    # Upright first, at every size: the usual case, and if it is found surely so, done.
+    upright = None
+    for size in _PRINT_SIZES:
+        located = _locate(sheet, piece, config, scale, scales=scales_of(size), looked_in=looked_in)
+        if located is not None and (upright is None or located[0] > upright[0]):
+            upright = located
+    if upright is not None and upright[0] >= _SURE_PRINT_MATCH:
+        return upright[0], upright[1]
+    # Every other way round, at every size, is then looked for on a copy of the sheet half the size (a quarter of the work), only to
+    # rank them -- a weak match (a foil's, a soft scan's) falls short of the bar on the small copy and is still the
+    # likeliest -- and the likeliest few are looked for as closely as ever.
+    coarse = _search_picture(sheet, replace(config, search_long_edge_px=max(200, round(config.search_long_edge_px * _COARSE_SHARE))))
+    ranking = replace(config, min_match_score=-1.0, min_match_peak=float("-inf"))
+    rough = []
+    for turns, size, turned in ways():
+        if not turns:
+            continue  # (upright was looked for closely already)
+        located = _locate(sheet, turned, ranking, scale, scales=scales_of(size), looked_in=coarse)
+        rough.append((located[0] if located is not None else -1.0, turns, size, turned))
+    rough.sort(key=lambda item: -item[0])
+    best = (upright[0], upright[1]) if upright is not None else None
+    for _score, turns, size, turned in rough[:_COARSE_KEEP]:
+        located = _locate(sheet, turned, config, scale, scales=scales_of(size), looked_in=looked_in)
+        if located is not None and (best is None or located[0] > best[0]):
+            best = (located[0], located[1])
+    return best
+
+
+_COARSE_SHARE = 0.5  # (the rough search's copy, as a share of the close search's)
+_COARSE_KEEP = 3  # (how many of the likeliest ways round and sizes are looked for closely)
+_SURE_PRINT_MATCH = 0.6  # (edges correlating this well: the piece is surely found)
+
+
+def located_by_print(
+    original: np.ndarray, suspect: np.ndarray, config: SeriesConfig, scale: float | None = None
+) -> AutoArea | None:
+    """The artwork of two files that have no border to find it by, and do not register as whole pages -- a proof sheet
+    holding the artwork beside another and a job sheet, against a scan of the one artwork on a scanner's glass: the
+    largest piece of print on each page is looked for on the other (by its edges, at the scale the two files' resolutions
+    give), and whichever is found more surely is the artwork on both. None if neither is found. `scale`: suspect pixels
+    per original pixel."""
+    found = []
+    block = print_block(suspect)
+    located = _located_any_way(original, suspect[block[1] : block[3], block[0] : block[2]], config, scale)
+    if located is not None:
+        found.append((located[0], located[1], block))  # (score, the original's box, the suspect's)
+    block = print_block(original)
+    located = _located_any_way(suspect, original[block[1] : block[3], block[0] : block[2]], config, 1.0 / scale if scale else None)
+    if located is not None:
+        found.append((located[0], block, located[1]))
+    if not found:
+        return None
+    _score, original_box, suspect_box = max(found, key=lambda item: item[0])
+    logger.info("artwork found by its print", extra={"score": round(_score, 2)})
+    return AutoArea(
+        _rect(original_box, original.shape[:2]),
+        _rect(suspect_box, suspect.shape[:2]),
+        "The two files did not line up as whole pages, so the artwork was found by what is printed: the largest piece of "
+        "print on one was found on the other, and only it was compared.",
     )

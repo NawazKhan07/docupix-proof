@@ -24,8 +24,17 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine.aggregation.aggregator import merge_clusters
-from app.models.categories import CATEGORY_LABELS, CATEGORY_ORDER, SUBTYPE_LABELS, category_colour
-from app.models.diff import DiffCluster
+from app.models.categories import (
+    CATEGORY_LABELS,
+    CATEGORY_ORDER,
+    SOURCE_COLOURS,
+    SOURCE_SHORT_LABELS,
+    SUBTYPE_LABELS,
+    category_colour,
+    finding_colour,
+    source_of,
+)
+from app.models.diff import SOURCE_LABELS, SOURCE_OCR, SOURCE_PIXELS, DiffCluster
 from app.models.result import AlignmentResult
 from app.ui.theme import set_variant
 
@@ -40,7 +49,7 @@ class FindingCard(QFrame):
     selectRequested = Signal(int)
     ignoreToggled = Signal(int)
 
-    def __init__(self, cluster: DiffCluster, selected: bool, parent=None):
+    def __init__(self, cluster: DiffCluster, selected: bool, parent=None, by_source: bool = False):
         super().__init__(parent)
         self.cluster_id = cluster.id
         self.setProperty("role", "card")
@@ -49,14 +58,18 @@ class FindingCard(QFrame):
 
         bar = QFrame(self)
         bar.setFixedWidth(5)
-        bar.setStyleSheet(f"background: {category_colour(cluster.category)}; border-radius: 2px;")
+        bar.setStyleSheet(f"background: {finding_colour(cluster, by_source)}; border-radius: 2px;")  # its box's colour
         self.colour_bar = bar
 
+        source = source_of(cluster)
         title = QLabel(
             f"#{cluster.id}  ·  {CATEGORY_LABELS.get(cluster.category, cluster.category)}  ·  "
-            f"{SUBTYPE_LABELS[cluster.subtype].capitalize()}"
+            f"{SUBTYPE_LABELS[cluster.subtype].capitalize()}  ·  "
+            f'<span style="color:{SOURCE_COLOURS[source]}">{SOURCE_SHORT_LABELS[source]}</span>'
             + ("  ·  possible misread" if cluster.uncertain else "")
+            + ("  ·  printer's note" if cluster.printers_note else "")
         )
+        title.setTextFormat(Qt.TextFormat.RichText)
         title.setStyleSheet("font-weight: 700;")
         detail = QLabel(cluster.detail)
         detail.setWordWrap(True)
@@ -86,11 +99,21 @@ class FindingCard(QFrame):
 
     def mousePressEvent(self, event) -> None:
         self.selectRequested.emit(self.cluster_id)
-        super().mousePressEvent(event)
+        event.accept()  # (taken here: a click on a card is not a click on the empty space round it, which deselects)
+
+
+# How a finding was found, as kinds in the list's filter (the combo's values; `DiffCandidate.source`).
+_SOURCE_KINDS = [("source:ocr", SOURCE_LABELS[SOURCE_OCR]), ("source:pixels", SOURCE_LABELS[SOURCE_PIXELS])]
+_SOURCE_KEY = {"source:ocr": SOURCE_OCR, "source:pixels": SOURCE_PIXELS}
+# Notes to the printer the digital file draws in the die line's colour (never printed, so missing from a scan): listed
+# only when picked, and then alone (`DiffCluster.printers_note`).
+_NOTES = "printers_notes"
+_NOTES_LABEL = "Printer's notes"
 
 
 class DiffListPanel(QWidget):
     clusterSelected = Signal(object)  # int cluster id, or None: clicking the selected card again deselects it
+    backgroundClicked = Signal()  # a click in the list where there is no card
     visibilityChanged = Signal()  # filters, ignoring or merging changed what should be shown
 
     def __init__(self, parent=None):
@@ -130,6 +153,9 @@ class DiffListPanel(QWidget):
         self.category_combo.addItem("All kinds", _ALL)
         for key in CATEGORY_ORDER:
             self.category_combo.addItem(CATEGORY_LABELS[key], key)
+        self._categories: tuple = tuple(CATEGORY_ORDER)
+        self._source_kinds_shown = False
+        self._notes_offered = False
         filters.addWidget(self.category_combo, stretch=1)
         layout.addLayout(filters)
 
@@ -182,6 +208,7 @@ class DiffListPanel(QWidget):
 
         self.warnings_label.setText("\n".join(warnings))
         self.warnings_label.setVisible(bool(warnings))
+        self._offer_notes()
         self._rebuild()
 
     def visible_clusters(self) -> list[DiffCluster]:
@@ -189,14 +216,57 @@ class DiffListPanel(QWidget):
         category = self.category_combo.currentData()
         show_ignored = self.show_ignored_check.isChecked()
         show_uncertain = self.show_uncertain_check.isChecked()
+        notes = category == _NOTES
 
         return [
             cluster
             for cluster in self._clusters
             if (show_ignored or not cluster.is_ignored)
             and (show_uncertain or not cluster.uncertain)
-            and (category == _ALL or cluster.category == category)
+            and cluster.printers_note == notes
+            and (notes or category == _ALL or cluster.category == category or _SOURCE_KEY.get(category, None) in cluster.sources)
         ]
+
+    def set_source_kinds(self, shown: bool) -> None:
+        """Offer "OCR findings" and "Pixel findings" as kinds to pick (the modes that find changes both ways)."""
+        self._offer(self._categories, shown)
+
+    def _offer_notes(self) -> None:
+        """"Printer's notes" is offered as a kind while there are any."""
+        self._offer(self._categories, self._source_kinds_shown, any(cluster.printers_note for cluster in self._clusters))
+
+    def set_categories(self, keys) -> None:
+        """Offer only these kinds of finding (in their usual order): a mode that never finds a kind (a leaflet has no
+        barcode or Braille to compare) does not list it."""
+        self._offer(tuple(key for key in CATEGORY_ORDER if key in set(keys)), self._source_kinds_shown)
+
+    def _offer(self, categories: tuple, source_kinds: bool, notes: bool | None = None) -> None:
+        notes = self._notes_offered if notes is None else notes
+        if categories == self._categories and source_kinds == self._source_kinds_shown and notes == self._notes_offered:
+            return
+        current = self.category_combo.currentData()
+        self._categories, self._source_kinds_shown, self._notes_offered = categories, source_kinds, notes
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        self.category_combo.addItem("All kinds", _ALL)
+        for key in categories:
+            self.category_combo.addItem(CATEGORY_LABELS[key], key)
+        if source_kinds:
+            for key, label in _SOURCE_KINDS:
+                self.category_combo.addItem(label, key)
+        if notes:
+            self.category_combo.addItem(_NOTES_LABEL, _NOTES)
+        index = self.category_combo.findData(current)
+        self.category_combo.setCurrentIndex(max(0, index))
+        self.category_combo.blockSignals(False)
+        if index < 0:  # what was picked is no longer offered: every kind is shown again
+            self._on_filters_changed()
+
+    @property
+    def colour_by_source(self) -> bool:
+        """Whether findings are coloured by how they were found (OCR or pixels) rather than by kind: while "OCR findings"
+        or "Pixel findings" is what the list is showing."""
+        return self.category_combo.currentData() in _SOURCE_KEY
 
     def marker_clusters(self) -> list[DiffCluster]:
         """What the viewer should draw: visible findings that are still active."""
@@ -204,6 +274,21 @@ class DiffListPanel(QWidget):
 
     def cluster(self, cluster_id: int) -> DiffCluster | None:
         return next((c for c in self._clusters if c.id == cluster_id), None)
+
+    @property
+    def clusters(self) -> list[DiffCluster]:
+        """Every finding on the list, filtered out or not."""
+        return list(self._clusters)
+
+    def replace_clusters(self, clusters: list[DiffCluster]) -> None:
+        """The list's findings are now `clusters` (an area was erased, or put back); merges of findings no longer on it
+        can no longer be split back."""
+        self._clusters = list(clusters)
+        self._merges = [merge for merge in self._merges if any(merge[0] is cluster for cluster in self._clusters)]
+        self._selected_id = None
+        self._offer_notes()
+        self._rebuild()
+        self.visibilityChanged.emit()
 
     # -- merging --------------------------------------------------------------
     @property
@@ -247,6 +332,11 @@ class DiffListPanel(QWidget):
         return True
 
     # -- interaction ----------------------------------------------------------
+    def mousePressEvent(self, event) -> None:
+        # a click in the list that no card took (the space below the last one): nothing selected
+        self.backgroundClicked.emit()
+        super().mousePressEvent(event)
+
     def select(self, cluster_id: int | None) -> None:
         self._selected_id = cluster_id
         self._rebuild()
@@ -307,7 +397,7 @@ class DiffListPanel(QWidget):
 
         visible = self.visible_clusters()
         for cluster in visible:
-            card = FindingCard(cluster, selected=cluster.id == self._selected_id)
+            card = FindingCard(cluster, selected=cluster.id == self._selected_id, by_source=self.colour_by_source)
             card.selectRequested.connect(self._on_card_selected)
             card.ignoreToggled.connect(self._on_ignore_toggled)
             self._cards_layout.addWidget(card)
@@ -326,20 +416,40 @@ class DiffListPanel(QWidget):
         self._update_header()
 
     def _update_header(self) -> None:
-        active = [c for c in self._clusters if not c.is_ignored and (self.show_uncertain_check.isChecked() or not c.uncertain)]
+        notes = self.category_combo.currentData() == _NOTES
+        active = [
+            c
+            for c in self._clusters
+            if not c.is_ignored and (self.show_uncertain_check.isChecked() or not c.uncertain) and c.printers_note == notes
+        ]
         ignored = sum(1 for c in self._clusters if c.is_ignored)
-        hidden = sum(1 for c in self._clusters if c.uncertain and not c.is_ignored and not self.show_uncertain_check.isChecked())
+        hidden = sum(
+            1 for c in self._clusters
+            if c.uncertain and not c.is_ignored and not self.show_uncertain_check.isChecked() and c.printers_note == notes
+        )
+        notes_hidden = 0 if notes else sum(1 for c in self._clusters if c.printers_note and not c.is_ignored)
         self.title_label.setText(f"Findings ({len(active)})")
 
-        # One chip per kind that is present, in that kind's colour: the same colour as its boxes in the two files.
-        counts = [
-            f'<span style="color:{category_colour(key)}">■</span> '
-            f"{sum(1 for c in active if c.category == key)} {CATEGORY_LABELS[key]}"
-            for key in CATEGORY_ORDER
-            if any(c.category == key for c in active)
-        ]
+        # One chip per kind present, in the colour its boxes and cards are drawn in -- or, while OCR or pixel findings
+        # are picked, per way of finding them, in theirs: the key to the colours on show.
+        if self.colour_by_source:
+            made = [source_of(c) for c in active]
+            counts = [
+                f'<span style="color:{SOURCE_COLOURS[source]}">■</span> {made.count(source)} {SOURCE_SHORT_LABELS[source]}'
+                for source in SOURCE_COLOURS
+                if source in made
+            ]
+        else:
+            counts = [
+                f'<span style="color:{category_colour(key)}">■</span> '
+                f"{sum(1 for c in active if c.category == key)} {CATEGORY_LABELS[key]}"
+                for key in CATEGORY_ORDER
+                if any(c.category == key for c in active)
+            ]
         if hidden:
             counts.append(f"{hidden} possible misread(s) hidden")
+        if notes_hidden:
+            counts.append(f"{notes_hidden} printer's note(s) hidden")
         if ignored:
             counts.append(f"{ignored} ignored")
         self.summary_label.setText("  ·  ".join(counts) if self._clusters else "")

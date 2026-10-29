@@ -9,7 +9,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pymupdf as fitz
-from PIL import Image
 from PySide6.QtCore import QObject, Signal
 
 from app.config import AppConfig, LeafletConfig
@@ -86,7 +85,7 @@ def _outcome(mode):
     return outcome
 
 
-def test_the_leaflet_toggles_are_offered_on_leaflet_results_only(qapp, tmp_path):
+def test_the_ocr_and_pixel_toggles_are_offered_only_where_both_are_compared(qapp, tmp_path):
     window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
     window.show()
     results = window.results_view
@@ -95,85 +94,81 @@ def test_the_leaflet_toggles_are_offered_on_leaflet_results_only(qapp, tmp_path)
     assert results.leaflet_text_check.isVisible() and results.leaflet_text_check.isChecked()
     assert results.leaflet_visual_check.isVisible() and not results.leaflet_visual_check.isChecked()
 
-    results.show_outcome(_outcome(ComparisonMode.AUTOMATIC), "a vs b")
+    results.show_outcome(_outcome(ComparisonMode.BARCODE), "a vs b")  # a mode that finds changes one way only
     assert not results.leaflet_text_check.isVisible()
     assert not results.leaflet_visual_check.isVisible()
     window.close()
 
 
-def test_leaflet_hides_the_edit_files_and_mode_switch_controls(qapp, tmp_path):
+def test_leaflet_offers_edit_files_but_not_the_mode_switch_controls(qapp, tmp_path):
     window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
     results = window.results_view
     results.show_outcome(_outcome(ComparisonMode.LEAFLET), "a vs b")
-    assert not results.edit_files_button.isVisible()
+    assert results.edit_files_button.isVisibleTo(results)  # every page of either file, edited (see leaflet_pages_dialog)
     assert not results.barcode_button.isVisible()
     assert not results.braille_button.isVisible()
     window.close()
 
 
-def test_the_only_ticked_strategy_cannot_be_unticked(qapp, tmp_path):
-    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+def _both_ways_outcome():
+    """A leaflet outcome whose strategies both found something: one change by reading, one in the pixels."""
+    from dataclasses import replace as _replace
+
+    from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType, SOURCE_OCR
+
+    outcome = _outcome(ComparisonMode.LEAFLET)
+    found = []
+    for number, (source, y) in enumerate([(SOURCE_OCR, 40), ("pixels", 10)], start=1):
+        member = DiffCandidate(BoundingBox(10, y, 60, y + 20), DiffType.TEXT, DiffSubtype.CHANGED, 1.0, f"by {source}", source=source)
+        found.append(DiffCluster(number, member.bbox, member.bbox, DiffType.TEXT, [member], detail=member.detail))
+    ocr_only = [c for c in found if "ocr" in c.sources]
+    return _replace(outcome, clusters=ocr_only, all_clusters=found, text_compared=True, graphics_compared=False)
+
+
+def test_the_ocr_and_pixel_toggles_show_and_hide_their_findings_at_once(qapp, tmp_path):
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window._on_compare()
+    window._on_completed(_both_ways_outcome())
     results = window.results_view
-    results.show_outcome(_outcome(ComparisonMode.LEAFLET), "a vs b")
+    assert [c.detail for c in results.panel.visible_clusters()] == ["by ocr"]
 
-    # only text is on: it is locked (nothing to fall back to), visual is free to tick
-    assert results.leaflet_text_check.isChecked() and not results.leaflet_text_check.isEnabled()
-    assert results.leaflet_visual_check.isEnabled()
+    results.leaflet_visual_check.setChecked(True)  # pixel findings too
+    assert sorted(c.detail for c in results.panel.visible_clusters()) == ["by ocr", "by pixels"]
+    results.leaflet_text_check.setChecked(False)  # pixel findings only
+    assert [c.detail for c in results.panel.visible_clusters()] == ["by pixels"]
+    results.leaflet_visual_check.setChecked(False)  # both off: nothing
+    assert results.panel.visible_clusters() == []
 
+    assert len(jobs.requests) == 1  # instant: nothing was compared again
+    window.close()
+
+
+def test_the_findings_shown_are_numbered_without_gaps(qapp, tmp_path):
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window._on_compare()
+    window._on_completed(_both_ways_outcome())
+    results = window.results_view
     results.leaflet_visual_check.setChecked(True)
-    # both on now: either could be unticked, since the other would still cover it
-    assert results.leaflet_text_check.isEnabled()
-    assert results.leaflet_visual_check.isEnabled()
-
     results.leaflet_text_check.setChecked(False)
-    # only visual left: now IT is the one locked
-    assert not results.leaflet_visual_check.isEnabled()
+    assert [c.id for c in results.panel.visible_clusters()] == [1]
     window.close()
 
 
-def test_ticking_visual_compares_the_same_files_again(qapp, tmp_path):
-    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+def test_leaflet_and_scan_findings_can_be_picked_by_how_they_were_found(qapp, tmp_path):
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
     window._on_compare()
-    (first,) = jobs.requests
-    assert first.config.leaflet.compare_visual is False
-    window._on_completed(_outcome(ComparisonMode.LEAFLET))
+    window._on_completed(_both_ways_outcome())
+    results = window.results_view
+    results.leaflet_visual_check.setChecked(True)
+    combo = results.panel.category_combo
+    labels = [combo.itemText(i) for i in range(combo.count())]
+    assert "OCR findings" in labels and "Pixel findings" in labels
+    combo.setCurrentIndex(labels.index("Pixel findings"))
+    assert [c.detail for c in results.panel.visible_clusters()] == ["by pixels"]
 
-    window.results_view.leaflet_visual_check.setChecked(True)
-
-    assert len(jobs.requests) == 2
-    again = jobs.requests[1]
-    assert again.mode is ComparisonMode.LEAFLET
-    assert (again.original_path, again.suspect_path) == (first.original_path, first.suspect_path)
-    assert again.config.leaflet.compare_visual is True
-    assert again.config.leaflet.compare_text is True  # untouched
-    window.close()
-
-
-def test_unticking_text_after_visual_is_on_compares_again_without_it(qapp, tmp_path):
-    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
-    window._on_compare()
-    window._on_completed(_outcome(ComparisonMode.LEAFLET))
-    window.results_view.leaflet_visual_check.setChecked(True)
-    window._on_completed(_outcome(ComparisonMode.LEAFLET))
-
-    window.results_view.leaflet_text_check.setChecked(False)
-
-    again = jobs.requests[-1]
-    assert again.config.leaflet.compare_text is False
-    assert again.config.leaflet.compare_visual is True  # the earlier toggle stuck
-    window.close()
-
-
-def test_a_leaflet_toggle_that_does_not_finish_puts_only_its_own_check_back(qapp, tmp_path):
-    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
-    window._on_compare()
-    window._on_completed(_outcome(ComparisonMode.LEAFLET))
-    window.results_view.leaflet_visual_check.setChecked(True)
-
-    window._on_failed("internal", "It broke.")
-
-    assert not window.results_view.leaflet_visual_check.isChecked()
-    assert window.results_view.leaflet_text_check.isChecked()  # untouched
+    results.show_outcome(_outcome(ComparisonMode.BARCODE), "a vs b")  # a mode that finds them one way only
+    labels = [combo.itemText(i) for i in range(combo.count())]
+    assert "OCR findings" not in labels
     window.close()
 
 
@@ -267,3 +262,61 @@ def test_page_specs_join_runs_and_read_back():
     assert page_spec({1, 2, 3}, 3) == ""  # every page
     assert parse_spec("1-3,5", 6) == {1, 2, 3, 5}
     assert parse_spec("", 4) == {1, 2, 3, 4}
+
+
+# ---- Erase area (Leaflet results) ---------------------------------------------------------------------------------------
+
+
+def test_erase_is_offered_on_leaflet_results_only(qapp, tmp_path):
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window.show()
+    results = window.results_view
+    window.stack.setCurrentWidget(results)
+    results.show_outcome(_outcome(ComparisonMode.LEAFLET), "a vs b")
+    assert results.viewport.erase_button.isVisible()
+    results.show_outcome(_outcome(ComparisonMode.AUTOMATIC), "a vs b")
+    assert not results.viewport.erase_button.isVisible()
+    window.close()
+
+
+def test_erasing_an_area_clears_it_from_both_pictures_and_removes_its_findings_at_once(qapp, tmp_path):
+    from PySide6.QtCore import QRectF
+
+    window, jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window._on_compare()
+    window._on_completed(_both_ways_outcome())
+    results = window.results_view
+    viewport = results.viewport
+    results.leaflet_visual_check.setChecked(True)
+    before = viewport._original_rgb[0:35, 0:100].copy(), viewport._suspect_rgb[0:35, 0:100].copy()
+
+    viewport.erase_button.click()
+    assert viewport.erase_mode and not viewport.merge_mode
+    viewport._on_region_selected(QRectF(0, 0, 100, 35))  # round the pixel finding (10..60, 10..30) only
+    assert not viewport.erase_mode  # one rectangle at a time
+    assert (viewport._original_rgb[0:35, 0:100] == 255).all() and (viewport._suspect_rgb[0:35, 0:100] == 255).all()
+    assert [(c.detail, c.id) for c in results.panel.visible_clusters()] == [("by ocr", 1)]
+    # gone for good: showing pixel findings again does not bring it back
+    results.leaflet_visual_check.setChecked(False)
+    results.leaflet_visual_check.setChecked(True)
+    assert [c.detail for c in results.panel.visible_clusters()] == ["by ocr"]
+    assert len(jobs.requests) == 1  # instant: nothing was compared again
+
+    viewport.undo_erase_button.click()
+    assert (viewport._original_rgb[0:35, 0:100] == before[0]).all() and (viewport._suspect_rgb[0:35, 0:100] == before[1]).all()
+    assert sorted(c.detail for c in results.panel.visible_clusters()) == ["by ocr", "by pixels"]
+    assert viewport.undo_erase_button.isHidden()
+    window.close()
+
+
+def test_merge_and_erase_are_one_tool_at_a_time(qapp, tmp_path):
+    window, _jobs = _loaded_window(qapp, tmp_path, ComparisonMode.LEAFLET)
+    window._on_compare()
+    window._on_completed(_both_ways_outcome())
+    viewport = window.results_view.viewport
+    viewport.merge_button.click()
+    viewport.erase_button.click()
+    assert viewport.erase_mode and not viewport.merge_mode
+    viewport.merge_button.click()
+    assert viewport.merge_mode and not viewport.erase_mode
+    window.close()

@@ -260,6 +260,9 @@ class DetectionConfig:
     # colour dark enough to be solid on darkness alone) is already past `ink_solid_high` and unaffected.
     ink_solid_chroma_px: float = 40.0
     ink_solid_neutral_margin: float = 60.0
+    # Scan vs Digital's black-and-white VIEW (not what is read or compared): coloured panels removed like the paper, what
+    # is printed on them black (`scan_normalizer._colour_panels_removed`).
+    shown_colour_panels_removed: bool = True
     # Scan vs Digital compares TEXT (and barcode bars as marks). Its graphics are SHOWN only if this is set: a scan
     # changes every colour, blurs every edge and never registers exactly, and comparing the two pictures gave dozens
     # of false 'graphics' differences (a fold line, the scanner's own edge, every dark block) round the few real ones.
@@ -273,6 +276,16 @@ class DetectionConfig:
     # What each file is READ from in Scan vs Digital (see scan_normalizer.reading_source): 'ink' (the ink picture: background
     # removed, ink black), 'gray' (the file's own grey), 'flat' (grey with the paper divided out), 'darkest' (the darkest
     # channel, paper divided out), 'clahe' (flat, local contrast stretched) or 'adaptive' (flat, thresholded locally).
+    # Scan vs Digital: the digital file's Braille dots (found by their shape and arrangement) are left out of what is
+    # read and compared -- a print embosses Braille, it does not print it (`braille_diff.braille_mask`).
+    scan_ignore_braille: bool = True
+    # Scan vs Digital: a graphics finding whose differing ink comes in no piece bigger than this (pixels, at 300 DPI:
+    # ~0.4 mm^2) is residual ink -- dust, a toner speck, bleed along a stroke -- not a printed mark (measured: specks <= 35,
+    # the smallest real mark 143). 0 keeps them all.
+    scan_residual_ink_px: int = 60
+    # Scan vs Digital: a solid area printed in a different ink (its hue 60+ degrees from the file's, both clearly coloured)
+    # is a colour finding, though colour is otherwise not compared in a scan (`worker._colour_swaps`).
+    scan_colour_swaps: bool = True
     scan_reading_digital: str = "ink"
     scan_reading_scan: str = "ink"
     # A line that differs is read again, from its own window, in the picture above AND in this one ("" for none): a word
@@ -332,12 +345,8 @@ class DetectionConfig:
     # language's tessdata installed can be read as more than shapes. A finding a word cannot be read for is still
     # found and located from its pixels (OCR only DESCRIBES a finding, never decides one) -- it is just not
     # captioned with the words. See `app.engine.ocr_locator.available_languages`.
-    ocr_language: str = "eng"
+    ocr_language: str = "auto"  # "auto": found on the files themselves (`app.engine.language_detect`)
     text_move_tolerance_px: float = 6.0
-    # Two digital files are read the same where their pixels are the same: a word read differently over
-    # marks that agree this closely (within 2 px, each way) is the reader's inconsistency (reading a page
-    # groups its lines differently when anything else on it differs), not a change.
-    text_identical_marks_agreement: float = 0.985
     # Reading a SCAN is noisier than reading the digital file it came from. Compared page against page,
     # a changed digit reshuffled the reading order and one identical layout gave 23 false 'changes'
     # (a case or comma, an l read as i, a line grouped differently, rotated text read as junk). So
@@ -359,13 +368,6 @@ class DetectionConfig:
     text_present_ink_agreement: float = 0.5
     text_added_confidence: float = 70.0
     text_added_ink_share: float = 0.25
-    # A word read differently in the scan whose ink lies, at least this much of it each way (within 2 px), on the
-    # digital word's ink was very probably only misread: it is kept, ranked Minor and worded as a likely misread.
-    # (A real one-letter change also matches this closely, so it cannot be dropped -- only ranked.)
-    text_misread_ink_agreement: float = 0.96
-    # ...where 'on the same ink' is judged to this many pixels: a scan's dot gain makes a hairline of lettering several
-    # times as thick, so its ink lies further from the digital's than a couple of pixels.
-    text_misread_slack_px: int = 3
     # Where the two files' INK PICTURES are, in the difference's box, the same picture -- correlate (normalised, softened a little,
     # each window about a letter wide re-settling within a few pixels of where the scan sits, so a line's warp along a
     # scan is not counted against it) at least `text_same_ink_loose_correlation` as a whole (one shift for the box; only
@@ -390,6 +392,26 @@ class DetectionConfig:
     # registered pair forgives one pixel only (`effective_detection_config`): with two, a 0 -> 1 in six-pixel type was
     # 'the same marks' and was missed (a 0 and a 1 are within two pixels of each other's strokes).
     residue_slack_px: int = 2
+    # Leaflet: a difference that is only its marks moved by up to this many pixels -- every letter the same shape and
+    # colour a pixel or two away, as an "open" document turned into outlines has them -- is not a change
+    # (`app.engine.detectors.nudge`). 0 turns this off.
+    nudge_tolerance_px: float = 3.0
+    # Automatic mode also compares the two artworks word by word (`app.engine.word_strategy`) on its own alignment: those
+    # findings are kept with the result, hidden, and shown at once by the results page's "OCR findings" toggle.
+    # The pieces of one line of text (each letter of a line re-set) are one finding, and the pieces of one photograph (a
+    # picture re-edited) too (`worker._by_text_line`, `worker._by_picture`).
+    group_text_lines: bool = True
+    group_pictures: bool = True
+    # ...and an element moved or resized in the suspect (a logo re-placed) is one finding (`detectors.elements`).
+    match_moved_elements: bool = True
+    automatic_ocr: bool = True
+    # Automatic mode only: compare as a FOOD LABEL (or any consumer label: a snack pack, a drinks wrapper) -- by the
+    # things printed (a logo, a sticker, a strip, a block of type, a photograph) rather than by the pixel, for artwork
+    # whose background is re-laid, whose photograph is re-shot and whose panels move as a whole (`app.engine.food_label`).
+    food_label: bool = False
+    # Scan vs Digital: how far inside its own outline a scan is compared from, at most (a share of its long edge; ~5 px on
+    # an A4 scan at 300 DPI). See `worker.run_comparison`.
+    scan_edge_inset_max_norm: float = 0.0015
     residue_max_colour_delta: float = 2.0
     # Two exports of the same artwork often render a solid ink a few dE apart (a colour profile: one pink or black a
     # shade off across the whole page), which is not a change to a piece of it: 4.6 on a wordmark, 4.0 on a black word.
@@ -417,6 +439,10 @@ class DetectionConfig:
     # be fitted by one transform for the whole sheet. Applies after any lift, auto-found or the reviewer's own, and
     # to a crop, in every comparison mode; a block whose own fit is no better keeps the whole-sheet transform.
     block_alignment_enabled: bool = True
+    # Leaflet: a page is aligned panel by panel only where its page-wide fit is not sure -- fewer than this share of its
+    # matched features agree on it, or they fit it worse than this (see `worker.run_comparison`).
+    leaflet_sure_fit_inlier_share: float = 0.5
+    leaflet_sure_fit_residual_px: float = 1.5
     block_min_area_fraction: float = 0.015  # a block is at least this share of the artwork (a logo or a line of text is not)
     # A margin this wide either side of a locally-aligned block's own edge is left out of detection: where its
     # own warp meets its neighbour's is this composite's own construction (feathered, not removed, by
@@ -426,10 +452,24 @@ class DetectionConfig:
     # Something missing where it was and added where it is, looking alike, is one finding: that it moved. And a finding whose
     # crop of the original fits the suspect a few pixels away is that picture moved.
     pair_moves: bool = True
+    # A carton's die lines (cut, crease, perforation: `app.engine.isolation.die_lines`) are left out of the comparison in
+    # both files, so one file drawing them and the other not, or in another colour or dash, is never a finding.
+    ignore_die_lines: bool = True
     find_moves: bool = True
     find_moves_max_findings: int = 300
     local_coarse_threshold: int = 24
     local_tolerance: int = 32
+    # Calibrated to the pair (hysteresis, as an edge detector does it): a difference's extent is what differs by more than
+    # `local_tolerance`, but it is a difference only if some of it -- `local_proof_min_pixels` -- differs by more than
+    # `local_proof_tolerance`, set from the pair's own measured noise (`local_diff.measure_noise`: how much the two files
+    # still differ where they print the same thing -- rendering, anti-aliasing, registration, a softer export) as
+    # `local_noise_margin` times it, within `local_tolerance`..`local_tolerance_max`. A noisy pair's noise is not flagged,
+    # and a real change is not cut into pieces by a higher bar (raising `local_tolerance` itself did that). 0 = no proof.
+    local_calibrate: bool = True
+    local_noise_margin: float = 2.0
+    local_tolerance_max: int = 48
+    local_proof_tolerance: int = 0
+    local_proof_min_pixels: int = 3
     local_blur_px: float = 0.8
     local_shift_radius_px: int = 2
     local_forgive_px: int = 1
@@ -449,7 +489,7 @@ class DetectionConfig:
     local_line_min_length_px: int = 60
     # What a finding says is then READ from its own box (never the whole page: two readings of one page group
     # their lines differently and report areas that did not change). At most this many findings are read.
-    text_describe_max_findings: int = 80
+    text_describe_max_findings: int = 250
     # A word is claimed changed, missing or new only if it was read at least this surely, and the pixels back it: over
     # the same marks (to `residue_min_agreement`) a reading that differs is the reader's; a word said to be
     # missing or new whose marks are still at least this much the same in the other file is unread there, not gone.
@@ -604,6 +644,7 @@ class SeriesConfig:
     # After a repeat is found, another is not looked for within this fraction of the template's width/height of it (a
     # real neighbour, printed with a gap, sits further off; this only stops the same instance being found twice).
     suppression_fraction: float = 0.3
+    max_repeat_workers: int = 4  # repeats are compared this many at a time (each comparison already threads its own work)
 
 
 @dataclass(frozen=True)
@@ -621,7 +662,7 @@ class LeafletConfig:
 
     # A Tesseract language code, or several joined with "+" (e.g. "eng+fra+deu"): whichever of them has its tessdata
     # installed is used; none installed falls back to English and says so once, rather than failing page by page.
-    language: str = "eng"
+    language: str = "auto"  # (as `DetectionConfig.ocr_language`)
     max_page_workers: int = 4  # pages are compared this many at a time (each comparison already threads its own work)
     page_gap_px: int = 28  # blank strip between one page and the next in the stacked view, with a label drawn on it
     # When the two files do not have the same number of pages, each page is paired with its most alike page in the

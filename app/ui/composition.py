@@ -43,17 +43,21 @@ def compose_flicker(
     suspect: np.ndarray,
     difference_boxes: list[BoundingBox],
     phase: int,
+    whole: bool = False,
 ) -> np.ndarray:
     """The original everywhere except where a difference lives (FR-8.2).
 
     Unchanged areas hold still on the original; each area containing a
     difference alternates between the two files, so only the flagged regions
     flicker and the reviewer is not left hunting for a change across a whole
-    page blinking at them.
+    page blinking at them. `whole`: the whole of each file alternates instead
+    (to see anything the findings did not flag).
     """
     base = original.copy()
     if phase % 2 == 0:
         return base
+    if whole:
+        return suspect.copy()
     height, width = base.shape[:2]
     for box in difference_boxes:
         x0, y0 = max(0, int(box.x0)), max(0, int(box.y0))

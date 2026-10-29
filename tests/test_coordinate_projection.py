@@ -17,7 +17,6 @@ from app.config import AppConfig
 from app.engine.aggregation.coordinate_projection import (
     original_to_suspect,
     project_box,
-    suspect_to_original,
 )
 from app.engine.alignment.homography import apply_transform
 from app.engine.worker import run_comparison
@@ -44,7 +43,7 @@ def test_a_pure_translation_round_trips_exactly():
     in_suspect = original_to_suspect(box, translation)
     assert in_suspect == BoundingBox(75, 110, 275, 260)
 
-    back = suspect_to_original(in_suspect, translation)
+    back = project_box(in_suspect, translation)
     assert back == box
 
 
@@ -64,7 +63,7 @@ def test_a_round_tripped_box_always_contains_the_original(angle):
     transform = _rotation(angle, tx=15, ty=-8)
     box = BoundingBox(100, 100, 300, 250)
 
-    round_trip = suspect_to_original(original_to_suspect(box, transform), transform)
+    round_trip = project_box(original_to_suspect(box, transform), transform)
 
     assert round_trip.x0 <= box.x0 + 1e-9 and round_trip.y0 <= box.y0 + 1e-9
     assert round_trip.x1 >= box.x1 - 1e-9 and round_trip.y1 >= box.y1 - 1e-9
@@ -73,7 +72,7 @@ def test_a_round_tripped_box_always_contains_the_original(angle):
 def test_box_inflation_stays_small_for_realistic_alignments():
     """Real misalignments are a degree or two; the marker must not balloon."""
     box = BoundingBox(100, 100, 300, 250)
-    round_trip = suspect_to_original(original_to_suspect(box, _rotation(1.5)), _rotation(1.5))
+    round_trip = project_box(original_to_suspect(box, _rotation(1.5)), _rotation(1.5))
     assert round_trip.area < box.area * 1.15
 
 
@@ -141,7 +140,7 @@ def test_the_two_boxes_are_the_same_region_seen_through_one_transform():
     outcome = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, AppConfig())
 
     for cluster in outcome.clusters:
-        back = suspect_to_original(cluster.bbox_in_suspect, outcome.alignment.transform)
+        back = project_box(cluster.bbox_in_suspect, outcome.alignment.transform)
         # The suspect-side box was inflated by the rotation, so what comes back
         # must contain the original box -- never miss part of what was found.
         assert back.x0 <= cluster.bbox_in_original.x0 + 1e-6

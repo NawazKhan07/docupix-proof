@@ -30,10 +30,11 @@ import cv2
 import numpy as np
 
 from app.config import DetectionConfig
+from app.engine import language_detect
 from app.engine.alignment.homography import apply_transform
 from app.engine.detectors import text_diff
 from app.engine.detectors.text_diff import OcrWord, canonical
-from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
+from app.models.diff import SOURCE_OCR, BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 logger = logging.getLogger(__name__)
 
@@ -435,7 +436,12 @@ def _reread(
             else:
                 subtype, detail = DiffSubtype.ADDED, f"'{text_new}' added in suspect"
             confidence = min(w.confidence for w in gone2 + new2) / 100.0
-            results.append(DiffCandidate(bbox=change_box, type=_span_type(text_gone + text_new), subtype=subtype, confidence=confidence, detail=detail))
+            results.append(
+                DiffCandidate(
+                    bbox=change_box, type=_span_type(text_gone + text_new), subtype=subtype, confidence=confidence, detail=detail,
+                    was_text=text_gone, now_text=text_new,
+                )
+            )
         else:
             results.append(text_diff._set_differently(change_box, alike, original, suspect, config))
     return results
@@ -512,7 +518,7 @@ _LANGUAGE_SCRIPTS = {
 }
 
 
-def _scripts_of(language: str) -> set[str] | None:
+def _scripts_of(language: str) -> set[str] | None:  # (`language` resolved: never "auto")
     """The scripts `language` (Tesseract's codes, '+'-joined) reads; None if any of it is a language not listed."""
     scripts: set[str] = set()
     for code in language.split("+"):
@@ -609,7 +615,6 @@ _WORD_MAX_HEIGHTS = 3.0  # a blob of print taller than this many type-heights, o
 _WORD_MAX_WIDTH_HEIGHTS = 40.0  # ...wider, is not a word (a rule, a frame, a picture)
 DEFAULT_TYPE_PX = 40.0  # the type's height where neither page has text of its own to measure it by (~9 pt at 300 DPI)
 _BLOCK_SEGMENTATION = "--psm 6"
-_PAGE_SEGMENTATION = "--psm 3"
 
 
 _LETTER_TO_WORD_BOX = 1.6  # a word's box (ascenders to descenders) is about this many times its letters' median height
@@ -752,7 +757,7 @@ def compare_words(
     words_o, words_s = _words(original_words), _words(suspect_words)
     script_candidates: list[DiffCandidate] = []
     if (original_layer is None) != (suspect_layer is None):
-        scripts = _scripts_of(language)
+        scripts = _scripts_of(language_detect.resolve(language))
         if scripts is not None:
             layer_first = original_layer is not None
             own, read = (words_o, words_s) if layer_first else (words_s, words_o)
@@ -830,6 +835,8 @@ def compare_words(
                 subtype=subtype,
                 confidence=0.8 if read else 1.0,
                 detail=detail,
+                was_text=_text(gone),
+                now_text=_text(new),
             )
         )
         was_read.append(unsure)
@@ -845,6 +852,8 @@ def compare_words(
         dropped += sum(candidate is None for candidate in closer)
         candidates = [candidate for candidate in candidates if candidate is not None]
     candidates += script_candidates
+    for candidate in candidates:
+        candidate.source = SOURCE_OCR  # found by comparing the words (their print only confirms it)
     logger.info(
         "page words compared",
         extra={"original_words": len(words_o), "suspect_words": len(words_s), "changes": len(candidates), "same_ink": dropped},

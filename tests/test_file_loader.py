@@ -107,14 +107,14 @@ def test_the_page_budget_steps_down_to_what_memory_can_hold(monkeypatch):
 
     gib = 2**30
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (64 * gib, 40 * gib))
-    assert file_loader.affordable_megapixels(100.0) == 100.0  # plenty: the configured limit
+    assert file_loader.memory_budget(100.0)[0] == 100.0  # plenty: the configured limit
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (14 * gib, 4.3 * gib))
-    assert file_loader.affordable_megapixels(100.0) == 50.0  # a busy 14 GB machine: what is free decides
+    assert file_loader.memory_budget(100.0)[0] == 50.0  # a busy 14 GB machine: what is free decides
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (14 * gib, 4.4 * gib))
-    assert file_loader.affordable_megapixels(100.0) == 50.0  # ...and a little more free is the same step
+    assert file_loader.memory_budget(100.0)[0] == 50.0  # ...and a little more free is the same step
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (8 * gib, 7 * gib))
-    assert file_loader.affordable_megapixels(100.0) == 50.0  # an idle 8 GB machine: its installed memory decides
+    assert file_loader.memory_budget(100.0)[0] == 50.0  # an idle 8 GB machine: its installed memory decides
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (4 * gib, 0.5 * gib))
-    assert file_loader.affordable_megapixels(100.0) == 18.0  # never below a carton at 300 DPI
+    assert file_loader.memory_budget(100.0)[0] == 18.0  # never below a carton at 300 DPI
     monkeypatch.setattr(file_loader, "_memory_bytes", lambda: None)
-    assert file_loader.affordable_megapixels(100.0) == 100.0  # unknown: the configured limit
+    assert file_loader.memory_budget(100.0)[0] == 100.0  # unknown: the configured limit

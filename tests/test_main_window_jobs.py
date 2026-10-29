@@ -154,3 +154,28 @@ def test_opening_the_window_warms_the_worker_up_unless_told_not_to(qapp, monkeyp
     qapp.processEvents()
     window.close()
     assert warmed == [1]
+
+
+def test_loading_both_files_prepares_the_comparison_before_compare_is_pressed(qapp, tmp_path):
+    """Rendering, lifting the artwork and aligning start as soon as the files are in (see `app.engine.prepared`):
+    once the setup has stayed put a moment, the worker is asked to prepare exactly what Compare would run."""
+    controller = JobController(RuntimeConfig(), target=fake_workers.prepare_recording_main)
+    window = MainWindow(jobs=controller)
+    results = []
+    controller.completed.connect(results.append)
+    try:
+        controller.warm_up()
+        _wait(qapp, lambda: controller._worker_ready)
+        a, b = _pair(tmp_path)
+        window.upload_panel.original_slot.load_path(a)
+        window.upload_panel.suspect_slot.load_path(b)
+        _wait(qapp, lambda: not window._prepare_timer.isActive())  # the pause after the last change
+        expected = window._setup_request()
+        window._on_compare()
+        _wait(qapp, lambda: bool(results))
+
+        assert expected in results[0]["prepared"]
+        assert results[0]["request"] == expected
+    finally:
+        controller.shutdown()
+        window.close()

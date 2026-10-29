@@ -10,7 +10,6 @@ import zxingcpp
 from app.config import DetectionConfig
 from app.engine.detectors import barcode_diff, braille_diff, color_diff, graphics_diff, text_diff
 from app.engine.ocr_locator import find_tesseract
-from app.engine.preprocessing.scan_normalizer import normalize_for_scan
 from app.models.diff import DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
@@ -138,49 +137,6 @@ def test_registration_tolerance_drops_resampling_halos_but_keeps_real_changes():
 # ---------------------------------------------------------------------------
 # Scan vs Digital preprocessing
 # ---------------------------------------------------------------------------
-
-
-def test_scan_normalizer_flattens_background_and_blackens_text():
-    image = _artwork()
-    # Simulate a scan: warm grey cast plus a vignette.
-    scanned = (image * 0.82 + 30).astype(np.uint8)
-    vignette = np.linspace(0.75, 1.0, scanned.shape[1])[None, :, None]
-    scanned = np.clip(scanned * vignette, 0, 255).astype(np.uint8)
-
-    normalized = normalize_for_scan(scanned)
-
-    unique_values = np.unique(normalized)
-    assert set(unique_values.tolist()) <= {0, 255}  # pure black and white only
-    gray = cv2.cvtColor(normalized, cv2.COLOR_RGB2GRAY)
-    assert (gray == 255).mean() > 0.5  # background really is white
-    assert (gray == 0).any()  # and the text survived
-
-
-def test_scan_normalizing_both_sides_removes_a_colour_cast_and_vignette():
-    """A scan's lighting must not read as a difference once normalized."""
-    original = _artwork()
-    scanned = np.clip(original * 0.8 + 25, 0, 255).astype(np.uint8)
-    vignette = np.linspace(0.70, 1.0, scanned.shape[1])[None, :, None]
-    scanned = np.clip(scanned * vignette, 0, 255).astype(np.uint8)
-
-    assert color_diff.detect(original, scanned, CONFIG)  # differs before
-
-    normalized_original = normalize_for_scan(original)
-    normalized_scan = normalize_for_scan(scanned)
-    agreement = float((normalized_original == normalized_scan).mean())
-    assert agreement > 0.995  # essentially identical after
-    assert graphics_diff.detect(normalized_original, normalized_scan, CONFIG) == []
-
-
-def test_scan_normalizer_keeps_solid_artwork_elements():
-    """Regression: an early background estimate with a fixed 31 px window
-    read a 100 px solid roundel as background and erased it outright."""
-    image = _artwork()
-    normalized = cv2.cvtColor(normalize_for_scan(image), cv2.COLOR_RGB2GRAY)
-
-    assert normalized[240, 430] == 0  # the solid roundel survived
-    assert normalized[245, 155] == 0  # so did the solid block
-    assert normalized[390, 300] == 255  # and the page is still white
 
 
 # ---------------------------------------------------------------------------

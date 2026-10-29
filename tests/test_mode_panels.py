@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 from PySide6.QtCore import QEvent, QPointF, Qt
@@ -73,7 +74,9 @@ def test_a_symbol_missing_from_the_suspect_fails_and_says_not_found(symbols):
 
 def test_both_values_are_shown_so_the_difference_can_be_read(symbols):
     (card,) = [c for c in symbols.cards() if c.comparison.original_value == "161"]
-    assert "161" in card.original_label.text() and "417" in card.suspect_label.text()
+    shown = lambda label: re.sub("<[^>]+>", "", label.text())  # (the characters that differ are marked up)
+    assert "161" in shown(card.original_label) and "417" in shown(card.suspect_label)
+    assert "<b" in card.suspect_label.text()  # ...marked
 
 
 def test_the_summary_counts_failures(symbols):

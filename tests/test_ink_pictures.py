@@ -20,7 +20,7 @@ from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import text_diff
 from app.engine.detectors.structure_diff import StructureResult
 from app.engine.ocr_locator import find_tesseract
-from app.engine.preprocessing.scan_normalizer import ink_image
+from app.engine.preprocessing.scan_normalizer import ink_image, ink_pair
 from app.engine.worker import _for_reading, _readable_only, run_comparison
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 from app.models.isolation import IsolationGeometry, NormalizedRect
@@ -131,16 +131,45 @@ def test_coloured_ink_is_black(colour):
     assert (ink[:200] == 255).all()
 
 
-def test_white_lettering_on_a_dark_block_stays_visible_as_white_on_black():
+def test_white_lettering_on_a_dark_block_comes_out_black_on_white():
+    """A colour panel is paper and what is printed on it ink, whatever the panel's colour: the scan's colours are never
+    the digital file's, and the words on it are compared as words, not as holes in a block."""
     page = _page()
     cv2.rectangle(page, (100, 200), (900, 500), (0, 130, 70), -1)  # a dark green bar
     _text(page, "AMPHOTRET", (160, 380), WHITE, scale=3.0, thickness=8)
 
     ink = ink_image(page, CONFIG)
 
-    assert (ink[220:250, 120:880] < 20).mean() > 0.98  # the block is a solid black graphic
+    assert (ink[220:250, 120:880] > 235).mean() > 0.98  # the panel is paper
     letters = ink[300:390, 160:880]
-    assert 0.08 < (letters > 235).mean() < 0.6  # and the letters read as white holes in it
+    assert 0.08 < (letters < 40).mean() < 0.6  # and its letters are ink
+
+
+def test_lettering_on_a_mid_coloured_panel_is_not_lost_with_the_panel():
+    """A lighter colour (a mid green, a sky blue) is judged a tint and comes out as paper: its reversed-out white type and
+    its yellow type on it must come out as ink, not as paper with it."""
+    page = _page()
+    cv2.rectangle(page, (100, 150), (900, 650), (90, 180, 60), -1)  # a mid green panel
+    _text(page, "BLACIDEC 10", (160, 320), WHITE, scale=2.2, thickness=6)
+    _text(page, "Solifenacin", (160, 500), (250, 230, 40), scale=2.0, thickness=5)  # yellow on green
+
+    ink = ink_image(page, CONFIG)
+
+    assert (ink[160:200, 110:890] > 235).mean() > 0.95  # the panel is paper
+    assert (ink[250:330, 160:800] < 40).mean() > 0.08  # the white type is ink
+    assert (ink[440:510, 160:760] < 40).mean() > 0.08  # so is the yellow type
+
+
+def test_a_white_shape_on_a_panel_keeps_its_own_type_rather_than_turning_black():
+    page = _page()
+    cv2.rectangle(page, (100, 150), (900, 650), (90, 180, 60), -1)  # a green panel
+    cv2.ellipse(page, (500, 400), (220, 110), 0, 0, 360, WHITE, -1)  # a white oval logo on it
+    _text(page, "MSN", (400, 430), (20, 20, 20), scale=2.0, thickness=5)  # its own dark type
+
+    ink = ink_image(page, CONFIG)
+
+    oval = ink[330:470, 320:680]
+    assert 0.05 < (oval < 40).mean() < 0.5  # the oval's type is ink, the oval itself is not a black blob
 
 
 def test_a_neutral_grey_backdrop_stays_white_not_a_false_solid_block():
@@ -430,7 +459,8 @@ def test_a_large_page_is_reduced_for_reading_and_a_small_one_is_left_alone():
 
 
 def test_text_is_read_from_the_ink_pictures(monkeypatch):
-    """The text detector is handed the ink pictures (grey, 255 = background), not the colour originals."""
+    """The text detector is handed the ink pictures (grey, 255 = background), not the colour originals. The reviewer is
+    shown the same pictures with each stroke cut at its edge: never blacker anywhere than what was read."""
     page = _label()
     seen = []
 
@@ -439,7 +469,90 @@ def test_text_is_read_from_the_ink_pictures(monkeypatch):
         return text_diff.TextScanResult([])
 
     monkeypatch.setattr(text_diff, "detect_scan", fake_detect)
-    outcome = run_comparison(page, simulate_scan(page, LIGHT), ComparisonMode.SCAN_VS_DIGITAL, AppConfig())
+    config = AppConfig(detection=replace(DetectionConfig(), shown_colour_panels_removed=False))  # (the edges alone, here)
+    outcome = run_comparison(page, simulate_scan(page, LIGHT), ComparisonMode.SCAN_VS_DIGITAL, config)
 
     assert len(seen) == 1 and seen[0][0].ndim == 2 and seen[0][0].dtype == np.uint8
-    assert np.array_equal(seen[0][0], outcome.ink_original) and np.array_equal(seen[0][1], outcome.ink_suspect)
+    assert (outcome.ink_original >= seen[0][0]).all() and (outcome.ink_suspect >= seen[0][1]).all()
+    assert (outcome.ink_original < 128).sum() > 0.8 * (seen[0][0] < 128).sum()  # the same type, a little finer
+
+
+def test_a_scans_own_outline_is_not_set_so_far_inside_it_that_it_cuts_the_type(monkeypatch):
+    """A scan's traced outline is set inside its soft edge; on a label whose type runs close to its edge, far enough to
+    cut the first letters off every line. In Scan vs Digital it is kept to a few pixels."""
+    import app.engine.worker as worker
+    from app.models.isolation import IsolationGeometry, NormalizedRect
+
+    seen = []
+    original_of = worker._Area.of
+
+    def recording(image, geometry):
+        seen.append(geometry)
+        return original_of(image, geometry)
+
+    monkeypatch.setattr(worker._Area, "of", staticmethod(recording))
+    page = _page()
+    _text(page, "PARACETAMOL", (160, 380), (20, 20, 20), scale=2.0, thickness=5)
+    wide = IsolationGeometry(boundary=NormalizedRect(0.05, 0.05, 0.95, 0.95), boundary_origin="lifted", edge_inset_norm=0.02)
+    try:
+        worker.run_comparison(page, page.copy(), ComparisonMode.SCAN_VS_DIGITAL, AppConfig(), wide, wide)
+    except Exception:  # noqa: BLE001 -- (only the areas it was given matter here)
+        pass
+    scan_geometry = seen[1]
+    assert scan_geometry.edge_inset_norm == AppConfig().detection.scan_edge_inset_max_norm
+    assert seen[0].edge_inset_norm == 0.02  # the digital file's own is left as it is
+
+
+# ---- the picture shown: each stroke cut at its true edge -------------------------------------------------------------
+
+
+def test_a_blurred_scans_type_is_shown_no_bolder_than_the_files_and_its_thin_strokes_whole():
+    """A scan blurs every edge, and the ramp that keeps faint thin type whole took a blur's outer half for ink: a scan's
+    bold type came out filled in. Worse, thinning the whole picture to match the file's weight broke its thin strokes.
+    The picture shown cuts each stroke where it is half as much ink as the stroke itself, whatever its strength."""
+    digital = _page((250, 246, 236), size=(420, 900))
+    _text(digital, "Please refer to the package", (30, 110), (20, 20, 20), scale=1.4, thickness=5)  # bold
+    _text(digital, "Each vial contains", (30, 260), (60, 60, 60), scale=1.2, thickness=1)  # thin, grey
+    # a print and its scan: a soft edge whose middle prints darker (ink spread) -- a scan's type measures bolder
+    darkness = (255.0 - cv2.GaussianBlur(digital, (0, 0), 1.2).astype(np.float32)) / 255.0
+    scan = np.clip(255.0 * (1.0 - np.sqrt(darkness)), 0, 255).astype(np.uint8)
+
+    pictures = ink_pair(digital, scan, CONFIG)
+
+    def weight(ink, rows):
+        return int((ink[rows] < 128).sum())
+
+    def pieces(ink, rows):
+        return cv2.connectedComponents((ink[rows] < 128).astype(np.uint8))[0] - 1
+
+    bold, thin = slice(40, 140), slice(210, 290)
+    # read from: the scan's type is bolder than the file's (what Tesseract was measured to read best) ...
+    assert weight(pictures.second, bold) > 1.03 * weight(pictures.first, bold)
+    # ... shown: cut at its edges, no bolder than the file's
+    assert weight(pictures.shown_second, bold) < 0.9 * weight(pictures.second, bold)
+    assert weight(pictures.shown_second, bold) <= weight(pictures.shown_first, bold)
+    # and the thin grey type neither lost nor broken into more pieces than the file's letters
+    assert weight(pictures.shown_second, thin) > 0.9 * weight(pictures.shown_first, thin)
+    assert pieces(pictures.shown_second, thin) <= pieces(pictures.shown_first, thin)
+
+
+def test_the_view_removes_a_coloured_panel_and_shows_its_type_black_in_both_files_alike():
+    """Scan vs Digital removes the background colour: a coloured panel is shown as paper like the paper, and the type on
+    it -- white knocked out of a green, black on a red -- is shown black. A scan's colours are a little off the file's:
+    both files are treated alike, so the panel is paper in both (not a block in one, paper in the other)."""
+    page = _page(size=(900, 1000))
+    cv2.rectangle(page, (100, 100), (900, 600), (20, 130, 70), -1)  # a green panel
+    _text(page, "ORIGINAL", (180, 300), (255, 255, 255), scale=3.0, thickness=8)  # white type knocked out of it
+    cv2.rectangle(page, (600, 380), (860, 560), (215, 35, 50), -1)  # a red box on it
+    _text(page, "NEW", (640, 500), (255, 255, 255), scale=2.0, thickness=6)
+    _text(page, "BE 100% SURE", (100, 800), (20, 130, 70), scale=1.5, thickness=4)  # green type on the paper
+    scan = simulate_scan(page, LIGHT)
+
+    pictures = ink_pair(page, scan, CONFIG)
+
+    for shown in (pictures.shown_first, pictures.shown_second):
+        assert shown[130:170, 400:560].mean() > 230  # the green panel's own area: paper
+        assert shown[240:300, 200:700].min() < 60  # the white type on it: ink
+        assert shown[400:430, 610:640].mean() > 220  # the red box: paper
+        assert shown[770:800, 110:500].min() < 60  # green type on paper: still ink
+        assert shown[700:740, 600:900].mean() > 240  # the paper: paper

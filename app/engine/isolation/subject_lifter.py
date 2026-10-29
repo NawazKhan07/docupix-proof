@@ -74,7 +74,7 @@ class HintStroke:
 class LiftedSubject:
     mask: np.ndarray  # bool (H, W): the subject, in the pixels of the image it was lifted from
     polygon: list[Point]  # its outer outline, simplified, in those pixels
-    source: str  # "border" (inside a closed line) | "segmented" (by colour)
+    source: str  # "border" (inside a closed line) | "print" (the printed extent) | "segmented" (by colour)
     image_size: tuple[int, int]  # (width, height) of the image it was lifted from
     hints: list[HintStroke] = field(default_factory=list)  # the corrections that produced it
     # How far inside the outline comparing should start (pixels of the image it was lifted from): the
@@ -316,12 +316,6 @@ def outline_from_mask(mask: np.ndarray, config: SubjectConfig) -> list[Point]:
     return [(float(p[0][0]), float(p[0][1])) for p in approx]
 
 
-def polygon_mask(shape: tuple[int, int], polygon: list[Point]) -> np.ndarray:
-    mask = np.zeros(shape, np.uint8)
-    cv2.fillPoly(mask, [np.round(np.array(polygon)).astype(np.int32)], 1)
-    return mask.astype(bool)
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -371,6 +365,58 @@ def _corrected(mask: np.ndarray, hints: list[HintStroke], seed: Point | None) ->
     return fill_holes(component_at(edited, seed, max(3.0, 0.005 * min(edited.shape))))
 
 
+_PRINT_SCALE_LONG_EDGE_PX = 1200  # the printed extent is found on a copy this big
+_PRINT_FROM_PAPER = 40  # (darkest channel) this much darker than the paper is print
+_PRINT_GATHER_SHARES = (0.03, 0.06, 0.1)  # print this close (a share of the long edge) is one piece, tried in turn...
+_PRINT_MOST = 0.6  # ...until one piece holds this share of the page's print
+_PRINT_SPECK_SHARE = 0.00005  # a mark smaller than this share of the page is a speck (dust, a stray dot)
+_PRINT_MIN_AREA = 0.05  # ...and the piece is at least this share of the page
+
+
+def printed_extent(image_rgb: np.ndarray, config: SubjectConfig) -> np.ndarray | None:
+    """The artwork as what is printed: the page's print gathered into pieces (what lies close together is one piece),
+    holes filled, the biggest piece -- a carton whose dieline is not closed, on a light page. None on a dark page, or
+    where no piece is big enough to be an artwork."""
+    height, width = image_rgb.shape[:2]
+    scale = min(1.0, _PRINT_SCALE_LONG_EDGE_PX / max(height, width))
+    small = cv2.resize(image_rgb, (max(2, round(width * scale)), max(2, round(height * scale))), interpolation=cv2.INTER_AREA)
+    darkest = small.min(axis=2)
+    paper = float(np.percentile(darkest, 90))
+    if paper < config.border_min_page_brightness:
+        return None
+    ink = (darkest.astype(np.int16) < paper - _PRINT_FROM_PAPER).astype(np.uint8)
+    total = int(ink.sum())
+    if total == 0:
+        return None
+    # gathered ever wider -- a carton's panels lie apart, blank paper between their blocks of print -- until one piece
+    # holds most of the page's print (a job sheet or a colour bar beside the artwork stays out of it)
+    for share in _PRINT_GATHER_SHARES:
+        gather = max(3, int(round(share * max(small.shape[:2])))) | 1
+        pieces = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((gather, gather), np.uint8))
+        count, labels, stats, _centres = cv2.connectedComponentsWithStats(pieces, connectivity=8)
+        if count <= 1:
+            continue
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        piece = (labels == biggest).astype(np.uint8)
+        if int((ink & piece).sum()) >= _PRINT_MOST * total:
+            break
+    else:
+        return None
+    # the artwork's extent: the outline round all the page's print but specks -- a flap's barcode, a side panel lie far
+    # from the rest, and must not be cut away; the paper this takes in round the corners is paper in both files
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    big = np.flatnonzero(stats[:, cv2.CC_STAT_AREA] >= _PRINT_SPECK_SHARE * ink.size)
+    big = big[big > 0]
+    points = cv2.findNonZero(np.isin(labels, big).astype(np.uint8)) if big.size else cv2.findNonZero(piece)
+    if points is None:
+        return None
+    filled = np.zeros_like(piece)
+    cv2.fillConvexPoly(filled, cv2.convexHull(points), 1)
+    if filled.mean() < _PRINT_MIN_AREA:
+        return None
+    return cv2.resize(filled, (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
 def lift_subject(
     image_rgb: np.ndarray,
     seed: Point | None = None,
@@ -408,6 +454,12 @@ def lift_subject(
                     "or switch to the colour method."
                 )
         if seed is None:
+            # No closed border (a dieline dashed, faint, or broken off where a flattened file lost it): the artwork is
+            # what is printed -- all of the page's print gathered into one piece, its holes filled.
+            extent = printed_extent(image_rgb, config)
+            if extent is not None:
+                mask = _corrected(extent, hints, seed)
+                return LiftedSubject(mask, outline_from_mask(mask, config), "print", (width, height), hints, 0.0)
             raise NoSubjectFoundError("Press and hold on the artwork to lift it.")
 
         bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)

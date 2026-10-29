@@ -223,3 +223,12 @@ def test_an_aligned_tile_past_the_suspects_edge_is_white(aligned_pair):
     _original, suspect, result = aligned_pair
     tile = render_aligned_vector_tile(suspect, result.transform, 2.0, TileRect(60000, 60000, 50, 50))
     assert np.all(tile == 255)
+
+
+def test_a_tile_is_drawn_at_the_resolution_the_page_was_compared_at(original_pdf):
+    """The window's own copy of a file may hold it at another resolution than the comparison did (less memory was free
+    when the comparison ran): a zoomed-in re-render must land where the compared picture is, not elsewhere on the page."""
+    compared = original_pdf.render(dpi=150)
+    rect = TileRect(60, 40, 120, 90)
+    tile = render_vector_tile(original_pdf, 1.0, rect, dpi=150)
+    assert np.array_equal(tile, compared[rect.y : rect.y + rect.height, rect.x : rect.x + rect.width])

@@ -209,7 +209,9 @@ def test_an_unavailable_language_falls_back_and_says_so(monkeypatch):
     original = _FakeArtwork([scenes.page("indications")])
     suspect = _FakeArtwork([scenes.page("indications", scenes.edit_first_line)])
 
-    outcome = compare_leaflet(original, suspect, AppConfig())
+    config = AppConfig()
+    config = replace(config, leaflet=replace(config.leaflet, language="khm"))  # (a language given, not found)
+    outcome = compare_leaflet(original, suspect, config)
 
     assert any("was used instead" in warning for warning in outcome.warnings)
 
@@ -310,3 +312,61 @@ def test_a_page_left_out_of_the_selection_is_not_reported_as_missing():
     assert outcome.clusters == []
     assert not any("missing" in note for note in outcome.notes)
     assert not any("missing" in warning for warning in outcome.warnings)
+
+
+# ---- the leaflet on each page: found, aligned by what is printed, compared alone ----------------------------------------
+
+
+def _sheet(outline, marks, colour_bar=False, edit=None):
+    """A leaflet page printed on a bigger sheet: its trim outline, crop marks round it and (maybe) a colour bar."""
+    import cv2
+
+    sheet = np.full((1400, 1100, 3), 255, np.uint8)
+    sheet[100:1300, 100:1000] = scenes.page("indications", edit)
+    x0, y0, x1, y1 = outline
+    cv2.rectangle(sheet, (x0, y0), (x1, y1), (180, 40, 160), 2)
+    for x, y in marks:
+        cv2.line(sheet, (x - 30, y), (x - 8, y), (0, 0, 0), 1)
+        cv2.line(sheet, (x, y - 30), (x, y - 8), (0, 0, 0), 1)
+    if colour_bar:
+        for i, colour in enumerate([(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 0, 0)]):
+            sheet[1340:1380, 200 + i * 60 : 250 + i * 60] = colour
+    return sheet
+
+
+def _both_ways():
+    config = AppConfig()
+    return replace(config, leaflet=replace(config.leaflet, compare_text=True, compare_visual=True))
+
+
+def test_the_leaflet_is_found_on_its_sheet_and_nothing_outside_it_is_compared_or_shown():
+    original = _sheet((96, 96, 1004, 1304), [(96, 96), (1004, 96)])
+    # another trim outline, other crop marks and a colour bar: none of it is the leaflet
+    suspect = _sheet((90, 92, 1010, 1310), [(90, 60), (1040, 92)], colour_bar=True)
+    outcome = compare_leaflet(_FakeArtwork([original]), _FakeArtwork([suspect]), _both_ways())
+    assert outcome.all_clusters == []
+    # the row is the leaflet alone: trimmed to it, and the colour bar below it is not on it
+    height, width = outcome.aligned_suspect.shape[:2]
+    assert height < 1300 and width < 1000
+    assert not (outcome.aligned_suspect[..., 0].astype(int) - outcome.aligned_suspect[..., 2] > 150).any()
+
+
+def test_a_change_inside_the_leaflet_is_still_found_on_its_sheet():
+    original = _sheet((96, 96, 1004, 1304), [(96, 96)])
+    suspect = _sheet((90, 92, 1010, 1310), [(90, 60)], edit=scenes.edit_first_line)
+    outcome = compare_leaflet(_FakeArtwork([original]), _FakeArtwork([suspect]), _both_ways())
+    assert outcome.all_clusters
+    assert {"ocr", "pixels"} & {source for cluster in outcome.all_clusters for source in cluster.sources}
+
+
+def test_an_area_holding_only_part_of_the_print_is_not_taken_for_the_leaflet():
+    from app.engine.leaflet import _holds_the_print
+    from app.models.isolation import IsolationGeometry, NormalizedRect
+
+    page = _sheet((96, 96, 1004, 1304), [(96, 96)])
+    height, width = page.shape[:2]
+    leaflet = IsolationGeometry(boundary=NormalizedRect(90 / width, 90 / height, 1010 / width, 1310 / height))
+    one_box = IsolationGeometry(boundary=NormalizedRect(100 / width, 100 / height, 1000 / width, 300 / height))
+    assert _holds_the_print(page, leaflet)
+    assert not _holds_the_print(page, one_box)
+    assert _holds_the_print(page, None)

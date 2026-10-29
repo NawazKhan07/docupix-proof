@@ -72,17 +72,20 @@ def _place(pixmap: fitz.Pixmap, width: int, height: int) -> np.ndarray:
 
 
 def render_vector_tile(
-    artwork: LoadedArtwork, zoom: float, rect: TileRect, page: int = 0
+    artwork: LoadedArtwork, zoom: float, rect: TileRect, page: int | None = None, dpi: float | None = None
 ) -> np.ndarray:
     """Render `rect` of a PDF page straight from its vector content.
 
     Returns an (rect.height, rect.width, 3) RGB array, whatever the page size:
-    anything beyond the page edge is white.
+    anything beyond the page edge is white. `dpi`: the resolution the compared picture of the page was rendered at --
+    what a pixel of the shared frame is (the file's own `working_dpi` if not given, which may differ: it depends on
+    the memory free when it is asked).
     """
     if not is_vector(artwork):
         raise ValueError("render_vector_tile needs a PDF; use render_raster_tile for images")
 
-    scale = zoom * artwork.working_dpi(page) / _PDF_POINTS_DPI  # device pixels per PDF point
+    page = artwork.page if page is None else page  # (the page the file is compared by)
+    scale = zoom * (dpi or artwork.working_dpi(page)) / _PDF_POINTS_DPI  # device pixels per PDF point
     # Shift so the tile's own origin lands on device (0, 0); the clip is then
     # the same region expressed back in page coordinates, padded slightly.
     matrix = fitz.Matrix(scale, 0, 0, scale, -rect.x, -rect.y)
@@ -123,9 +126,10 @@ def render_aligned_vector_tile(
     alignment_transform: np.ndarray,
     zoom: float,
     rect: TileRect,
-    page: int = 0,
+    page: int | None = None,
+    dpi: float | None = None,
 ) -> np.ndarray:
-    """A PDF rendered from vector data into the original's frame, crisp at `zoom`.
+    """A PDF rendered from vector data into the original's frame, crisp at `zoom` (`dpi`: see `render_vector_tile`).
 
     `alignment_transform` maps this file's working-resolution pixels into the
     shared frame. Rather than warping an already-rasterized page (which would
@@ -160,7 +164,7 @@ def render_aligned_vector_tile(
         width=max(1, int(np.ceil((high[0] - low[0]) * zoom))),
         height=max(1, int(np.ceil((high[1] - low[1]) * zoom))),
     )
-    rendered = render_vector_tile(artwork, zoom, source, page)
+    rendered = render_vector_tile(artwork, zoom, source, page, dpi)
 
     # Output pixel -> source pixel: through the shared frame, back into the
     # suspect's own pixels, then into the rendered patch (whose origin sits

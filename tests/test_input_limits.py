@@ -115,3 +115,26 @@ def test_a_refused_file_leaves_no_open_handle_behind(tmp_path):
         load_artwork(path, RuntimeConfig(max_pdf_pages=5))
     path.unlink()  # would fail on Windows if the document were still open
     assert not path.exists()
+
+
+def test_a_page_is_held_at_the_usual_resolution_whenever_it_fits_so_the_same_files_give_the_same_findings(tmp_path, monkeypatch):
+    """How much memory is free changes by the minute; the resolution a page is compared at must not, or the same two
+    files give different findings on a busy afternoon (a 23 MP label held at 18 MP lost a real text finding). The usual
+    resolution follows the installed memory; what is free lowers it only when the page itself does not fit -- and then
+    the results page says so, and why."""
+    from app.engine import file_loader
+
+    gib = 2**30
+    path = _pdf(tmp_path / "label.pdf", size=(1200, 1150))  # 423 x 406 mm: 24 MP at 300 DPI
+    monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (16 * gib, 12 * gib))
+    with load_artwork(path, RuntimeConfig()) as idle:
+        usual = idle.working_dpi()
+        assert usual == WORKING_DPI and idle.reduced_note() is None
+    monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (16 * gib, 2.15e9))  # busy: not a 25 MP level, but this page
+    with load_artwork(path, RuntimeConfig()) as busy:
+        assert busy.working_dpi() == usual and busy.reduced_note() is None
+    monkeypatch.setattr(file_loader, "_memory_bytes", lambda: (16 * gib, 1.2e9))  # too little for it: held lower, and said
+    with load_artwork(path, RuntimeConfig()) as short:
+        assert short.working_dpi() < usual
+        note = short.reduced_note()
+        assert note and "not the usual 300 DPI" in note and "little memory was free" in note

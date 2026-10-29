@@ -22,10 +22,13 @@ from PySide6.QtWidgets import (
 from app.config import AppConfig, RuntimeConfig
 from app.engine.file_loader import ArtworkLoadError, LoadedArtwork, SUPPORTED_EXTENSIONS, load_artwork
 from app.engine.isolation.cutout import Cutout
+from app.engine.page_choice import choose_pages
 from app.models.isolation import IsolationGeometry
 from app.models.job import ComparisonMode
 from app.ui.isolation_dialog import IsolationDialog, SubjectReference
-from app.ui.page_picker import PagePicker
+from app.ui.leaflet_pages_dialog import LeafletPagesDialog, PageAreas
+from app.ui.flow_layout import flow_widget
+from app.ui.page_picker import PagePicker, PageSelector
 from app.ui.theme import set_variant
 
 _FILE_DIALOG_FILTER = "Artwork files (*" + " *".join(sorted(SUPPORTED_EXTENSIONS)) + ")"
@@ -45,6 +48,8 @@ class UploadSlot(QWidget):
         self.limits = limits or self.config.runtime
         self.loaded: Optional[LoadedArtwork] = None
         self.geometry: Optional[IsolationGeometry] = None
+        # Leaflet mode: what was set on each page of the file (its own area, areas erased), by page (0-based).
+        self.page_areas: PageAreas = {}
         # The artwork lifted from this file (if any), which the other file can lay over itself.
         self.cutout: Optional[Cutout] = None
         self.partner: Optional[UploadSlot] = None  # the other slot; set by the panel
@@ -65,8 +70,8 @@ class UploadSlot(QWidget):
         header_row.addWidget(self.status_pill, alignment=Qt.AlignmentFlag.AlignVCenter)
         outer.addLayout(header_row)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
+        # (the buttons wrap onto a second line where the slot is narrow, rather than squeeze their words)
+        button_widget, button_row = flow_widget(self, spacing=8)
         self.browse_button = QPushButton(f"Browse {title}…")
         self.isolate_button = QPushButton("Edit Artwork Area…")
         self.isolate_button.setEnabled(False)
@@ -77,8 +82,13 @@ class UploadSlot(QWidget):
         self.pages_picker.setVisible(False)
         self.pages_picker.pagesChanged.connect(lambda _spec: self._refresh_status() if self.loaded is not None else None)
         button_row.addWidget(self.pages_picker)
-        button_row.addStretch(1)
-        outer.addLayout(button_row)
+        # Every other mode: which ONE page of a file of several to compare ("Best match": the page the other file's
+        # artwork is on, found when comparing).
+        self.page_selector = PageSelector("Page")
+        self.page_selector.setVisible(False)
+        self.page_selector.pageChosen.connect(self._on_page_chosen)
+        button_row.addWidget(self.page_selector)
+        outer.addWidget(button_widget)
 
         self.detail_label = QLabel("No file selected")
         self.detail_label.setProperty("secondary", "true")
@@ -110,9 +120,34 @@ class UploadSlot(QWidget):
         self._sync_pages_picker()
 
     def _sync_pages_picker(self) -> None:
-        self.pages_picker.setVisible(
-            self.mode is ComparisonMode.LEAFLET and self.title == "Original" and self.loaded is not None and self.loaded.page_count > 1
-        )
+        several = self.loaded is not None and self.loaded.page_count > 1
+        self.pages_picker.setVisible(self.mode is ComparisonMode.LEAFLET and self.title == "Original" and several)
+        self.page_selector.setVisible(self.mode is not ComparisonMode.LEAFLET and several)
+
+    @property
+    def page_choice(self) -> int | None:
+        """The page of this file to compare (0-based), or None for the best match (every mode but Leaflet)."""
+        if self.loaded is None or self.loaded.page_count <= 1:
+            return None
+        return self.page_selector.choice
+
+    def set_page_choice(self, page: int | None) -> None:
+        """Show `page` as this file's choice (the results page picked it), without starting anything."""
+        self.page_selector.set_choice(page)
+        if page is not None and self.loaded is not None:
+            self.loaded.select_page(page)
+
+    def _on_page_chosen(self, page: int | None) -> None:
+        if self.loaded is None:
+            return
+        if page is not None and page != self.loaded.page:
+            self.loaded.select_page(page)
+            if self.geometry is not None:
+                # an area drawn on one page means nothing on another
+                self.geometry = None
+                self.cutout = None
+        self._refresh_status()
+        self.changed.emit()
 
     @property
     def pages_to_compare(self) -> str:
@@ -137,9 +172,11 @@ class UploadSlot(QWidget):
             self.loaded.close()
         self.loaded = artwork
         self.geometry = None
+        self.page_areas = {}
         self.cutout = None
         self.isolate_button.setEnabled(True)
         self.pages_picker.set_page_count(artwork.page_count)
+        self.page_selector.set_page_count(artwork.page_count)
         self._sync_pages_picker()
         set_variant(self.status_pill, "pill", "loaded")
         self.status_pill.setText("Loaded")
@@ -148,14 +185,31 @@ class UploadSlot(QWidget):
 
     def edit_artwork_area(self) -> bool:
         """Open the Edit Artwork Area dialog, as the button does; returns whether it was accepted (a caller
-        elsewhere, e.g. the results page, needs to know whether to act on a change -- `geometry` is only ever
-        replaced with a new object on Accept, never touched on Cancel, so identity says which happened)."""
-        before = self.geometry
+        elsewhere, e.g. the results page, needs to know whether to act on a change -- `geometry` and `page_areas` are
+        only ever replaced with new objects on Accept, never touched on Cancel, so identity says which happened)."""
+        before = (self.geometry, self.page_areas)
         self._on_edit_artwork_area()
-        return self.geometry is not before
+        return self.geometry is not before[0] or self.page_areas is not before[1]
 
     def _on_edit_artwork_area(self) -> None:
         assert self.loaded is not None
+        if self.mode is ComparisonMode.LEAFLET:
+            # A leaflet is compared page by page: the whole file is shown, and what is set is kept for each page.
+            dialog = LeafletPagesDialog(self.loaded, self.title, self, areas=self.page_areas)
+            if dialog.exec() == LeafletPagesDialog.DialogCode.Accepted:
+                self.page_areas = dialog.result_areas() or {}
+                self._refresh_status()
+                self.changed.emit()
+            return
+        if self.loaded.page_count > 1 and self.page_choice is None:
+            # An area is drawn on one page: the page the comparison would take is settled first, and kept.
+            page = 0
+            partner = self.partner.loaded if self.partner is not None else None
+            if partner is not None:
+                page, _other, _guessed, _other_guessed = choose_pages(self.loaded, partner, None, self.partner.page_choice)
+            self.page_selector.set_choice(page)
+            self.loaded.select_page(page)
+            self._refresh_status()
         reference = None
         if self.partner is not None and self.partner.cutout is not None and self.partner.loaded is not None:
             partner = self.partner.loaded
@@ -167,6 +221,8 @@ class UploadSlot(QWidget):
             self.loaded, self.title, self, reference=reference, config=self.config, partner_title=partner_title
         )
         if dialog.exec() == IsolationDialog.DialogCode.Accepted:
+            if self.loaded.page_count > 1:
+                self.page_selector.set_choice(dialog.result_page())  # the page the area was drawn on is the one compared
             self.geometry = dialog.result_geometry()
             lifted = dialog.result_cutout()
             if lifted is not None:  # keep an earlier lift when this visit did not make a new one
@@ -185,9 +241,20 @@ class UploadSlot(QWidget):
                 if self.mode is ComparisonMode.LEAFLET:
                     chosen = self.pages_to_compare
                     pages += f" \u2014 page(s) {chosen} compared" if chosen else " \u2014 every page is compared"
+                elif self.page_choice is None:
+                    pages += " \u2014 the page matching the other file is compared"
                 else:
-                    pages += " \u2014 only page 1 is compared"
+                    pages += f" \u2014 page {self.page_choice + 1} is compared"
         geometry_note = ""
+        if self.mode is ComparisonMode.LEAFLET:
+            erased = sum(len(area.erase_regions) for area in self.page_areas.values())
+            own = sum(1 for area in self.page_areas.values() if area.boundary is not None)
+            if erased:
+                geometry_note += f" · {erased} area{'s' if erased != 1 else ''} erased"
+            if own:
+                geometry_note += f" · own area on {own} page{'s' if own != 1 else ''}"
+            self.detail_label.setText(f"{self.loaded.path.name} ({self.loaded.kind}{pages}){geometry_note}")
+            return
         if self.geometry is not None and self.geometry.boundary is not None:
             origin = self.geometry.boundary_origin
             if origin == "lifted":
@@ -216,11 +283,34 @@ class UploadSlot(QWidget):
             and (partner.geometry is None or partner.geometry.boundary is None)
         )
 
+    def _state(self) -> tuple:
+        """What this slot holds, as `_take` restores it (`UploadPanel.swap`)."""
+        return self.loaded, self.geometry, self.page_areas, self.cutout, self.page_choice, self.pages_picker.spec()
+
+    def _take(self, state: tuple) -> None:
+        """Hold what another slot held (`_state`): its file, the page chosen of it, what was set on it."""
+        self.loaded, self.geometry, self.page_areas, self.cutout, page, pages = state
+        count = self.loaded.page_count if self.loaded is not None else 1
+        self.pages_picker.set_page_count(count)
+        self.page_selector.set_page_count(count)
+        self.page_selector.set_choice(page)
+        if pages:
+            self.pages_picker.set_spec(pages)
+        self._sync_pages_picker()
+        self.isolate_button.setEnabled(self.loaded is not None)
+        set_variant(self.status_pill, "pill", "loaded" if self.loaded is not None else "empty")
+        self.status_pill.setText("Loaded" if self.loaded is not None else "Not loaded")
+        if self.loaded is not None:
+            self._refresh_status()
+        else:
+            self.detail_label.setText("No file selected")
+
     def clear(self) -> None:
         if self.loaded is not None:
             self.loaded.close()
         self.loaded = None
         self.geometry = None
+        self.page_areas = {}
         self.cutout = None
         self.isolate_button.setEnabled(False)
         set_variant(self.status_pill, "pill", "empty")
@@ -268,6 +358,18 @@ class UploadPanel(QGroupBox):
     @property
     def both_loaded(self) -> bool:
         return self.original is not None and self.suspect is not None
+
+    def swap(self) -> None:
+        """The two files trade places -- each with its page choice and what was set on it (an area, areas erased, an
+        artwork lifted) -- as if loaded the other way round."""
+        original, suspect = self.original_slot._state(), self.suspect_slot._state()
+        for slot in (self.original_slot, self.suspect_slot):
+            slot.blockSignals(True)
+        self.original_slot._take(suspect)
+        self.suspect_slot._take(original)
+        for slot in (self.original_slot, self.suspect_slot):
+            slot.blockSignals(False)
+        self.filesChanged.emit()
 
     def set_mode(self, mode: ComparisonMode) -> None:
         """Series mode uses the suspect as a whole sheet (every repeat of the original's artwork on it is found

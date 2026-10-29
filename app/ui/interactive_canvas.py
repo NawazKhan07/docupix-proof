@@ -65,6 +65,8 @@ _CROP_COLOUR = QColor(47, 111, 237)
 _CROP_PEN = QPen(_CROP_COLOUR, 2)
 _CROP_PEN.setCosmetic(True)  # constant on-screen width at any zoom
 _DIM_BRUSH = QBrush(QColor(15, 23, 42, 120))  # the part of the page outside the crop
+_MARKED_PEN = QPen(QColor(34, 160, 90), 2, Qt.PenStyle.DashLine)
+_MARKED_PEN.setCosmetic(True)
 _OUTLINE_PEN = QPen(_CROP_COLOUR, 2)
 _OUTLINE_PEN.setCosmetic(True)
 _OUTLINE_HALO = QPen(QColor(255, 255, 255, 235), 5)
@@ -375,6 +377,7 @@ class InteractiveCanvas(QGraphicsView):
         # Erase: a rectangle selected the same way, then applied to join the regions left out.
         self._erase_editor = _RectEditor(self, erase=True)
         self._erase_regions: list[NormalizedRect] = []
+        self._marked_items: list[QGraphicsRectItem] = []
         self._erase_items: list[QGraphicsRectItem] = []
 
         # The lifted / placed outline, drawn over a dimmed page.
@@ -432,6 +435,7 @@ class InteractiveCanvas(QGraphicsView):
         self._overlay_cutout = None
         self._erase_items = []
         self._erase_regions = []
+        self._marked_items = []
         self._polygon_norm = None
         self._edit_handles = []
         self._edit_points = []
@@ -508,18 +512,6 @@ class InteractiveCanvas(QGraphicsView):
     def zoom_actual(self) -> None:
         self.set_zoom(1.0)
 
-    def zoom_to_selection(self) -> None:
-        """Zoom so the crop rectangle fills the view, for checking its edges."""
-        crop = self._crop_editor.rect
-        if crop is None or crop.isEmpty():
-            return
-        viewport = self.viewport()
-        fit = min(
-            (viewport.width() - _FIT_MARGIN_PX) / crop.width(),
-            (viewport.height() - _FIT_MARGIN_PX) / crop.height(),
-        )
-        self.set_zoom(fit)
-        self.centerOn(crop.center())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -894,9 +886,6 @@ class InteractiveCanvas(QGraphicsView):
     def brush_mode(self) -> str | None:
         return self._brush_mode
 
-    @property
-    def brush_radius_px(self) -> float:
-        return self._brush_radius_px
 
     def begin_hint(self, scene_pos: QPointF) -> None:
         if self._brush_mode is None:
@@ -1085,6 +1074,27 @@ class InteractiveCanvas(QGraphicsView):
         self._erase_regions = []
         self._erase_editor.clear()
         self.eraseRegionsChanged.emit()
+
+    def add_erase_region(self, region: NormalizedRect) -> None:
+        """Show `region` as already erased (one kept from an earlier visit), as if it had just been applied."""
+        width, height = self._image_size
+        self._erase_editor.set(QRectF(QPointF(region.x0 * width, region.y0 * height), QPointF(region.x1 * width, region.y1 * height)))
+        self.apply_erase_selection()
+
+    # -- marked areas (fixed outlines the reviewer set, e.g. each page's own area) ------------------------------------
+    def set_marked_areas(self, regions: list[NormalizedRect]) -> None:
+        """Draw these rectangles as fixed outlines (nothing to drag): replaces the ones drawn before."""
+        for item in self._marked_items:
+            if item.scene() is not None:
+                self._scene.removeItem(item)
+        width, height = self._image_size
+        self._marked_items = []
+        for region in regions:
+            rect = QRectF(QPointF(region.x0 * width, region.y0 * height), QPointF(region.x1 * width, region.y1 * height))
+            item = self._scene.addRect(rect, _MARKED_PEN)
+            item.setZValue(5)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._marked_items.append(item)
 
     # -- panning ---------------------------------------------------------------
     def _wants_pan(self, event: QMouseEvent) -> bool:

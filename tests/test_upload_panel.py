@@ -76,10 +76,10 @@ def test_the_page_note_says_leaflet_mode_compares_every_page(qapp, tmp_path):
 
     slot = UploadSlot("Original")
     slot.load_path(_two_page_pdf(tmp_path))
-    assert "only page 1 is compared" in slot.detail_label.text()
+    assert "the page matching the other file is compared" in slot.detail_label.text()
 
     slot.set_mode(ComparisonMode.LEAFLET)
     assert "every page is compared" in slot.detail_label.text()
 
     slot.set_mode(ComparisonMode.AUTOMATIC)
-    assert "only page 1 is compared" in slot.detail_label.text()
+    assert "the page matching the other file is compared" in slot.detail_label.text()

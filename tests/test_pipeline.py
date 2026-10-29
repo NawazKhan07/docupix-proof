@@ -4,7 +4,6 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import pytesseract
-import pytest
 
 from dataclasses import replace
 
@@ -98,16 +97,21 @@ def test_warp_validity_mask_excludes_uncovered_corners():
     assert not mask[0, 0]  # a corner rotated out of frame is not
 
 
-def test_scan_vs_digital_mode_excludes_colour_differences():
-    """FR-6.3: colour is not compared at all when a scan is involved."""
+def test_scan_vs_digital_mode_ignores_a_colour_shift_but_not_a_different_ink():
+    """FR-6.3: a scan's colours are not compared -- scanning shifts every one -- but an area printed in a different ink
+    (red in the file, green in the print) is not a shift: it is the one colour finding a scan gets."""
     original = _artwork()
-    suspect = _recolour_block(original)
+    shifted = original.copy()
+    cv2.rectangle(shifted, (70, 200), (240, 290), (225, 60, 55), -1)  # the same red, as a scan renders it
+    scan_shift = run_comparison(original, shifted, ComparisonMode.SCAN_VS_DIGITAL, CONFIG)
+    assert not any(c.type is DiffType.COLOUR for c in scan_shift.candidates)
 
-    automatic = run_comparison(original, suspect, ComparisonMode.AUTOMATIC, CONFIG)
-    scan = run_comparison(original, suspect, ComparisonMode.SCAN_VS_DIGITAL, CONFIG)
-
+    swapped = _recolour_block(original)  # red -> green
+    automatic = run_comparison(original, swapped, ComparisonMode.AUTOMATIC, CONFIG)
+    scan = run_comparison(original, swapped, ComparisonMode.SCAN_VS_DIGITAL, CONFIG)
     assert any(c.type is DiffType.COLOUR for c in automatic.candidates)
-    assert not any(c.type is DiffType.COLOUR for c in scan.candidates)
+    colour = [c for c in scan.candidates if c.type is DiffType.COLOUR]
+    assert len(colour) == 1 and "red in the digital file, green in the scan" in colour[0].detail
 
 
 def test_scan_mode_still_sees_a_structural_change():
@@ -214,3 +218,18 @@ def test_the_outcome_carries_the_aligned_pair_the_viewer_draws_from():
 
     assert outcome.aligned_original.shape == original.shape
     assert outcome.aligned_suspect.shape == original.shape
+
+
+def test_the_same_pair_gives_the_same_alignment_and_findings_every_time():
+    """A reviewer comparing the same two files again must get the same answer, whatever was compared in between."""
+    original = _artwork()
+    suspect = _shifted(_recolour_block(original))
+
+    def run():
+        outcome = run_comparison(original, suspect, ComparisonMode.SCAN_VS_DIGITAL, GRAPHICS)
+        return outcome.alignment.transform, [(c.type, c.detail, c.bbox_in_original) for c in outcome.all_clusters]
+
+    first = run()
+    run_comparison(original, _shifted(original, angle=-2.0), ComparisonMode.AUTOMATIC, CONFIG)  # something else in between
+    second = run()
+    assert np.array_equal(first[0], second[0]) and first[1] == second[1]

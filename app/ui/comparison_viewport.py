@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 ZOOM_STEP = 1.25
 MIN_ZOOM = 0.05
 MAX_ZOOM = 8.0
-FOCUS_MAX_ZOOM = 3.0  # how far "jump to finding" will zoom in by itself
+FOCUS_MAX_ZOOM = 1.0  # how far "jump to finding" will zoom in by itself (100% native resolution)
 FIT_MARGIN_PX = 4
 FLICKER_INTERVAL_MS = 600
 
@@ -78,12 +78,18 @@ _PANE_CAPTIONS = {
 }
 
 
+_FIT_BOX_MARGIN = 0.03  # fitting the compared artwork leaves this share of it as room each side
+
+
 class ComparisonViewport(QWidget):
     markerClicked = Signal(int)  # cluster id
+    backgroundClicked = Signal()  # a click on the picture where there is no finding
     zoomChanged = Signal(float)
     viewModeChanged = Signal(object)  # ViewMode
     mergeRegionSelected = Signal(object)  # BoundingBox (shared space): the reviewer drew a rectangle to merge findings in
     undoMergeRequested = Signal()
+    eraseRegionSelected = Signal(object)  # BoundingBox (shared space): the reviewer drew a rectangle to erase
+    undoEraseRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -91,17 +97,21 @@ class ComparisonViewport(QWidget):
         self._zoom = 1.0
         self._fit_mode = True
         self._scroll_lock = True
+        self._separate_frames = False  # the suspect pane is another picture, not the original's frame (Series)
+        self._colour_by_source = False  # finding boxes coloured by how they were found, not by kind
         self._syncing_scroll = False
         self._phase = 0
         self._selected_id: int | None = None
         self._marker_clusters: list[DiffCluster] = []
+        self._hide_highlights: bool = False
         self._original_rgb: np.ndarray | None = None
         self._suspect_rgb: np.ndarray | None = None
         # Scan vs Digital also has each file as ink on paper (black and white); it is what is shown by default.
         self._colour_pair: tuple[np.ndarray, np.ndarray] | None = None
         self._ink_pair: tuple[np.ndarray, np.ndarray] | None = None
         self._showing_ink = False
-        self._sources: tuple[LoadedArtwork | None, LoadedArtwork | None, np.ndarray | None, BlockAlignments] = (None, None, None, [])
+        self._sources: tuple = (None, None, None, [], (None, None))
+        self._dpis: tuple[float | None, float | None] = (None, None)
         self._stacks: dict[str, ImageStack] = {}
         self._original_artwork: LoadedArtwork | None = None
         self._suspect_artwork: LoadedArtwork | None = None
@@ -110,6 +120,7 @@ class ComparisonViewport(QWidget):
         # zoomed-in vector re-render use each panel's own correction too, not just the whole artwork's --
         # the raster views (`compose_overlay` and friends) already do, via the pre-built composite.
         self._block_alignments: BlockAlignments = []
+        self._region_tool: str | None = None  # what a rectangle dragged on the page is for ("merge" / "erase")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -147,6 +158,7 @@ class ComparisonViewport(QWidget):
 
         for pane in (self.original_pane, self.suspect_pane):
             pane.markerClicked.connect(self.markerClicked)
+            pane.backgroundClicked.connect(self.backgroundClicked)
             pane.regionSelected.connect(self._on_region_selected)
             pane.zoomStepRequested.connect(self._on_wheel_zoom)
             pane.zoomRequested.connect(self._on_zoom_requested)
@@ -200,6 +212,18 @@ class ComparisonViewport(QWidget):
         self.undo_merge_button = QPushButton("Undo merge")
         self.undo_merge_button.setToolTip("Split the last merged finding back into the findings it was made of.")
         self.undo_merge_button.setVisible(False)
+        # Erase (Leaflet): a rectangle dragged on the page is cleared from both pictures, the findings in it with it.
+        self.erase_button = QPushButton("Erase area")
+        self.erase_button.setCheckable(True)
+        self.erase_button.setProperty("variant", "segment")
+        self.erase_button.setToolTip(
+            "Drag a rectangle on the page: that area is cleared from both files at once, and every finding in it removed."
+        )
+        self.erase_button.setMinimumWidth(self.erase_button.sizeHint().width())
+        self.erase_button.setVisible(False)
+        self.undo_erase_button = QPushButton("Undo erase")
+        self.undo_erase_button.setToolTip("Put back the last area erased, and the findings that were in it.")
+        self.undo_erase_button.setVisible(False)
         self.merge_notice = QLabel("")
         self.merge_notice.setProperty("secondary", "true")
         self.merge_row = QWidget()
@@ -208,11 +232,25 @@ class ComparisonViewport(QWidget):
         merge_layout.setSpacing(8)
         merge_layout.addWidget(self.merge_notice)
         merge_layout.addWidget(self.undo_merge_button)
+        merge_layout.addWidget(self.undo_erase_button)
         merge_layout.addStretch(1)
         self.merge_row.setVisible(False)
         self.merge_button.toggled.connect(self.set_merge_mode)
         self.undo_merge_button.clicked.connect(self.undoMergeRequested)
+        self.erase_button.toggled.connect(self.set_erase_mode)
+        self.undo_erase_button.clicked.connect(self.undoEraseRequested)
         top_flow.addWidget(self.merge_button)
+        top_flow.addWidget(self.erase_button)
+
+        self.hide_highlights_button = QPushButton("Hide highlights")
+        self.hide_highlights_button.setCheckable(True)
+        self.hide_highlights_button.setProperty("variant", "segment")
+        self.hide_highlights_button.setToolTip(
+            "Hide all deviation highlights from the viewer, except the selected deviation."
+        )
+        self.hide_highlights_button.setMinimumWidth(self.hide_highlights_button.sizeHint().width())
+        self.hide_highlights_button.toggled.connect(self.set_hide_highlights)
+        top_flow.addWidget(self.hide_highlights_button)
 
         self.zoom_out_button = QPushButton("−")
         self.zoom_in_button = QPushButton("+")
@@ -230,6 +268,28 @@ class ComparisonViewport(QWidget):
             zoom.addWidget(widget)
         top_flow.addWidget(zoom_group)
 
+        # Flicker only: alternate just the findings (the rest holds still), or the whole of each file.
+        self._flicker_whole = False
+        self.flicker_scope = QWidget()
+        scope_layout = QHBoxLayout(self.flicker_scope)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.setSpacing(0)
+        self.flicker_findings_button = QPushButton("Flicker findings only")
+        self.flicker_whole_button = QPushButton("Flicker whole file")
+        self.flicker_findings_button.setToolTip("Only the areas of the findings alternate between the two files.")
+        self.flicker_whole_button.setToolTip("The whole of each file alternates, to see anything the findings did not flag.")
+        scope_group = QButtonGroup(self)
+        scope_group.setExclusive(True)
+        for button in (self.flicker_findings_button, self.flicker_whole_button):
+            button.setCheckable(True)
+            button.setProperty("variant", "segment")
+            scope_group.addButton(button)
+            scope_layout.addWidget(button)
+        self.flicker_findings_button.setChecked(True)
+        self.flicker_findings_button.clicked.connect(lambda: self.set_flicker_whole(False))
+        self.flicker_whole_button.clicked.connect(lambda: self.set_flicker_whole(True))
+        self.flicker_scope.setVisible(False)  # only in Flicker
+        bottom.addWidget(self.flicker_scope)
         self.scroll_lock_check = QCheckBox("Scroll lock")
         self.scroll_lock_check.setChecked(True)
         self.scroll_lock_check.toggled.connect(self.set_scroll_lock)
@@ -314,6 +374,7 @@ class ComparisonViewport(QWidget):
         self.ink_check.setVisible(self._ink_pair is not None)
         self._selected_id = None
         self._fit_mode = True
+        self._fit_box = None  # (the compared area, once it is set: what "fit" frames)
         self._phase = 0
         self._load_active_pair()
         self._apply_fit()
@@ -324,7 +385,7 @@ class ComparisonViewport(QWidget):
         self._original_rgb, self._suspect_rgb = original, suspect
         self._stacks = {"original": ImageStack(original), "suspect": ImageStack(suspect)}
         # Zoomed-in tiles are re-rendered from a PDF's vector data; the ink pictures exist only as pixels.
-        original_source, suspect_source, transform, block_alignments = self._sources
+        original_source, suspect_source, transform, block_alignments, dpis = self._sources
         if self._showing_ink:
             original_source = suspect_source = transform = None
             block_alignments = []
@@ -351,8 +412,10 @@ class ComparisonViewport(QWidget):
         suspect: LoadedArtwork | None,
         alignment_transform: np.ndarray | None,
         block_alignments: BlockAlignments | None = None,
+        dpis: tuple[float | None, float | None] = (None, None),
     ) -> None:
-        """Give the viewer the files themselves, so zoomed-in views can be re-rendered.
+        """Give the viewer the files themselves, so zoomed-in views can be re-rendered (`dpis`: the resolution each was
+        compared at -- `ComparisonOutcome.original_dpi`/`suspect_dpi` -- so a re-render lands where the picture is).
 
         Without these (or for image files, which have no vector data) the
         viewer still works: it falls back to resampling the 300 DPI pair. `block_alignments`, if given, lets a
@@ -360,7 +423,8 @@ class ComparisonViewport(QWidget):
         non-zoomed views already do (`ComparisonOutcome.block_alignments`).
         """
         block_alignments = block_alignments or []
-        self._sources = (original, suspect, alignment_transform, block_alignments)
+        self._sources = (original, suspect, alignment_transform, block_alignments, dpis)
+        self._dpis = dpis
         if self._showing_ink:
             original = suspect = alignment_transform = None
             block_alignments = []
@@ -375,7 +439,7 @@ class ComparisonViewport(QWidget):
         # Set the fields directly: going through `set_sources` would schedule
         # a render, which is exactly what releasing is meant to prevent.
         self._detail_timer.stop()
-        self._sources = (None, None, None, [])
+        self._sources = (None, None, None, [], (None, None))
         self._original_artwork = None
         self._suspect_artwork = None
         self._alignment_transform = None
@@ -401,6 +465,13 @@ class ComparisonViewport(QWidget):
             self._mode_buttons[mode].setEnabled(enabled)
         if not enabled and self._mode is not ViewMode.SIDE_BY_SIDE:
             self.set_view_mode(ViewMode.SIDE_BY_SIDE)
+        # Two different pictures (Series: one artwork beside the whole sheet) are two frames: each pane draws a finding
+        # where it is on ITS picture, and scrolling one pane to the same place of the other means nothing.
+        self._separate_frames = not enabled
+        if self._separate_frames:
+            self.set_scroll_lock(False)
+        self._apply_mode_layout()
+        self._refresh_markers()
 
     def set_view_mode(self, mode: ViewMode) -> None:
         if mode is self._mode and self._mode_buttons[mode].isChecked():
@@ -419,9 +490,12 @@ class ComparisonViewport(QWidget):
         single = self._mode in SINGLE_PANE_MODES
         self._suspect_holder.setVisible(not single)
         original_caption, suspect_caption = _PANE_CAPTIONS[self._mode]
+        if self._separate_frames:
+            suspect_caption = "Suspect (the whole sheet: every repeat)"
         self._original_caption.setText(original_caption)
         self._suspect_caption.setText(suspect_caption)
-        self.scroll_lock_check.setEnabled(not single)  # nothing to lock with one pane
+        self.scroll_lock_check.setEnabled(not single and not self._separate_frames)  # (nothing to lock with one pane)
+        self.flicker_scope.setVisible(self._mode is ViewMode.FLICKER)
 
         if self._mode in ANIMATED_MODES and self.isVisible():
             self._timer.start()
@@ -451,11 +525,20 @@ class ComparisonViewport(QWidget):
 
         self._refresh_markers()
 
+
+    def set_flicker_whole(self, whole: bool) -> None:
+        """Flicker the whole of each file (True) or only the findings (False)."""
+        self._flicker_whole = whole
+        (self.flicker_whole_button if whole else self.flicker_findings_button).setChecked(True)
+        if self._mode is ViewMode.FLICKER and self.has_images:
+            self._build_flicker_stacks()
+            self._refresh_markers()
+
     def _build_flicker_stacks(self) -> None:
         boxes = [cluster.bbox_in_original for cluster in self._marker_clusters]
         for phase in (0, 1):
             self._stacks[f"flicker{phase}"] = ImageStack(
-                compose_flicker(self._original_rgb, self._suspect_rgb, boxes, phase)
+                compose_flicker(self._original_rgb, self._suspect_rgb, boxes, phase, whole=self._flicker_whole)
             )
         self.original_pane.set_stacks(
             {"flicker0": self._stacks["flicker0"], "flicker1": self._stacks["flicker1"]}
@@ -495,24 +578,53 @@ class ComparisonViewport(QWidget):
     def is_animating(self) -> bool:
         return self._timer.isActive()
 
-    # -- merging findings --------------------------------------------------------
+    # -- merging findings / erasing an area --------------------------------------------------------
+    def _set_region_tool(self, tool: str | None) -> None:
+        """Which rectangle tool a drag on the page is for ("merge", "erase"), or None: dragging pans the page."""
+        self._region_tool = tool
+        for pane in (self.original_pane, self.suspect_pane):
+            pane.set_region_selection(tool is not None)
+        for button, name in ((self.merge_button, "merge"), (self.erase_button, "erase")):
+            if button.isChecked() != (tool == name):
+                button.blockSignals(True)
+                button.setChecked(tool == name)
+                button.blockSignals(False)
+        self.merge_notice.setText(
+            {"merge": "Drag a rectangle round the findings to merge.", "erase": "Drag a rectangle round the area to erase."}.get(tool, "")
+        )
+        self._show_merge_row()
+
     def set_merge_mode(self, on: bool) -> None:
         """While on, dragging on the page draws a rectangle to merge the findings in, instead of panning."""
-        for pane in (self.original_pane, self.suspect_pane):
-            pane.set_region_selection(on)
-        if self.merge_button.isChecked() != on:
-            self.merge_button.blockSignals(True)
-            self.merge_button.setChecked(on)
-            self.merge_button.blockSignals(False)
-        self.merge_notice.setText("Drag a rectangle round the findings to merge." if on else "")
-        self._show_merge_row()
+        if on or self.merge_mode:
+            self._set_region_tool("merge" if on else None)
 
     @property
     def merge_mode(self) -> bool:
         return self.merge_button.isChecked()
 
+    def set_erase_mode(self, on: bool) -> None:
+        """While on, dragging on the page draws a rectangle to erase, instead of panning."""
+        if on or self.erase_mode:
+            self._set_region_tool("erase" if on else None)
+
+    @property
+    def erase_mode(self) -> bool:
+        return self.erase_button.isChecked()
+
+    def set_erase_available(self, available: bool) -> None:
+        """Offer the Erase tool (Leaflet's results)."""
+        if not available:
+            self.set_erase_mode(False)
+            self.set_can_undo_erase(False)
+        self.erase_button.setVisible(available)
+
     def set_can_undo_merge(self, can: bool) -> None:
         self.undo_merge_button.setVisible(can)
+        self._show_merge_row()
+
+    def set_can_undo_erase(self, can: bool) -> None:
+        self.undo_erase_button.setVisible(can)
         self._show_merge_row()
 
     def show_merge_notice(self, text: str) -> None:
@@ -520,17 +632,56 @@ class ComparisonViewport(QWidget):
         self._show_merge_row()
 
     def _show_merge_row(self) -> None:
-        """The merge row is there while it has a message or an Undo to offer, and out of the way otherwise."""
-        self.merge_row.setVisible(bool(self.merge_notice.text()) or not self.undo_merge_button.isHidden())
+        """The tools' row is there while it has a message or an Undo to offer, and out of the way otherwise."""
+        self.merge_row.setVisible(
+            bool(self.merge_notice.text()) or not self.undo_merge_button.isHidden() or not self.undo_erase_button.isHidden()
+        )
 
     def _on_region_selected(self, rect) -> None:
-        self.set_merge_mode(False)  # one rectangle at a time: a stray drag afterwards should pan, not merge
-        self.mergeRegionSelected.emit(BoundingBox(rect.left(), rect.top(), rect.right(), rect.bottom()))
+        tool = self._region_tool
+        self._set_region_tool(None)  # one rectangle at a time: a stray drag afterwards should pan
+        box = BoundingBox(rect.left(), rect.top(), rect.right(), rect.bottom())
+        if tool == "erase":
+            self.eraseRegionSelected.emit(box)
+        else:
+            self.mergeRegionSelected.emit(box)
+
+    def erase_region(self, box: BoundingBox) -> list | None:
+        """Clear `box` to white in both pictures (colour and ink alike), at once. Returns what was there, for
+        `restore_region`; None if the box holds no pixel of the pictures."""
+        pictures = [picture for pair in (self._colour_pair, self._ink_pair) if pair for picture in pair]
+        if not pictures:
+            return None
+        patches = []
+        for picture in pictures:
+            height, width = picture.shape[:2]
+            x0, y0 = max(0, int(math.floor(box.x0))), max(0, int(math.floor(box.y0)))
+            x1, y1 = min(width, int(math.ceil(box.x1))), min(height, int(math.ceil(box.y1)))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            patches.append((picture, (x0, y0, x1, y1), picture[y0:y1, x0:x1].copy()))
+            picture[y0:y1, x0:x1] = 255
+        if not patches:
+            return None
+        self._redraw_pictures()
+        return patches
+
+    def restore_region(self, patches: list) -> None:
+        """Put back what `erase_region` cleared."""
+        for picture, (x0, y0, x1, y1), was in patches:
+            picture[y0:y1, x0:x1] = was
+        self._redraw_pictures()
+
+    def _redraw_pictures(self) -> None:
+        """The pictures' pixels changed: every view of them is drawn again (zoom and scroll kept)."""
+        self._load_active_pair()
 
     # -- markers -------------------------------------------------------------
-    def set_marker_clusters(self, clusters: list[DiffCluster]) -> None:
-        """The findings to draw (the caller filters out ignored/hidden ones)."""
+    def set_marker_clusters(self, clusters: list[DiffCluster], by_source: bool = False) -> None:
+        """The findings to draw (the caller filters out ignored/hidden ones), coloured by kind -- or, `by_source`, by
+        how each was found (the findings list is showing OCR or pixel findings)."""
         self._marker_clusters = list(clusters)
+        self._colour_by_source = by_source
         if self.has_images:
             if self._mode is ViewMode.FLICKER:
                 self._build_flicker_stacks()  # the flickering regions follow the findings
@@ -545,6 +696,15 @@ class ComparisonViewport(QWidget):
         for pane in (self.original_pane, self.suspect_pane):
             pane.set_compared_area(polygons)
             pane.show_compared_area(self.compared_area_check.isChecked())
+        # "fit" frames the artwork that was compared, not the whole sheet it was found on
+        points = [point for polygon in (polygons or []) for point in polygon]
+        if points:
+            xs, ys = [x for x, _y in points], [y for _x, y in points]
+            self._fit_box = BoundingBox(min(xs), min(ys), max(xs), max(ys))
+        else:
+            self._fit_box = None
+        if self._fit_mode and self.has_images:
+            self._apply_fit()
 
     def _on_compared_area_toggled(self, checked: bool) -> None:
         for pane in (self.original_pane, self.suspect_pane):
@@ -562,13 +722,41 @@ class ComparisonViewport(QWidget):
         for pane in (self.original_pane, self.suspect_pane):
             pane.show_block_outlines(checked)
 
+    @property
+    def hide_highlights(self) -> bool:
+        return self._hide_highlights
+
+    def set_hide_highlights(self, hidden: bool) -> None:
+        self._hide_highlights = bool(hidden)
+        if self.hide_highlights_button.isChecked() != self._hide_highlights:
+            self.hide_highlights_button.setChecked(self._hide_highlights)
+        self.hide_highlights_button.setText("Show highlights" if self._hide_highlights else "Hide highlights")
+        self.hide_highlights_button.setToolTip(
+            "Show all deviation highlights in the viewer."
+            if self._hide_highlights
+            else "Hide all deviation highlights from the viewer, except the selected deviation."
+        )
+        self._refresh_markers()
+
     def set_selected(self, cluster_id: int | None) -> None:
         self._selected_id = cluster_id
         self._refresh_markers()
 
     def _refresh_markers(self) -> None:
+        if self._hide_highlights:
+            clusters = [c for c in self._marker_clusters if c.id == self._selected_id] if self._selected_id is not None else []
+        else:
+            clusters = self._marker_clusters
         for pane in self._visible_panes():
-            pane.set_markers(self._marker_clusters, self._selected_id)
+            own_frame = pane is self.suspect_pane and self._separate_frames
+            pane.set_markers(
+                clusters,
+                self._selected_id,
+                boxes_of=(lambda cluster: cluster.suspect_boxes)
+                if own_frame
+                else (lambda cluster: [cluster.shown_in_suspect]) if pane is self.suspect_pane else None,
+                by_source=self._colour_by_source,
+            )
 
     def _visible_panes(self) -> list[PaneView]:
         if self._mode is ViewMode.SIDE_BY_SIDE:
@@ -579,7 +767,7 @@ class ComparisonViewport(QWidget):
         """Select a finding and bring it into view in every visible pane."""
         self.clear_highlight()
         self.set_selected(cluster.id)
-        self.focus_box(cluster.bbox_in_original)
+        self.focus_box(cluster.bbox_in_original, cluster.bbox_in_suspect)
 
     def highlight_box(self, box: BoundingBox | None) -> None:
         """Bring a region chosen in a results panel (a decoded symbol, the Braille) into view, and mark it in every pane."""
@@ -592,8 +780,9 @@ class ComparisonViewport(QWidget):
         for pane in (self.original_pane, self.suspect_pane):
             pane.set_highlight(None)
 
-    def focus_box(self, box: BoundingBox) -> None:
-        """Bring a region (a finding, a decoded symbol) into view in every visible pane."""
+    def focus_box(self, box: BoundingBox, suspect_box: BoundingBox | None = None) -> None:
+        """Bring a region (a finding, a decoded symbol) into view in every visible pane -- in the suspect pane, where it
+        is another picture (Series), at `suspect_box`."""
         pane = self.original_pane
         viewport = pane.viewport()
         if box.width > 0 and box.height > 0 and viewport.width() > 0:
@@ -603,7 +792,8 @@ class ComparisonViewport(QWidget):
             if target > self._zoom:
                 self.set_zoom(target)
         for visible in self._visible_panes():
-            visible.center_on_box(box)
+            own_frame = visible is self.suspect_pane and self._separate_frames and suspect_box is not None
+            visible.center_on_box(suspect_box if own_frame else box)
 
     # -- zoom (FR-8.6) -------------------------------------------------------
     @property
@@ -658,7 +848,7 @@ class ComparisonViewport(QWidget):
         self.set_zoom(self._zoom / ZOOM_STEP)
 
     def fit_to_view(self) -> None:
-        """Reset: show the whole artwork (FR-8.6's reset control)."""
+        """Reset: show the whole artwork -- the compared area, where there is one (FR-8.6's reset control)."""
         self._fit_mode = True
         self._apply_fit()
 
@@ -667,6 +857,16 @@ class ComparisonViewport(QWidget):
         viewport = self.original_pane.viewport()
         if width <= 0 or height <= 0 or viewport.width() <= 0 or viewport.height() <= 0:
             return  # not laid out yet; the pane's resize event will call back in
+        box = getattr(self, "_fit_box", None)
+        if box is not None and box.width > 0 and box.height > 0:
+            # the compared artwork fills the view (with a little room round it), centred
+            margin = 1.0 + 2 * _FIT_BOX_MARGIN
+            fit = min((viewport.width() - FIT_MARGIN_PX) / (box.width * margin), (viewport.height() - FIT_MARGIN_PX) / (box.height * margin))
+            self.set_zoom(fit, from_fit=True)
+            self.original_pane.center_on_box(box)
+            if not self._separate_frames:
+                self.suspect_pane.center_on_box(box)
+            return
         fit = min(
             (viewport.width() - FIT_MARGIN_PX) / width,
             (viewport.height() - FIT_MARGIN_PX) / height,
@@ -733,17 +933,17 @@ class ComparisonViewport(QWidget):
 
     def _original_tile(self, rect: TileRect) -> np.ndarray:
         if is_vector(self._original_artwork):
-            return render_vector_tile(self._original_artwork, self._zoom, rect)
+            return render_vector_tile(self._original_artwork, self._zoom, rect, dpi=self._dpis[0])
         return render_raster_tile(self._original_rgb, self._zoom, rect)
 
     def _suspect_tile(self, rect: TileRect) -> np.ndarray:
         if is_vector(self._suspect_artwork) and self._alignment_transform is not None:
-            base = render_aligned_vector_tile(self._suspect_artwork, self._alignment_transform, self._zoom, rect)
+            base = render_aligned_vector_tile(self._suspect_artwork, self._alignment_transform, self._zoom, rect, dpi=self._dpis[1])
             for polygon, transform in self._block_alignments:
                 xs, ys = [p[0] * self._zoom for p in polygon], [p[1] * self._zoom for p in polygon]
                 if max(xs) < rect.x or min(xs) > rect.x + rect.width or max(ys) < rect.y or min(ys) > rect.y + rect.height:
                     continue  # this block does not touch the visible tile at all
-                block_tile = render_aligned_vector_tile(self._suspect_artwork, transform, self._zoom, rect)
+                block_tile = render_aligned_vector_tile(self._suspect_artwork, transform, self._zoom, rect, dpi=self._dpis[1])
                 alpha = feathered_alpha((rect.height, rect.width), polygon, scale=self._zoom, shift=(rect.x, rect.y))
                 base = (alpha[..., None] * block_tile + (1.0 - alpha[..., None]) * base).astype(np.uint8)
             return base
@@ -768,7 +968,7 @@ class ComparisonViewport(QWidget):
             for b in (cluster.bbox_in_original for cluster in self._marker_clusters)
         ]
         if self._mode is ViewMode.FLICKER:
-            return {f"flicker{phase}": compose_flicker(original, suspect, boxes, phase) for phase in (0, 1)}
+            return {f"flicker{phase}": compose_flicker(original, suspect, boxes, phase, whole=self._flicker_whole) for phase in (0, 1)}
         return {f"gray{phase}": compose_grayscale(original, suspect, boxes, phase) for phase in (0, 1)}
 
     # -- scroll lock (FR-8.5) --------------------------------------------------

@@ -33,16 +33,22 @@ import cv2
 import numpy as np
 
 from app.config import AppConfig, LeafletConfig
-from app.engine.aggregation.aggregator import build_clusters
-from app.engine.alignment.aligner import align
-from app.engine.alignment.homography import warp_to_reference
-from app.engine.detectors import document_text
-from app.engine.detectors.text_diff import OcrUnavailableError, OcrWord, ocr_available, read_pages, text_layer_words
+from app.engine import prepared
+from app.engine.detectors.text_diff import OcrWord, ocr_available, read_pages, shown_words, text_layer_words
 from app.engine.file_loader import LoadedArtwork
+from app.engine import language_detect
+from app.engine.language_detect import detect_languages
 from app.engine.ocr_locator import usable_language
+from app.models.languages import AUTO
+from app.engine.isolation.auto_area import find_artwork
+from app.engine.isolation.block_grid import stroked_line_map
+from app.engine.isolation.boundary_mask import apply_mask, boundary_mask
+from app.engine.isolation.die_lines import vector_strokes
+from app.engine.word_strategy import word_outcome
 from app.engine.worker import ComparisonOutcome, run_comparison
 from app.logging_config import StageTimer
-from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType
+from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType, SOURCE_PAGE, renumbered, visible_by_source
+from app.models.isolation import IsolationGeometry
 from app.models.job import ComparisonMode, DetectorOptions
 
 logger = logging.getLogger(__name__)
@@ -57,7 +63,7 @@ class NoPagesComparedError(Exception):
 
 
 # The visual strategy (`LeafletConfig.compare_visual`) is Automatic mode's own pixel-by-pixel comparison (which also
-# reads and describes what a found difference says); the text strategy is `_text_outcome`.
+# reads and describes what a found difference says); the text strategy is `word_strategy.word_outcome`.
 _VISUAL_STRATEGY_OPTIONS = DetectorOptions(
     compare_color=True, compare_text=True, compare_graphics=True,
     decode_symbols=False, compare_braille_dots=False, normalize_scan=False,
@@ -295,66 +301,105 @@ def _layer_word_set(words: list[OcrWord] | None) -> frozenset[str] | None:
     return found if len(found) >= _MIN_WORDS_FOR_PAIRING else None
 
 
+def _page(artwork, index: int) -> np.ndarray:
+    """One page of a file as a picture."""
+    return artwork.render(page=index)  # (not kept: a pack insert's pages are ~100 MB each; its alignments are)
+
+
 def _page_words(artwork, index: int, page: np.ndarray) -> list[OcrWord] | None:
     """A PDF page's own words in its picture's pixels (None for a page with none of its own, or a picture)."""
     if getattr(artwork, "kind", None) != "pdf":
         return None
-    return text_layer_words(artwork.pdf_page(index), artwork.working_dpi(index), page.shape[:2])
+    return shown_words(text_layer_words(artwork.pdf_page(index), artwork.working_dpi(index), page.shape[:2]), page)
 
 
-def _text_outcome(
-    original_page: np.ndarray,
-    suspect_page: np.ndarray,
-    original_layer: list[OcrWord] | None,
-    suspect_layer: list[OcrWord] | None,
-    config: AppConfig,
-    language: str,
-) -> ComparisonOutcome:
-    """The text strategy on one pair of pages (see the module's account): the suspect page aligned onto the original,
-    and their words compared where they are printed."""
-    alignment = align(original_page, suspect_page, config.alignment)
-    warped = warp_to_reference(suspect_page, alignment.transform, original_page.shape[:2])
-    suspect_in_frame = document_text.in_frame(suspect_layer, alignment.transform) if suspect_layer else None
-    heights = [w.bbox.height for w in (original_layer or []) + (suspect_in_frame or []) if w.upright is not False]
-    type_px = float(np.median(heights)) if heights else document_text.type_height(original_page)
-    warnings: list[str] = []
-    candidates: list[DiffCandidate] = []
-    try:
-        if original_layer is not None and suspect_in_frame is not None:
-            words_o, words_s = original_layer, suspect_in_frame  # both pages' own text: every word, exactly
-        else:
-            if not ocr_available():
-                raise OcrUnavailableError(
-                    "The text reader (Tesseract) is not available, so the text of a page with none of its own was not compared."
-                )
-            windows = document_text.difference_windows(original_page, warped, type_px)
-            words_o, words_s = document_text.words_in_windows(
-                windows, original_page, warped, original_layer, suspect_in_frame, config.detection, type_px
+def _pdf_lines_and_strokes(artwork, index: int, page: np.ndarray) -> tuple:
+    """A PDF page's own stroked lines (its folds, for dividing the leaflet into panels) and stroked paths with their
+    colours (its outline and fold lines, drawn out of what is compared); (None, None) for a picture."""
+    if getattr(artwork, "kind", None) != "pdf":
+        return None, None
+    page_pdf, dpi = artwork.pdf_page(index), artwork.working_dpi(index)
+    return stroked_line_map(page_pdf, dpi, page.shape[:2]), vector_strokes(page_pdf, dpi)
+
+
+_LEAFLET_PRINT_SHARE = 0.85  # an area found on a page is its leaflet only if at least this share of the page's print is in it
+
+
+def _printed(picture: np.ndarray) -> np.ndarray:
+    """Where `picture` is printed on: darker than paper (or a light margin tint) in its darkest channel."""
+    if picture.ndim == 2:
+        return picture < _CONTENT_LEVEL
+    channels = cv2.split(np.ascontiguousarray(picture[:, :, :3]))
+    darkest = channels[0]
+    for channel in channels[1:]:
+        darkest = cv2.min(darkest, channel)
+    return darkest < _CONTENT_LEVEL
+
+
+def _holds_the_print(page: np.ndarray, geometry: IsolationGeometry | None) -> bool:
+    """Whether `geometry` is the leaflet on `page` rather than one box printed on it (a table, a panel, a logo's frame):
+    what lies outside a leaflet is only its marks -- crop and fold marks, colour bars, a slug line -- a small share of
+    the page's print."""
+    if geometry is None:
+        return True
+    inside = boundary_mask(page.shape[:2], geometry)
+    if inside is None:
+        return True
+    printed = _printed(page)
+    total = int(np.count_nonzero(printed))
+    return total == 0 or np.count_nonzero(printed & inside) >= _LEAFLET_PRINT_SHARE * total
+
+
+_AREA_WORKING_PX = 3000  # a page's leaflet is looked for on a copy no bigger than this along its long edge
+
+
+def _reduced(page: np.ndarray) -> tuple[np.ndarray, float]:
+    """`page` no bigger than `_AREA_WORKING_PX` along its long edge, and the scale it was reduced by (1 if it was not)."""
+    scale = min(1.0, _AREA_WORKING_PX / max(page.shape[:2]))
+    if scale >= 1.0:
+        return page, 1.0
+    size = (max(1, round(page.shape[1] * scale)), max(1, round(page.shape[0] * scale)))
+    return cv2.resize(page, size, interpolation=cv2.INTER_AREA), scale
+
+
+def _leaflet_areas(
+    original, suspect, o: int, s: int, original_page: np.ndarray, suspect_page: np.ndarray, config: AppConfig
+) -> tuple[IsolationGeometry | None, IsolationGeometry | None]:
+    """The leaflet on each page of a pair -- found the way a carton's artwork is found on its sheet (from a PDF's own
+    lines where it has them), so its marks and whatever else is on the sheet are not compared. (None, None) where no
+    area holding the leaflet's print is found: the whole page is compared, as it is."""
+    if not config.detection.auto_artwork:
+        return None, None
+    is_pdf = (getattr(original, "kind", None) == "pdf", getattr(suspect, "kind", None) == "pdf")
+
+    def found() -> tuple[IsolationGeometry | None, IsolationGeometry | None]:
+        # Found on a reduced copy of each page: the area is kept in shares of the page (any size of it), and it only
+        # says what is compared -- a leaflet page is 40-100 MP, where finding it at full size takes many seconds.
+        (small_original, original_scale), (small_suspect, suspect_scale) = _reduced(original_page), _reduced(suspect_page)
+        try:
+            area = find_artwork(
+                small_original,
+                small_suspect,
+                config.subject,
+                original.pdf_page(o) if is_pdf[0] else None,
+                suspect.pdf_page(s) if is_pdf[1] else None,
+                original.working_dpi(o) * original_scale if is_pdf[0] else None,
+                suspect.working_dpi(s) * suspect_scale if is_pdf[1] else None,
             )
-        floor = config.detection.ocr_min_confidence
-        candidates = document_text.compare_words(
-            document_text.usable(words_o, floor),
-            document_text.usable(words_s, floor),
-            original_page,
-            warped,
-            config.detection,
-            original_layer,
-            suspect_in_frame,
-            language,
-        )
-    except OcrUnavailableError as exc:
-        logger.warning("leaflet page text not compared: %s", exc)
-        warnings.append(str(exc))
-    return ComparisonOutcome(
-        alignment=alignment,
-        candidates=candidates,
-        clusters=build_clusters(candidates, alignment.transform, config.clustering),
-        aligned_original=original_page,
-        aligned_suspect=warped,
-        warnings=warnings,
-        detection_profile="exact",
-        mode=ComparisonMode.LEAFLET,
-    )
+        except Exception:  # noqa: BLE001 -- finding the leaflet is a help, never a reason for a page to fail
+            logger.exception("leaflet area not found")
+            return None, None
+        return area.original, area.suspect
+
+    paths = (getattr(original, "path", None), getattr(suspect, "path", None))
+    try:
+        key = (prepared.file_key(paths[0]), o, prepared.file_key(paths[1]), s, prepared.settings_key(config.subject))
+    except (OSError, TypeError):
+        key = (prepared.digest(original_page), prepared.digest(suspect_page), prepared.settings_key(config.subject))
+    original_area, suspect_area = prepared.remembered("leaflet_area", key, found)
+    if not (_holds_the_print(original_page, original_area) and _holds_the_print(suspect_page, suspect_area)):
+        return None, None
+    return original_area, suspect_area
 
 
 _CONTENT_LEVEL = 235  # a pixel darker than this in its darkest channel is printed (paper and a light margin tint are not)
@@ -368,16 +413,23 @@ def _content_box(*pictures: np.ndarray) -> tuple[int, int, int, int]:
     height, width = pictures[0].shape[:2]
     printed = np.zeros((height, width), bool)
     for picture in pictures:
-        channels = cv2.split(np.ascontiguousarray(picture[:, :, :3])) if picture.ndim == 3 else [picture]
-        darkest = channels[0]
-        for channel in channels[1:]:
-            darkest = cv2.min(darkest, channel)
-        printed |= darkest < _CONTENT_LEVEL
+        printed |= _printed(picture)
     if not printed.any():
         return 0, 0, width, height
     x, y, w, h = cv2.boundingRect(printed.astype(np.uint8))
     margin = round(_CONTENT_MARGIN_SHARE * max(height, width))
     return max(0, x - margin), max(0, y - margin), min(width, x + w + margin), min(height, y + h + margin)
+
+
+def _leaflet_row(outcome: ComparisonOutcome) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    """A compared pair of pages as its row shows them: the leaflet compared on them, everything else on the page cleared
+    and trimmed away (a page compared whole: trimmed to what is printed). Returns both pictures and the crop's (x, y)."""
+    original, suspect = outcome.aligned_original, outcome.aligned_suspect
+    area = outcome.compare_mask
+    if area is not None and area.any() and not area.all():
+        original, suspect = apply_mask(original, area), apply_mask(suspect, area)
+    x0, y0, x1, y1 = _content_box(original, suspect)
+    return original[y0:y1, x0:x1], suspect[y0:y1, x0:x1], (x0, y0)
 
 
 def _placeholder(height: int, width: int, text: str) -> np.ndarray:
@@ -423,7 +475,7 @@ def _whole_page_finding(kind: DiffSubtype, page_index: int, offset: int, size: t
     box = BoundingBox(0.0, float(offset), float(width), float(offset + height))
     word = "missing from" if kind is DiffSubtype.REMOVED else "added in"
     detail = f"Page {page_index + 1} {word} the suspect (no page of the other file looks enough like it)"
-    member = DiffCandidate(bbox=box, type=DiffType.GRAPHICS, subtype=kind, confidence=1.0, detail=detail)
+    member = DiffCandidate(bbox=box, type=DiffType.GRAPHICS, subtype=kind, confidence=1.0, detail=detail, source=SOURCE_PAGE)
     return DiffCluster(
         id=0,
         bbox_in_original=box,
@@ -434,10 +486,31 @@ def _whole_page_finding(kind: DiffSubtype, page_index: int, offset: int, size: t
     )
 
 
+def _with_reviewers(found: IsolationGeometry | None, own: IsolationGeometry | None) -> IsolationGeometry | None:
+    """A page's area as compared: the reviewer's own area for it where they set one, else the leaflet found on it; less
+    whatever they erased on it either way."""
+    if own is None:
+        return found
+    if own.boundary is not None:
+        return own
+    if found is None:
+        return own
+    return replace(found, erase_regions=list(found.erase_regions) + list(own.erase_regions), erase_brush_radius_norm=own.erase_brush_radius_norm)
+
+
 def compare_leaflet(
-    original: LoadedArtwork, suspect: LoadedArtwork, config: AppConfig, progress: Callable[[str], None] | None = None
+    original: LoadedArtwork,
+    suspect: LoadedArtwork,
+    config: AppConfig,
+    progress: Callable[[str], None] | None = None,
+    original_areas: dict[int, IsolationGeometry] | None = None,
+    suspect_areas: dict[int, IsolationGeometry] | None = None,
+    align_only: bool = False,
 ) -> ComparisonOutcome:
-    """Compare every page of `original` against every page of `suspect` it is paired with (see the module's account)."""
+    """Compare every page of `original` against every page of `suspect` it is paired with (see the module's account).
+    `original_areas`/`suspect_areas`: what the reviewer set on each page of each file (by page, 0-based) -- a page's
+    own area, compared instead of the leaflet found on it, and areas left out of it."""
+    original_areas, suspect_areas = original_areas or {}, suspect_areas or {}
     say = progress or (lambda _text: None)
     leaflet_config = config.leaflet
     if original.page_count == 0 or suspect.page_count == 0:
@@ -445,11 +518,24 @@ def compare_leaflet(
 
     say("Rendering the pages…")
     with StageTimer(logger, "leaflet_render"):
-        original_pages = [original.render(page=i) for i in range(original.page_count)]
-        suspect_pages = [suspect.render(page=i) for i in range(suspect.page_count)]
+        original_pages = [_page(original, i) for i in range(original.page_count)]
+        suspect_pages = [_page(suspect, i) for i in range(suspect.page_count)]
 
-    language, language_ok = usable_language(leaflet_config.language)
-    page_config = config if language_ok else _with_language(config, language)
+    # each PDF page's own words (none for an outlined page, or a picture): exact, and instant beside reading it
+    original_layers = [_page_words(original, i, page) for i, page in enumerate(original_pages)]
+    suspect_layers = [_page_words(suspect, i, page) for i, page in enumerate(suspect_pages)]
+
+    found_languages = None
+    if leaflet_config.language == AUTO:
+        # The languages printed are found from the first pages beside the pages being paired and compared; a reading
+        # asked for meanwhile waits only for what is left of it (`language_detect`).
+        sample = list(original_pages[:_LANGUAGE_PAGES]) + list(suspect_pages[:_LANGUAGE_PAGES])
+        texts = [[w.text for w in (layer or [])] for layer in original_layers[:_LANGUAGE_PAGES] + suspect_layers[:_LANGUAGE_PAGES]]
+        found_languages = language_detect.begin(lambda: detect_languages(sample, texts))
+        language, language_ok = AUTO, True
+    else:
+        language, language_ok = usable_language(leaflet_config.language)
+    page_config = _with_language(config, language)  # (every reading on the pages, not just the word comparison)
     warnings: list[str] = []
     if not language_ok:
         warnings.append(
@@ -457,10 +543,6 @@ def compare_leaflet(
             "Findings are still located and flagged correctly; only their words may not be read where this is the "
             "wrong language for them."
         )
-
-    # each PDF page's own words (none for an outlined page, or a picture): exact, and instant beside reading it
-    original_layers = [_page_words(original, i, page) for i, page in enumerate(original_pages)]
-    suspect_layers = [_page_words(suspect, i, page) for i, page in enumerate(suspect_pages)]
 
     say("Matching the pages…")
     with StageTimer(logger, "leaflet_pairing"):
@@ -485,27 +567,42 @@ def compare_leaflet(
     say("Comparing the pages…")
     results: dict[int, ComparisonOutcome] = {}
 
+    # each PDF page's own lines and paths (folds divide a leaflet into panels; its outline and fold lines are drawn out)
+    original_extras = [_pdf_lines_and_strokes(original, i, page) for i, page in enumerate(original_pages)]
+    suspect_extras = [_pdf_lines_and_strokes(suspect, i, page) for i, page in enumerate(suspect_pages)]
+
     def compare_one(pair: tuple[int, int]) -> tuple[int, ComparisonOutcome | Exception]:
         o, s = pair
         original_page, suspect_page = original_pages[o], suspect_pages[s]
         try:
-            outcome: ComparisonOutcome | None = None
-            if leaflet_config.compare_text:
-                outcome = _text_outcome(original_page, suspect_page, original_layers[o], suspect_layers[s], page_config, language)
-            if leaflet_config.compare_visual:
-                visual_outcome = run_comparison(
-                    original_page,
-                    suspect_page,
-                    ComparisonMode.LEAFLET,
-                    page_config,
-                    options=_VISUAL_STRATEGY_OPTIONS,
-                    original_words=original_layers[o],
-                    suspect_words=suspect_layers[s],
-                )
-                outcome = _merge_outcomes(outcome, visual_outcome) if outcome is not None else visual_outcome
-            if outcome is None:
-                raise ValueError("Neither of Leaflet's comparison strategies is switched on.")
-            return o, outcome
+            # 1. The leaflet on each page: what is outside it (marks, notes, the rest of the sheet) is not compared.
+            original_area, suspect_area = _leaflet_areas(original, suspect, o, s, original_page, suspect_page, page_config)
+            original_area = _with_reviewers(original_area, original_areas.get(o))
+            suspect_area = _with_reviewers(suspect_area, suspect_areas.get(s))
+            # 2. Its pixels: aligned by what is printed (never by the outlines -- see `run_comparison`), then panel by
+            #    panel along its folds, with its outline and fold lines drawn out of both pages.
+            visual_outcome = run_comparison(
+                original_page,
+                suspect_page,
+                ComparisonMode.LEAFLET,
+                page_config,
+                original_geometry=original_area,
+                suspect_geometry=suspect_area,
+                options=_VISUAL_STRATEGY_OPTIONS,
+                original_lines=original_extras[o][0],
+                suspect_lines=suspect_extras[s][0],
+                original_words=original_layers[o],
+                suspect_words=suspect_layers[s],
+                original_strokes=original_extras[o][1],
+                suspect_strokes=suspect_extras[s][1],
+                align_only=align_only,
+            )
+            if align_only:
+                return o, visual_outcome
+            # 3. Its words, on exactly that alignment. Both strategies always: the results page shows or hides each
+            #    one's findings (its OCR / pixel toggles) at once, with nothing compared again.
+            text_outcome = word_outcome(visual_outcome, original_layers[o], suspect_layers[s], page_config, language)
+            return o, _merge_outcomes(visual_outcome, text_outcome)
         except Exception as exc:  # noqa: BLE001 -- one unreadable page must not sink the rest
             return o, exc
 
@@ -535,10 +632,10 @@ def compare_leaflet(
             if reference_alignment is None:
                 reference_alignment = outcome.alignment
             profiles.append(outcome.detection_profile)
-            x0, y0, x1, y1 = _content_box(outcome.aligned_original, outcome.aligned_suspect)
+            shown_original, shown_suspect, crop = _leaflet_row(outcome)
             label = f"Page {o + 1}" if o == s_index else f"Original p.{o + 1} / Suspect p.{s_index + 1}"
-            rows.append((outcome.aligned_original[y0:y1, x0:x1], outcome.aligned_suspect[y0:y1, x0:x1], label))
-            row_crops.append((x0, y0))
+            rows.append((shown_original, shown_suspect, label))
+            row_crops.append(crop)
             for cluster in outcome.clusters:
                 cluster.detail = f"{label}: {cluster.detail}"
             row_clusters.append(list(outcome.clusters))
@@ -549,14 +646,14 @@ def compare_leaflet(
             trimmed = page[y0:y1, x0:x1]
             rows.append((trimmed, _placeholder(*trimmed.shape[:2], "No page of the suspect matches this one"), f"Original p.{o + 1}"))
             row_crops.append((0, 0))
-            row_clusters.append([_whole_page_finding(DiffSubtype.REMOVED, o, 0, trimmed.shape[:2])])
+            row_clusters.append([] if align_only else [_whole_page_finding(DiffSubtype.REMOVED, o, 0, trimmed.shape[:2])])
     for s_index in unmatched_s:
         page = suspect_pages[s_index]
         x0, y0, x1, y1 = _content_box(page)
         trimmed = page[y0:y1, x0:x1]
         rows.append((_placeholder(*trimmed.shape[:2], "No page of the original matches this one"), trimmed, f"Suspect p.{s_index + 1}"))
         row_crops.append((0, 0))
-        row_clusters.append([_whole_page_finding(DiffSubtype.ADDED, s_index, 0, trimmed.shape[:2])])
+        row_clusters.append([] if align_only else [_whole_page_finding(DiffSubtype.ADDED, s_index, 0, trimmed.shape[:2])])
 
     if not rows:
         raise NoPagesComparedError("No page could be compared (every pairing failed, or none paired at all).")
@@ -587,11 +684,18 @@ def compare_leaflet(
         )
     if selection is not None:
         notes.append(f"Restricted to original page(s) {leaflet_config.compare_pages}: the rest were not reviewed.")
+    said = language_detect.note(found_languages)
+    if said:
+        notes.append(said)
 
     return ComparisonOutcome(
         alignment=reference_alignment,
         candidates=[],
-        clusters=all_clusters,
+        clusters=[] if align_only else renumbered(
+            visible_by_source(all_clusters, ocr_wanted=leaflet_config.compare_text, pixels_wanted=leaflet_config.compare_visual),
+            all_clusters,
+        ),
+        all_clusters=[] if align_only else all_clusters,
         aligned_original=original_stack,
         aligned_suspect=suspect_stack,
         warnings=warnings,
@@ -602,8 +706,11 @@ def compare_leaflet(
         graphics_compared=leaflet_config.compare_visual,
         text_compared=leaflet_config.compare_text,
         compared_pages=leaflet_config.compare_pages,
-        notes=notes,
+        notes=["Files updated and aligned. Click Recompare to run comparison."] if align_only else notes,
     )
+
+
+_LANGUAGE_PAGES = 2  # (a leaflet's languages are found on its first pages: a page or two holds every language it has)
 
 
 def _with_language(config: AppConfig, language: str) -> AppConfig:

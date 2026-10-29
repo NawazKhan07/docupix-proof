@@ -10,9 +10,9 @@ import cv2
 import numpy as np
 import pytest
 
-from app.config import AppConfig, DetectionConfig
+from app.config import DetectionConfig
 from app.engine.detectors import braille_diff, structure_diff, text_diff
-from app.engine.detectors.text_diff import OcrWord, _findings, _runs, _trustworthy, corroborated, marks_agreement
+from app.engine.detectors.text_diff import OcrWord, _findings, _runs, _trustworthy, marks_agreement
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
 CONFIG = DetectionConfig()
@@ -62,19 +62,6 @@ def test_marks_that_are_the_same_agree_and_different_ones_do_not():
     assert marks_agreement(a, a.copy(), box) >= 0.999
     assert marks_agreement(a, b, box) < 0.95
     assert marks_agreement(a, np.full_like(a, 255), box) is None  # a blank crop cannot be judged
-
-
-def test_a_finding_over_identical_pixels_is_dropped_and_one_over_different_pixels_is_kept():
-    same = _page_with_text("500 mg")
-    phantom = DiffCandidate(BoundingBox(0, 0, 700, 160), DiffType.TEXT, DiffSubtype.CHANGED, 0.9, "'x' -> 'a'")
-    assert corroborated([phantom], same, same.copy(), CONFIG) == []
-    assert corroborated([phantom], same, _page_with_text("250 mg"), CONFIG) == [phantom]
-
-
-def test_a_finding_over_a_blank_crop_is_kept_because_it_cannot_be_checked():
-    blank = np.full((160, 700, 3), 255, np.uint8)
-    finding = DiffCandidate(BoundingBox(0, 0, 700, 160), DiffType.TEXT, DiffSubtype.REMOVED, 0.9, "'x' missing")
-    assert corroborated([finding], blank, blank.copy(), CONFIG) == [finding]
 
 
 def test_a_moved_word_reports_how_far_it_moved():

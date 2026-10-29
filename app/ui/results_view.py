@@ -7,13 +7,18 @@ filtering or ignoring in the list changes which markers the viewer draws.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSplitter,
@@ -24,25 +29,58 @@ from PySide6.QtWidgets import (
 
 from app.engine.file_loader import LoadedArtwork
 from app.engine.worker import ComparisonOutcome
-from app.models.diff import visible_clusters
+from app.models.categories import CATEGORY_ORDER
+from app.models.diff import SOURCE_OCR, BoundingBox, renumbered, visible_by_source, visible_clusters
 from app.models.job import MODE_DISPLAY_NAMES, ComparisonMode
 from app.ui.braille_panel import BrailleResultsPanel
 from app.ui.comparison_viewport import ComparisonViewport
 from app.ui.diff_list_panel import DiffListPanel
 from app.ui.flow_layout import flow_widget
-from app.ui.page_picker import PagePicker
+from app.ui.page_picker import PagePicker, PageSelector
 from app.ui.symbol_panel import SymbolResultsPanel
 
+logger = logging.getLogger(__name__)
+
+# controls that use the arrow keys themselves: they keep them
+_ARROW_CONTROLS = (QComboBox, QAbstractSpinBox, QLineEdit)
+
 PANEL_MIN_WIDTH = 290
+
+
+class _ToolActionShim(QPushButton):
+    """Compatibility shim for tests expecting barcode_button and braille_button directly."""
+
+    def __init__(self, view: ResultsView, mode: ComparisonMode, label: str):
+        super().__init__(label, view)
+        self._view = view
+        self._mode = mode
+        self._label = label
+        self.clicked.connect(self._handle_click)
+        super().setVisible(False)
+
+    def isVisible(self) -> bool:
+        return self._view.tools_button.isVisible()
+
+    def isEnabled(self) -> bool:
+        return self._view.tools_button.isEnabled() and (self._view._current_mode is not self._mode)
+
+    def setVisible(self, visible: bool) -> None:
+        pass
+
+    def setEnabled(self, enabled: bool) -> None:
+        pass
+
+    def _handle_click(self) -> None:
+        self._view._on_tool_selected(self._mode, self._label)
+        self._view._on_recompare_clicked()
 
 
 class ResultsView(QWidget):
     backRequested = Signal()
     editFilesRequested = Signal(str)  # "original" or "suspect": edit its artwork area, then compare again
     modeSwitchRequested = Signal(object)  # ComparisonMode: the same files, a different mode, shown instantly
-    leafletTextToggled = Signal(bool)  # Leaflet: read and compare the words on each page (or not)
-    leafletVisualToggled = Signal(bool)  # Leaflet: pure pixel-by-pixel comparison (or not)
     leafletPagesChanged = Signal(str)  # Leaflet: which of the original's pages to compare ("" = every page)
+    pageChangeRequested = Signal(str, int)  # ("original" | "suspect", 0-based page): compare that page of that file instead
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,11 +103,23 @@ class ResultsView(QWidget):
         titles = QVBoxLayout()
         titles.setSpacing(2)
         titles.addWidget(heading)
-        titles.addWidget(self.subtitle_label)
+        # The file names only; what the comparison noted (the resolution used, the area found, the languages read) is
+        # one click away, not a paragraph over the results.
+        names = QHBoxLayout()
+        names.setSpacing(10)
+        names.addWidget(self.subtitle_label, stretch=1)
+        self.details_button = QPushButton("Details")
+        self.details_button.setCheckable(True)
+        self.details_button.setFlat(True)
+        self.details_button.setVisible(False)
+        self.details_button.setToolTip("What the comparison noted about these files")
+        names.addWidget(self.details_button, alignment=Qt.AlignmentFlag.AlignTop)
+        titles.addLayout(names)
         self.note_label = QLabel("")
         self.note_label.setProperty("secondary", "true")
         self.note_label.setWordWrap(True)
         self.note_label.setVisible(False)
+        self.details_button.toggled.connect(self.note_label.setVisible)
         titles.addWidget(self.note_label)
         header.addWidget(self.back_button, alignment=Qt.AlignmentFlag.AlignTop)
         header.addSpacing(8)
@@ -90,36 +140,57 @@ class ResultsView(QWidget):
         )
         self.text_check.setVisible(False)
         self.text_check.toggled.connect(self._on_text_toggled)
-        # Leaflet's own two independent strategies: which words differ, and/or exactly which pixels do. At
-        # least one must stay on, so each disables itself while it is the only one left ticked.
-        self.leaflet_text_check = QCheckBox("Compare text")
+        # Leaflet and Automatic: both strategies are always run -- reading and comparing the words (OCR), and comparing
+        # the pictures pixel by pixel -- and these two show or hide each one's findings at once, nothing compared again.
+        # (Automatic opens on its pixel findings; its OCR ones are there for the ticking.)
+        self.leaflet_text_check = QCheckBox("OCR findings")
         self.leaflet_text_check.setToolTip(
-            "Read and compare the words on each page. On by default -- a leaflet's pages are what they say."
+            "Show the changes found by reading and comparing the words, word for word."
         )
         self.leaflet_text_check.setVisible(False)
-        self.leaflet_text_check.toggled.connect(self._on_leaflet_text_toggled)
-        self.leaflet_visual_check = QCheckBox("Compare visually (pixel by pixel)")
+        self.leaflet_text_check.toggled.connect(self._on_leaflet_sources_toggled)
+        self.leaflet_visual_check = QCheckBox("Pixel findings")
         self.leaflet_visual_check.setToolTip(
-            "A pure pixel-by-pixel comparison marking the exact areas that differ, whatever they say."
+            "Show the changes found by comparing the pictures pixel by pixel, marking exactly the areas that differ."
         )
         self.leaflet_visual_check.setVisible(False)
-        self.leaflet_visual_check.toggled.connect(self._on_leaflet_visual_toggled)
+        self.leaflet_visual_check.toggled.connect(self._on_leaflet_sources_toggled)
         # Which of the leaflet's pages to compare: a list to tick, next to the other file controls.
         self.leaflet_pages_picker = PagePicker()
         self.leaflet_pages_picker.setVisible(False)
         self.leaflet_pages_picker.pagesChanged.connect(self._on_leaflet_pages_chosen)
+        # Every other mode: which page of each file of several was compared -- pick another to compare that one.
+        self.original_page_selector = PageSelector("Original page", with_best_match=False)
+        self.suspect_page_selector = PageSelector("Suspect page", with_best_match=False)
+        for which, selector in (("original", self.original_page_selector), ("suspect", self.suspect_page_selector)):
+            selector.setVisible(False)
+            selector.pageChosen.connect(lambda page, which=which: self._on_page_chosen(which, page))
         # A quick way to switch to Barcode or Braille mode on these same files without going back to the setup
-        # page: the one currently shown is disabled (nothing to switch to), the other re-compares instantly.
-        self.barcode_button = QPushButton("Barcode")
-        self.barcode_button.setProperty("variant", "segment")
-        self.barcode_button.setToolTip("Compare these same files again, restricted to barcode/Pharmacode/QR symbols.")
-        self.barcode_button.setVisible(False)
-        self.barcode_button.clicked.connect(lambda: self.modeSwitchRequested.emit(ComparisonMode.BARCODE))
-        self.braille_button = QPushButton("Braille")
-        self.braille_button.setProperty("variant", "segment")
-        self.braille_button.setToolTip("Compare these same files again, restricted to the Braille dot matrix.")
-        self.braille_button.setVisible(False)
-        self.braille_button.clicked.connect(lambda: self.modeSwitchRequested.emit(ComparisonMode.BRAILLE))
+        # page: a Tools dropdown offering Barcode and Braille, and a Recompare button appearing when picked.
+        self.tools_button = QPushButton("Tools")
+        self.tools_button.setProperty("variant", "segment")
+        self.tools_button.setToolTip("Select a specialized comparison mode (Barcode, Braille).")
+        self.tools_button.setVisible(False)
+        self.tools_menu = QMenu(self.tools_button)
+        self.automatic_action = self.tools_menu.addAction("Automatic")
+        self.automatic_action.triggered.connect(
+            lambda: self._on_tool_selected(self._origin_mode or ComparisonMode.AUTOMATIC, "Tools")
+        )
+        self.barcode_action = self.tools_menu.addAction("Barcode")
+        self.barcode_action.triggered.connect(lambda: self._on_tool_selected(ComparisonMode.BARCODE, "Barcode"))
+        self.braille_action = self.tools_menu.addAction("Braille")
+        self.braille_action.triggered.connect(lambda: self._on_tool_selected(ComparisonMode.BRAILLE, "Braille"))
+        self.tools_button.setMenu(self.tools_menu)
+
+        self.recompare_button = QPushButton("Recompare")
+        self.recompare_button.setProperty("variant", "primary")
+        self.recompare_button.setToolTip("Compare these same files again in the current or selected mode.")
+        self.recompare_button.setVisible(True)
+        self.recompare_button.clicked.connect(self._on_recompare_clicked)
+        self._selected_tool_mode: ComparisonMode | None = None
+
+        self.barcode_button = _ToolActionShim(self, ComparisonMode.BARCODE, "Barcode")
+        self.braille_button = _ToolActionShim(self, ComparisonMode.BRAILLE, "Braille")
         # A way back from Barcode/Braille to whatever mode this comparison actually started in -- switching to
         # one of those two must not strand the reviewer with no way back except returning to the setup page
         # and comparing again from scratch.
@@ -146,10 +217,12 @@ class ResultsView(QWidget):
             self.leaflet_text_check,
             self.leaflet_visual_check,
             self.origin_mode_button,
-            self.barcode_button,
-            self.braille_button,
+            self.tools_button,
+            self.recompare_button,
             self.edit_files_button,
             self.leaflet_pages_picker,
+            self.original_page_selector,
+            self.suspect_page_selector,
         ):
             controls.addWidget(widget)
         header.addWidget(controls_widget, stretch=2, alignment=Qt.AlignmentFlag.AlignTop)
@@ -183,8 +256,14 @@ class ResultsView(QWidget):
         self.symbol_panel.symbolSelected.connect(self.viewport.highlight_box)
         self.braille_panel.regionSelected.connect(self.viewport.highlight_box)
         self.viewport.markerClicked.connect(self._on_marker_clicked)
+        self.viewport.backgroundClicked.connect(self.deselect)
+        self.panel.backgroundClicked.connect(self.deselect)
         self.viewport.mergeRegionSelected.connect(self._on_merge_region)
         self.viewport.undoMergeRequested.connect(self._on_undo_merge)
+        self.viewport.eraseRegionSelected.connect(self._on_erase_region)
+        self.viewport.undoEraseRequested.connect(self._on_undo_erase)
+        # each area erased, latest last: (what the pictures had there, the findings before, every finding's number)
+        self._erasures: list[tuple] = []
 
     def set_origin_mode(self, mode: ComparisonMode | None) -> None:
         """The mode this comparison actually started in (a fresh "Compare" from the setup page) -- not touched
@@ -203,7 +282,8 @@ class ResultsView(QWidget):
         self._outcome = outcome
         self.subtitle_label.setText(subtitle)
         self.note_label.setText("  ".join(outcome.notes))
-        self.note_label.setVisible(bool(outcome.notes))
+        self.details_button.setVisible(bool(outcome.notes))
+        self.note_label.setVisible(bool(outcome.notes) and self.details_button.isChecked())
         self.has_results = True
         scan_mode = outcome.mode is ComparisonMode.SCAN_VS_DIGITAL
         self.graphics_check.blockSignals(True)
@@ -215,34 +295,50 @@ class ResultsView(QWidget):
         self.text_check.blockSignals(False)
         self.text_check.setVisible(scan_mode)
         leaflet_mode = outcome.mode is ComparisonMode.LEAFLET
+        both_ways = outcome.mode in (ComparisonMode.LEAFLET, ComparisonMode.AUTOMATIC)  # OCR and pixel findings, toggled
         self.leaflet_text_check.blockSignals(True)
         self.leaflet_text_check.setChecked(bool(outcome.text_compared))
         self.leaflet_text_check.blockSignals(False)
-        self.leaflet_text_check.setVisible(leaflet_mode)
+        self.leaflet_text_check.setVisible(both_ways)
+        self._set_ocr_check_ready(not outcome.ocr_pending, outcome.mode)
         self.leaflet_visual_check.blockSignals(True)
         self.leaflet_visual_check.setChecked(bool(outcome.graphics_compared))
         self.leaflet_visual_check.blockSignals(False)
-        self.leaflet_visual_check.setVisible(leaflet_mode)
-        self._refresh_leaflet_strategy_locks()
+        self.leaflet_visual_check.setVisible(both_ways)
+        # how each finding was found, as kinds to pick in the findings list: where both ways are run
+        self.panel.set_source_kinds(both_ways or outcome.mode is ComparisonMode.SCAN_VS_DIGITAL)
+        # a leaflet is compared for its words, colours and graphics only: it has no barcode or Braille to list
+        self.panel.set_categories(("text", "colour", "graphics") if leaflet_mode else CATEGORY_ORDER)
         if leaflet_mode:
             self.leaflet_pages_picker.set_page_count(original.page_count if original is not None else 0)
             self.leaflet_pages_picker.set_spec(outcome.compared_pages)
         self.leaflet_pages_picker.setVisible(leaflet_mode and self.leaflet_pages_picker.page_count > 1)
+        for selector, artwork, page in (
+            (self.original_page_selector, original, outcome.original_page),
+            (self.suspect_page_selector, suspect, outcome.suspect_page),
+        ):
+            count = artwork.page_count if artwork is not None else 0
+            selector.set_page_count(count)
+            selector.set_choice(page)
+            selector.setVisible(not leaflet_mode and count > 1)
         # Barcode/Braille are Automatic's own quick-checks (and each other's): offered from Automatic itself or
         # from whichever of the two is currently shown, never from a mode with its own specific comparison
         # (Scan vs Digital, Series) or Leaflet (which pairs and compares its own pages, on its own screen).
         switchable = outcome.mode in (ComparisonMode.AUTOMATIC, ComparisonMode.BARCODE, ComparisonMode.BRAILLE)
+        self.tools_button.setVisible(switchable)
+        self.recompare_button.setVisible(True)
+        self._selected_tool_mode = None
+        if outcome.mode is ComparisonMode.AUTOMATIC:
+            self.tools_button.setText("Tools")
+        elif outcome.mode is ComparisonMode.BARCODE:
+            self.tools_button.setText("Barcode")
+        elif outcome.mode is ComparisonMode.BRAILLE:
+            self.tools_button.setText("Braille")
         self.barcode_button.setVisible(switchable)
         self.braille_button.setVisible(switchable)
-        # Barcode/Braille already have their own dedicated buttons; the origin button is only for getting back
-        # to whatever OTHER mode (Automatic, Scan vs Digital, Series) this comparison actually started in.
-        origin_has_own_button = self._origin_mode in (ComparisonMode.BARCODE, ComparisonMode.BRAILLE, ComparisonMode.LEAFLET, None)
-        show_origin = switchable and not origin_has_own_button and self._origin_mode is not outcome.mode
-        if show_origin:
-            self.origin_mode_button.setText(MODE_DISPLAY_NAMES[self._origin_mode])
-        self.origin_mode_button.setVisible(show_origin)
-        # A leaflet's pages have no crop/lift area of their own to re-edit (every page is compared in full).
-        self.edit_files_button.setVisible(not leaflet_mode)
+        origin_label = MODE_DISPLAY_NAMES.get(self._origin_mode, "Automatic") if self._origin_mode else "Automatic"
+        self.automatic_action.setText(origin_label)
+        self.origin_mode_button.setVisible(False)
         self._current_mode = outcome.mode
         self.set_busy("")
         ink_pair = (
@@ -260,13 +356,18 @@ class ResultsView(QWidget):
             # would not line up with that picture, so it is resampled like an image.
             self.viewport.set_sources(None, None, None)
         else:
-            self.viewport.set_sources(original, suspect, outcome.alignment.transform, outcome.block_alignments)
+            self.viewport.set_sources(
+                original, suspect, outcome.alignment.transform, outcome.block_alignments, (outcome.original_dpi, outcome.suspect_dpi)
+            )
         self.viewport.set_compared_area(outcome.compared_outline)
         self.viewport.set_block_outlines(outcome.block_outlines or None)
         self.viewport.clear_highlight()
         self.panel.set_result(outcome.clusters, outcome.alignment, outcome.warnings)
         self.viewport.set_merge_mode(False)
         self.viewport.set_can_undo_merge(False)
+        self.viewport.set_hide_highlights(False)
+        self._erasures = []
+        self.viewport.set_erase_available(leaflet_mode)
         self.viewport.show_merge_notice("")
         self._show_mode_panels(outcome)
         self._sync_markers()
@@ -304,21 +405,36 @@ class ResultsView(QWidget):
         idle = not self._busy_locked
         self.graphics_check.setEnabled(idle)
         self.text_check.setEnabled(idle)
+        self.tools_button.setEnabled(idle)
+        self.recompare_button.setEnabled(idle)
         self.barcode_button.setEnabled(idle and self._current_mode is not ComparisonMode.BARCODE)
         self.braille_button.setEnabled(idle and self._current_mode is not ComparisonMode.BRAILLE)
         self.origin_mode_button.setEnabled(idle)
         self.edit_files_button.setEnabled(idle)
         self.leaflet_pages_picker.setEnabled(idle)
-        self._refresh_leaflet_strategy_locks()
+        self.original_page_selector.setEnabled(idle)
+        self.suspect_page_selector.setEnabled(idle)
 
-    def _refresh_leaflet_strategy_locks(self) -> None:
-        """At least one of Leaflet's two strategies must stay on: whichever is the only one ticked disables
-        itself, so un-ticking it is not even possible, rather than silently doing nothing or leaving neither on."""
-        idle = not self._busy_locked
-        text_only = self.leaflet_text_check.isChecked() and not self.leaflet_visual_check.isChecked()
-        visual_only = self.leaflet_visual_check.isChecked() and not self.leaflet_text_check.isChecked()
-        self.leaflet_text_check.setEnabled(idle and not text_only)
-        self.leaflet_visual_check.setEnabled(idle and not visual_only)
+    def select_tool(self, mode: ComparisonMode) -> None:
+        """Select a tool mode ('Barcode', 'Braille', or 'Automatic') from the Tools dropdown."""
+        if mode in (ComparisonMode.BARCODE, ComparisonMode.BRAILLE):
+            label = "Barcode" if mode is ComparisonMode.BARCODE else "Braille"
+        else:
+            label = "Tools"
+        self._on_tool_selected(mode, label)
+
+    def _on_tool_selected(self, mode: ComparisonMode, label: str) -> None:
+        if mode == self._current_mode and label == "Tools":
+            self._selected_tool_mode = None
+        else:
+            self._selected_tool_mode = mode
+        self.tools_button.setText(label)
+        self.recompare_button.setVisible(True)
+
+    def _on_recompare_clicked(self) -> None:
+        target_mode = self._selected_tool_mode if self._selected_tool_mode is not None else self._current_mode
+        if target_mode is not None:
+            self.modeSwitchRequested.emit(target_mode)
 
     def _on_graphics_toggled(self, checked: bool) -> None:
         self._refilter_scan_clusters(graphics_wanted=checked, text_wanted=self.text_check.isChecked())
@@ -334,20 +450,70 @@ class ResultsView(QWidget):
             return
         self._outcome = replace(
             self._outcome,
-            clusters=visible_clusters(self._outcome.all_clusters, text_wanted=text_wanted, graphics_wanted=graphics_wanted),
+            clusters=renumbered(
+                visible_clusters(self._outcome.all_clusters, text_wanted=text_wanted, graphics_wanted=graphics_wanted),
+                self._outcome.all_clusters,
+            ),
             graphics_compared=graphics_wanted,
             text_compared=text_wanted,
         )
         self.panel.set_result(self._outcome.clusters, self._outcome.alignment, self._outcome.warnings)
         self._sync_markers()
 
-    def _on_leaflet_text_toggled(self, checked: bool) -> None:
-        self._refresh_leaflet_strategy_locks()
-        self.leafletTextToggled.emit(checked)
+    def _set_ocr_check_ready(self, ready: bool, mode: ComparisonMode | None) -> None:
+        """The OCR findings' checkbox, usable once they are there (Automatic sends its pixel findings first)."""
+        self.leaflet_text_check.setEnabled(ready)
+        if not ready:
+            self.leaflet_text_check.setToolTip("Reading the words… the OCR findings can be shown in a moment.")
+        elif mode is ComparisonMode.AUTOMATIC:
+            self.leaflet_text_check.setToolTip("Show the words spelt differently in the suspect (read and compared word for word).")
+        else:
+            self.leaflet_text_check.setToolTip("Show the changes found by reading and comparing the words, word for word.")
 
-    def _on_leaflet_visual_toggled(self, checked: bool) -> None:
-        self._refresh_leaflet_strategy_locks()
-        self.leafletVisualToggled.emit(checked)
+    def add_rest(self, whole: ComparisonOutcome | None) -> None:
+        """The rest of the result on show, sent after it (`ComparisonOutcome.ocr_pending`): its OCR findings added to
+        what is shown -- the findings already there kept as they are (and whatever was done with them: ignored, merged)
+        -- or, where they could not be made (`None`), the result left as it was."""
+        if self._outcome is None or not self._outcome.ocr_pending:
+            return
+        if whole is None:
+            self._outcome = replace(self._outcome, ocr_pending=False)
+            self._set_ocr_check_ready(True, self._outcome.mode)
+            self.leaflet_text_check.setToolTip("The words could not be read, so there are no OCR findings.")
+            self.leaflet_text_check.setEnabled(False)
+            return
+        read = [cluster for cluster in (whole.all_clusters or whole.clusters) if cluster.sources == {SOURCE_OCR}]
+        everything = list(self._outcome.all_clusters or self._outcome.clusters) + read
+        ocr, pixels = self.leaflet_text_check.isChecked(), self.leaflet_visual_check.isChecked()
+        self._outcome = replace(
+            self._outcome,
+            all_clusters=everything,
+            clusters=renumbered(visible_by_source(everything, ocr_wanted=ocr, pixels_wanted=pixels), everything),
+            candidates=self._outcome.candidates + [m for c in read for m in c.members],
+            warnings=self._outcome.warnings + [w for w in whole.warnings if w not in self._outcome.warnings],
+            ocr_pending=False,
+        )
+        self._set_ocr_check_ready(True, self._outcome.mode)
+        self.panel.set_result(self._outcome.clusters, self._outcome.alignment, self._outcome.warnings)
+        self._sync_markers()
+
+    def _on_leaflet_sources_toggled(self, _checked: bool) -> None:
+        """Leaflet's or Automatic's OCR / pixel findings shown or hidden: a filter over everything both strategies found
+        (`outcome.all_clusters`), so it is instant -- nothing is compared again."""
+        if self._outcome is None:
+            return
+        ocr, pixels = self.leaflet_text_check.isChecked(), self.leaflet_visual_check.isChecked()
+        self._outcome = replace(
+            self._outcome,
+            clusters=renumbered(
+                visible_by_source(self._outcome.all_clusters or self._outcome.clusters, ocr_wanted=ocr, pixels_wanted=pixels),
+                self._outcome.all_clusters or [],
+            ),
+            text_compared=ocr,
+            graphics_compared=pixels,
+        )
+        self.panel.set_result(self._outcome.clusters, self._outcome.alignment, self._outcome.warnings)
+        self._sync_markers()
 
     def revert_leaflet_pages_field(self, text: str) -> None:
         """A page choice whose comparison did not finish: the picker goes back to what the results on show used."""
@@ -357,12 +523,23 @@ class ResultsView(QWidget):
         if self._busy_locked:
             return
         self.leafletPagesChanged.emit(spec)
+
+    def _on_page_chosen(self, which: str, page: int | None) -> None:
+        if self._busy_locked or page is None:
+            return
+        self.pageChangeRequested.emit(which, page)
+
+    def revert_page_selectors(self) -> None:
+        """A page choice whose comparison did not finish: the selectors go back to the pages the results on show used."""
+        if self._outcome is not None:
+            self.original_page_selector.set_choice(self._outcome.original_page)
+            self.suspect_page_selector.set_choice(self._outcome.suspect_page)
     def release_sources(self) -> None:
         """Stop holding the loaded files (they are closed when replaced)."""
         self.viewport.release_sources()
 
     def _sync_markers(self) -> None:
-        self.viewport.set_marker_clusters(self.panel.marker_clusters())
+        self.viewport.set_marker_clusters(self.panel.marker_clusters(), by_source=self.panel.colour_by_source)
 
     def _on_finding_selected(self, cluster_id: int | None) -> None:
         if cluster_id is None:  # the already-selected card was clicked again: deselect, without moving the view
@@ -373,8 +550,75 @@ class ResultsView(QWidget):
             self.viewport.focus_cluster(cluster)
 
     def _on_marker_clicked(self, cluster_id: int) -> None:
+        if cluster_id == self.panel._selected_id:  # the selected finding clicked again: deselect it
+            self.deselect()
+            return
         self.viewport.set_selected(cluster_id)
         self.panel.select(cluster_id)
+
+    def deselect(self) -> None:
+        """No finding selected (the reviewer clicked the picture where there is none, or anywhere else on the page)."""
+        if self.panel._selected_id is None:
+            return
+        self.panel.select(None)
+        self.viewport.set_selected(None)
+        self.viewport.clear_highlight()
+
+    def mousePressEvent(self, event) -> None:
+        # a click on the page that nothing else took (its heading, the space between the panels): deselect
+        self.deselect()
+        super().mousePressEvent(event)
+
+    # -- stepping through the findings with the arrow keys --------------------------------------------------------------
+    def step_finding(self, step: int) -> bool:
+        """With a finding selected, select the one `step` places below (+1) or above (-1) it in the findings list -- the
+        list's own order, whatever is filtered out -- and take the view to it. False if there is none that way (or none
+        selected): nothing changes."""
+        shown = self.panel.visible_clusters()
+        ids = [cluster.id for cluster in shown]
+        current = self.panel._selected_id
+        if current not in ids:
+            return False
+        index = ids.index(current) + step
+        if not 0 <= index < len(ids):
+            return False
+        self.panel.select(ids[index])
+        self._on_finding_selected(ids[index])
+        return True
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QApplication.instance().installEventFilter(self)
+
+    def hideEvent(self, event) -> None:
+        QApplication.instance().removeEventFilter(self)
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        """Up / Down, while a finding is selected on this page -- or a code, a Braille line or difference in the list on
+        show beside the viewer -- step to the one above / below it, whichever part of the page has the keyboard (the
+        viewer or the list, which would otherwise scroll), except a control that uses the arrows itself (a drop-down, a
+        number box) or another window (a dialog) in front."""
+        if event.type() != QEvent.Type.KeyPress or event.key() not in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            return super().eventFilter(watched, event)  # (every event of the application passes here: the rest is for arrows)
+        side = self.side.currentWidget()
+        stepping_side = side in (self.symbol_panel, self.braille_panel) and side.has_selection
+        if (
+            not (event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)
+            and (self.panel._selected_id is not None or stepping_side)
+            and self.isVisible()
+            and QApplication.activeModalWidget() is None
+            and isinstance(watched, QWidget)
+            and watched.window() is self.window()
+            and not isinstance(QApplication.focusWidget(), _ARROW_CONTROLS)
+        ):
+            delta = 1 if event.key() == Qt.Key.Key_Down else -1
+            if stepping_side:
+                side.step(delta)  # (the Symbols or Braille list on show: its codes, its lines and differences)
+            else:
+                self.step_finding(delta)
+            return True  # handled (at the first or last finding, the arrow simply does nothing)
+        return super().eventFilter(watched, event)
 
     # -- merging findings ------------------------------------------------------------
     def _on_merge_region(self, region) -> None:
@@ -398,6 +642,56 @@ class ResultsView(QWidget):
             self.viewport.set_selected(merged.id)
             self.viewport.show_merge_notice(f"Merged {len(inside)} findings into #{merged.id}.")
 
+    def _on_erase_region(self, region: BoundingBox) -> None:
+        """The reviewer erased an area (Leaflet): it is cleared from both pictures and every finding in it is removed,
+        at once -- nothing is compared again."""
+        if self._outcome is None:
+            return
+        shown = self.panel.clusters
+        known = shown + [c for c in (self._outcome.all_clusters or self._outcome.clusters) if not any(c is k for k in shown)]
+        patches = self.viewport.erase_region(region)
+        if patches is None:
+            self.viewport.show_merge_notice("That rectangle is off the pages: nothing was erased.")
+            return
+        doomed = {id(c) for c in known if _erased_by(c.bbox_in_original, region)}
+        self._erasures.append(
+            (patches, shown, list(self._outcome.clusters), list(self._outcome.all_clusters), [(c, c.id) for c in known])
+        )
+
+        def kept(clusters: list) -> list:
+            return [c for c in clusters if id(c) not in doomed]
+
+        self._outcome = replace(self._outcome, clusters=kept(self._outcome.clusters), all_clusters=kept(self._outcome.all_clusters))
+        remaining = renumbered(kept(shown), self._outcome.all_clusters)
+        self.panel.replace_clusters(remaining)
+        self.viewport.set_selected(None)
+        self._sync_markers()
+        # Erasing is the reviewer's decision about what is not part of the leaflet: leave a trace.
+        logger.info(
+            "area erased",
+            extra={"area": [round(v) for v in (region.x0, region.y0, region.x1, region.y1)], "findings_removed": len(doomed)},
+        )
+        self.viewport.set_can_undo_erase(True)
+        removed = len(doomed)
+        self.viewport.show_merge_notice(
+            f"Erased the area and {removed} finding{'s' if removed != 1 else ''} in it." if removed else "Erased the area (no finding was in it)."
+        )
+
+    def _on_undo_erase(self) -> None:
+        if not self._erasures or self._outcome is None:
+            return
+        patches, shown, clusters, all_clusters, numbers = self._erasures.pop()
+        self.viewport.restore_region(patches)
+        for cluster, number in numbers:
+            cluster.id = number
+        self._outcome = replace(self._outcome, clusters=clusters, all_clusters=all_clusters)
+        self.panel.replace_clusters(shown)
+        self.viewport.set_selected(None)
+        self._sync_markers()
+        logger.info("area erase undone")
+        self.viewport.set_can_undo_erase(bool(self._erasures))
+        self.viewport.show_merge_notice("Put back the last area erased.")
+
     def _on_undo_merge(self) -> None:
         if self.panel.undo_merge():
             self.viewport.set_can_undo_merge(self.panel.can_undo_merge)
@@ -414,3 +708,16 @@ def _mostly_inside(box, region) -> bool:
     if box.area <= 0:
         return region.x0 <= box.center[0] <= region.x1 and region.y0 <= box.center[1] <= region.y1
     return box.intersection_area(region) >= _MERGE_MIN_INSIDE * box.area
+
+
+_ERASED_SHARE = 0.5  # a finding is erased with an area when its centre is in it, or at least this share of it is
+
+
+def _erased_by(box: BoundingBox, region: BoundingBox) -> bool:
+    cx, cy = (box.x0 + box.x1) / 2, (box.y0 + box.y1) / 2
+    if region.x0 <= cx <= region.x1 and region.y0 <= cy <= region.y1:
+        return True
+    width = min(box.x1, region.x1) - max(box.x0, region.x0)
+    height = min(box.y1, region.y1) - max(box.y0, region.y0)
+    area = max(0.0, box.x1 - box.x0) * max(0.0, box.y1 - box.y0)
+    return width > 0 and height > 0 and area > 0 and width * height >= _ERASED_SHARE * area

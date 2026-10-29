@@ -5,6 +5,7 @@ import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtTest import QTest
 
+from app.models.diff import BoundingBox, DiffCluster, DiffType
 from app.ui.comparison_viewport import (
     MAX_ZOOM,
     MIN_ZOOM,
@@ -247,6 +248,24 @@ def test_flicker_only_changes_pixels_inside_a_flagged_region(viewport, outcome):
     assert np.array_equal(frame0[5, 5], frame1[5, 5])  # far from any finding: holds still
 
 
+def test_flicker_can_alternate_the_whole_file(viewport, outcome):
+    """'Flicker whole file': everything alternates, not just the findings -- to see what they did not flag."""
+    viewport.set_view_mode(ViewMode.FLICKER)
+    assert viewport.flicker_scope.isVisibleTo(viewport)
+    viewport.set_flicker_whole(True)
+    frame1 = viewport._stacks["flicker1"]._array(0)
+    assert np.array_equal(frame1, viewport._suspect_rgb)  # the suspect entire, off the findings too
+
+    viewport.set_flicker_whole(False)
+    frame1 = viewport._stacks["flicker1"]._array(0)
+    assert np.array_equal(frame1[5, 5], viewport._original_rgb[5, 5])  # back to the findings only
+
+
+def test_the_flicker_choice_is_offered_only_in_flicker(viewport):
+    viewport.set_view_mode(ViewMode.OVERLAY)
+    assert not viewport.flicker_scope.isVisibleTo(viewport)
+
+
 def test_overlay_is_static(viewport):
     viewport.set_view_mode(ViewMode.OVERLAY)
     assert not viewport.is_animating
@@ -353,6 +372,60 @@ def test_halos_are_removed_along_with_their_markers(viewport, outcome):
     assert viewport.original_pane.marker_count == 0
 
 
+def test_hide_highlights_button_toggles_marker_visibility_except_selected(viewport, outcome):
+    """Clicking 'Hide highlights' hides all deviations, but the selected deviation remains highlighted."""
+    assert not viewport.hide_highlights
+    assert viewport.hide_highlights_button.text() == "Hide highlights"
+    assert not viewport.hide_highlights_button.isChecked()
+    assert viewport.original_pane.marker_count == len(outcome.clusters)
+
+    # Click button with no selection: all markers hidden
+    viewport.hide_highlights_button.click()
+    assert viewport.hide_highlights
+    assert viewport.hide_highlights_button.text() == "Show highlights"
+    assert viewport.hide_highlights_button.isChecked()
+    assert viewport.original_pane.marker_count == 0
+    assert viewport.suspect_pane.marker_count == 0
+
+    # Selecting a cluster while hidden: ONLY that cluster is marked/highlighted
+    selected_cluster = outcome.clusters[0]
+    viewport.set_selected(selected_cluster.id)
+    assert viewport.original_pane.marker_count == 1
+    assert viewport.suspect_pane.marker_count == 1
+    assert selected_cluster.id in viewport.original_pane._marker_items
+
+    # Selecting another cluster: only the new one is marked
+    second_cluster = outcome.clusters[1]
+    viewport.set_selected(second_cluster.id)
+    assert viewport.original_pane.marker_count == 1
+    assert second_cluster.id in viewport.original_pane._marker_items
+
+    # Deselecting: 0 markers
+    viewport.set_selected(None)
+    assert viewport.original_pane.marker_count == 0
+
+    # Click button again to show all highlights
+    viewport.hide_highlights_button.click()
+    assert not viewport.hide_highlights
+    assert viewport.hide_highlights_button.text() == "Hide highlights"
+    assert not viewport.hide_highlights_button.isChecked()
+    assert viewport.original_pane.marker_count == len(outcome.clusters)
+    assert viewport.suspect_pane.marker_count == len(outcome.clusters)
+
+
+def test_hide_highlights_keeps_existing_selection_highlighted(viewport, outcome):
+    """If a finding is already selected, clicking 'Hide highlights' keeps it highlighted while hiding the others."""
+    selected = outcome.clusters[0]
+    viewport.set_selected(selected.id)
+    assert viewport.original_pane.marker_count == len(outcome.clusters)
+
+    viewport.hide_highlights_button.click()
+    assert viewport.original_pane.marker_count == 1
+    assert selected.id in viewport.original_pane._marker_items
+    assert viewport.suspect_pane.marker_count == 1
+    assert selected.id in viewport.suspect_pane._marker_items
+
+
 def test_a_halo_never_steals_a_click_from_its_marker(viewport, outcome, qapp):
     cluster = outcome.clusters[0]
     pane = viewport.original_pane
@@ -426,6 +499,16 @@ def test_focusing_never_zooms_out(viewport, outcome):
     viewport.set_zoom(4.0)
     viewport.focus_cluster(outcome.clusters[0])
     assert viewport.zoom >= 4.0 - 1e-9
+
+
+def test_focusing_small_finding_caps_at_natural_zoom(viewport, qapp):
+    """Jumping to a small finding should not over-magnify (caps at 100% zoom)."""
+    viewport.fit_to_view()
+    small_box = BoundingBox(100, 100, 120, 120)  # tiny 20x20 finding
+    cluster = DiffCluster(99, small_box, small_box, DiffType.TEXT, [], detail="tiny")
+    viewport.focus_cluster(cluster)
+    qapp.processEvents()
+    assert viewport.zoom <= 1.0 + 1e-9
 
 
 def test_loading_new_images_resets_to_a_fitted_view(viewport, outcome):

@@ -8,6 +8,7 @@ this handles pixels, levels-of-detail and difference markers.
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
+    QGraphicsItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
-from app.models.categories import category_colour
+from app.models.categories import finding_colour
 from app.models.diff import BoundingBox, DiffCluster
 from app.ui.gestures import enable_zoom_gestures, zoom_from_viewport_event, zoom_from_wheel
 
@@ -99,6 +101,7 @@ class ImageStack:
 
 class PaneView(QGraphicsView):
     markerClicked = Signal(int)  # cluster id
+    backgroundClicked = Signal()  # a click (not a pan) where there is no finding
     zoomStepRequested = Signal(int)  # +1 / -1, a fixed step (keyboard / buttons)
     zoomRequested = Signal(float, QPointF)  # scale factor about a viewport point (pinch, Ctrl + wheel)
     resized = Signal()
@@ -120,8 +123,9 @@ class PaneView(QGraphicsView):
         self._shown_key: str | None = None
         self._pixmap_item: QGraphicsPixmapItem | None = None
         self._zoom = 1.0
-        self._marker_items: dict[int, QGraphicsRectItem] = {}
-        self._halo_items: list[QGraphicsRectItem] = []
+        self._marker_items: dict[int, QGraphicsItem] = {}  # each finding's box (its first, where it has several)
+        self._extra_marker_items: list[QGraphicsItem] = []  # the rest (a Series finding common to several repeats)
+        self._halo_items: list[QGraphicsItem] = []
         self._highlight_items: list[QGraphicsRectItem] = []
         self._press_pos = None
         self._selecting = False  # region selection: a drag draws a rectangle instead of panning
@@ -374,46 +378,57 @@ class PaneView(QGraphicsView):
         self._scene.addItem(self._block_outline_item)
 
     # -- markers -------------------------------------------------------------
-    def set_markers(self, clusters: list[DiffCluster], selected_id: int | None = None) -> None:
-        """Draw one box per finding, in the colour of its category (text, colour, graphics, barcode, Braille).
+    def set_markers(
+        self,
+        clusters: list[DiffCluster],
+        selected_id: int | None = None,
+        boxes_of: Callable[[DiffCluster], list[BoundingBox]] | None = None,
+        by_source: bool = False,
+    ) -> None:
+        """Draw each finding's box, in its kind's colour (text, colour, graphics, barcode, Braille) -- or, `by_source`,
+        in the colour of how it was found (OCR or pixels).
 
-        Every pane draws the *same* shared-space box: both views are drawn from
-        the one aligned pair, so a marker cannot land in different places in
-        different panes (FR-7.4).
+        Every pane draws the *same* shared-space box where both views are drawn from the one aligned pair, so a marker
+        cannot land in different places in different panes (FR-7.4). Where this pane's picture is another frame (Series:
+        the whole sheet), `boxes_of` says where each finding is on it -- one place or several.
         """
-        for item in [*self._marker_items.values(), *self._halo_items]:
+        for item in [*self._marker_items.values(), *self._extra_marker_items, *self._halo_items]:
             self._scene.removeItem(item)
         self._marker_items.clear()
+        self._extra_marker_items = []
         self._halo_items.clear()
 
         for cluster in clusters:
-            box = cluster.bbox_in_original
-            item = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
-            colour = QColor(category_colour(cluster.category))
+            colour = QColor(finding_colour(cluster, by_source))
             is_selected = cluster.id == selected_id
+            boxes = boxes_of(cluster) if boxes_of is not None else [cluster.bbox_in_original]
+            for index, box in enumerate(boxes):
+                item = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
+                pen = QPen(colour, 3 if is_selected else 2)
+                pen.setCosmetic(True)  # constant on-screen width at any zoom
+                item.setPen(pen)
+                if is_selected:
+                    fill = QColor(colour)
+                    fill.setAlpha(60)
+                    item.setBrush(fill)
+                item.setZValue(_MARKER_Z + (1 if is_selected else 0))
+                item.setData(0, cluster.id)
+                self._scene.addItem(item)
+                if index == 0:
+                    self._marker_items[cluster.id] = item
+                else:
+                    self._extra_marker_items.append(item)
 
-            pen = QPen(colour, 3 if is_selected else 2)
-            pen.setCosmetic(True)  # constant on-screen width at any zoom
-            item.setPen(pen)
-            if is_selected:
-                fill = QColor(colour)
-                fill.setAlpha(60)
-                item.setBrush(fill)
-            item.setZValue(_MARKER_Z + (1 if is_selected else 0))
-            item.setData(0, cluster.id)
-            self._scene.addItem(item)
-            self._marker_items[cluster.id] = item
-
-            # A colour alone vanishes over artwork of the same colour
-            # (a red marker on a red block), so each marker sits on a white halo.
-            halo = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
-            halo_pen = QPen(QColor(255, 255, 255, 230), pen.widthF() + 3)
-            halo_pen.setCosmetic(True)
-            halo.setPen(halo_pen)
-            halo.setZValue(item.zValue() - 0.5)
-            halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-            self._scene.addItem(halo)
-            self._halo_items.append(halo)
+                # A colour alone vanishes over artwork of the same colour
+                # (a red marker on a red block), so each marker sits on a white halo.
+                halo = QGraphicsRectItem(box.x0, box.y0, box.width, box.height)
+                halo_pen = QPen(QColor(255, 255, 255, 230), pen.widthF() + 3)
+                halo_pen.setCosmetic(True)
+                halo.setPen(halo_pen)
+                halo.setZValue(item.zValue() - 0.5)
+                halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                self._scene.addItem(halo)
+                self._halo_items.append(halo)
 
     @property
     def marker_count(self) -> int:
@@ -531,6 +546,9 @@ class PaneView(QGraphicsView):
         ]
         if under_cursor:
             smallest = min(
-                under_cursor, key=lambda item: item.rect().width() * item.rect().height()
+                under_cursor, key=lambda item: item.boundingRect().width() * item.boundingRect().height()
             )
             self.markerClicked.emit(int(smallest.data(0)))
+        else:
+            self.backgroundClicked.emit()
+

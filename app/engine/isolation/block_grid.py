@@ -22,6 +22,7 @@ import logging
 import cv2
 import numpy as np
 
+from app.engine.isolation.pdf_paths import stroked_paths
 from app.engine.isolation.polygon_tracer import ArtworkBlock, find_blocks
 from app.models.diff import BoundingBox
 
@@ -40,6 +41,7 @@ _WHITE_ON_WHITE = 0.92  # a stroke lighter than this (0-1 grey) is invisible on 
 _EDGE_LINE_SHARE = 0.45  # two cells stay apart only if a line runs along this much of their shared edge (a dashed fold ~0.6)
 _VECTOR_EDGE_LINE_SHARE = 0.8  # ...where the lines are a PDF's own strokes, drawn solid
 _STROKE_SHARE = 0.9  # rows carrying at least this share of a line's longest run are the same stroke
+_STROKE_GAP_PX = 4  # lines further apart than this are separate strokes (a stroke is a few pixels wide)
 _DOMINANT_LINE = 1.5  # a line this many times longer than the others it is grouped with is the cut on its own
 _EDGE_SLACK_PX = 6  # a line counts for an edge if it lies within this many pixels of it
 _SIDE_PROBE_PX = 6  # how far either side of an edge to look for artwork on both sides
@@ -53,11 +55,11 @@ def stroked_line_map(page, dpi: float, shape: tuple[int, int]) -> np.ndarray | N
     strokes, or so many vector paths that reading them all is not worth it.
     """
     try:
-        drawings = page.get_drawings()
+        total, drawings = stroked_paths(page)
     except Exception:  # noqa: BLE001 -- a page that cannot be read for lines just has no lines to offer
         logger.exception("could not read the page's vector paths")
         return None
-    if not drawings or len(drawings) > 300_000:
+    if not drawings or total > 300_000:
         return None
     height, width = shape
     to_pixels = dpi / 72.0
@@ -117,6 +119,16 @@ def _cluster(values: list[int], tolerance: int, exact: dict[int, int] | None = N
         runner_up = max([exact[value] for value in on_line if exact[value] < _STROKE_SHARE * longest] or [0])
         if runner_up and longest >= _DOMINANT_LINE * runner_up:
             on_line = [value for value in on_line if exact[value] >= _STROKE_SHARE * longest]  # the long line's own stroke
+        # Two separate strokes in one group -- the two edges of a narrow gutter between panels, each a fold -- are not
+        # averaged either: that sits between them, on no line. The cut is on one of them (the longer; the first, tied).
+        strokes: list[list[int]] = []
+        for value in sorted(on_line):
+            if strokes and value - strokes[-1][-1] <= _STROKE_GAP_PX:
+                strokes[-1].append(value)
+            else:
+                strokes.append([value])
+        if len(strokes) > 1:
+            on_line = max(strokes, key=lambda stroke: (max(exact[value] for value in stroke), -stroke[0]))
         positions.append(int(round(sum(on_line) / len(on_line))))
     return positions
 
@@ -142,14 +154,32 @@ def _darkest(image: np.ndarray) -> np.ndarray:
     return cv2.min(cv2.min(channels[0], channels[1]), channels[2])
 
 
-def _thin_dark_lines(image: np.ndarray) -> np.ndarray:
-    """Thin dark structures of the picture (a die line, a fold, a rule), for a file with no vector paths to read.
+_RASTER_FOLD_SHARE = 0.6  # a picture's straight line is a fold only if it runs this share of the artwork
+_STRAIGHT_SHARE = 0.05  # a straight run at least this share of the artwork's shorter side is line-work, not a letter
+_LINE_MAX_THICKNESS_PX = 8  # ...if it is no thicker than this across
+_LINE_BACKGROUND_PX = 15  # a pixel's background: the median this wide round it
 
-    Taken on the darkest channel, so a line printed in any ink colour counts; a black-hat keeps only what is
-    narrower than its kernel, so a filled bar or block (whose inside is not a thin structure) does not.
-    """
-    darkest = _darkest(image)
-    return cv2.morphologyEx(darkest, cv2.MORPH_BLACKHAT, np.ones((9, 9), np.uint8)) >= _THIN_LINE_CONTRAST
+
+def _straight_lines_any_colour(image: np.ndarray, length: int) -> np.ndarray:
+    """The long straight thin lines of a picture -- a file with no vector paths (a scan, a flattened PDF) -- of ANY
+    colour, darker or lighter than what is round them: a fold line printed blue over a red panel is darker than the red
+    in no 'darkest channel' sense, but a thin line in the red and green channels all the same. Only straight runs at
+    least `length` long are kept (along or across): type, a pattern and a picture make thin strokes too, but short."""
+    # the pixels that ARE ink: off their own background (the median round them) in some channel -- not a filter's fill of
+    # the gaps between letters, which made a line of small type read as one long line
+    channels = cv2.split(np.ascontiguousarray(image[:, :, :3])) if image.ndim == 3 else [image]
+    thin = np.zeros(image.shape[:2], bool)
+    for channel in channels:
+        thin |= cv2.absdiff(channel, cv2.medianBlur(channel, _LINE_BACKGROUND_PX)) >= _THIN_LINE_CONTRAST
+    thin = thin.astype(np.uint8)
+    # long one way, and thin the other: a line of small type also reads as a long band of thin marks (the gaps between
+    # its letters fill in), but a band as tall as its letters -- a fold is a few pixels across
+    across = _LINE_MAX_THICKNESS_PX
+    along = cv2.morphologyEx(thin, cv2.MORPH_OPEN, np.ones((1, length), np.uint8))
+    along &= 1 - cv2.morphologyEx(along, cv2.MORPH_OPEN, np.ones((across, 1), np.uint8))
+    down = cv2.morphologyEx(thin, cv2.MORPH_OPEN, np.ones((length, 1), np.uint8))
+    down &= 1 - cv2.morphologyEx(down, cv2.MORPH_OPEN, np.ones((1, across), np.uint8))
+    return (along | down).astype(bool)
 
 
 def _edge_has_line(
@@ -196,9 +226,16 @@ def divide_into_blocks(
         return []
     margin_x, margin_y = max(8, int(box_w * _EDGE_MARGIN_SHARE)), max(8, int(box_h * _EDGE_MARGIN_SHARE))
     has_vectors = line_map is not None and line_map.shape == region.shape
-    evidence = (line_map if has_vectors else _thin_dark_lines(image)) & cv2.dilate(
-        region.astype(np.uint8), np.ones((5, 5), np.uint8)
-    ).astype(bool)
+    straight = max(24, int(_STRAIGHT_SHARE * min(box_w, box_h)))
+    if has_vectors:
+        found = line_map
+    else:
+        # (looked for only in the box round the artwork, a few pixels over: on a proof sheet it can be a third of the page)
+        bx0, by0 = max(0, x_min - _LINE_BACKGROUND_PX), max(0, y_min - _LINE_BACKGROUND_PX)
+        bx1, by1 = min(width, x_max + _LINE_BACKGROUND_PX), min(height, y_max + _LINE_BACKGROUND_PX)
+        found = np.zeros((height, width), bool)
+        found[by0:by1, bx0:bx1] = _straight_lines_any_colour(image[by0:by1, bx0:bx1], straight)
+    evidence = found & cv2.dilate(region.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
 
     # Where a flap or tab meets a panel, the outline's width (or height) steps.
     cuts_y = _steps(region.sum(axis=1), _STEP_SHARE * box_w)
@@ -210,12 +247,21 @@ def divide_into_blocks(
         lines_y = _long_lines(evidence, horizontal=True, length=max(24, int(_LINE_SHARE * box_w)))
         lines_x = _long_lines(evidence, horizontal=False, length=max(24, int(_LINE_SHARE * box_h)))
     else:
-        # Panels closed by lines all round: the only evidence of a fold a scan or a plain image can give.
+        # Panels closed by lines all round: the surest evidence of a fold a scan or a plain image can give...
         for block in find_blocks(image, region):
             for x in (int(block.bbox.x0), int(block.bbox.x1)):
                 lines_x[x] = max(lines_x.get(x, 0), int(block.bbox.height))
             for y in (int(block.bbox.y0), int(block.bbox.y1)):
                 lines_y[y] = max(lines_y.get(y, 0), int(block.bbox.width))
+        # ...and, where they found none, the picture's own long straight lines -- folds of any colour (a blue fold over a
+        # red panel closes no panel 'darker' than it), and folds where a panel is not closed all round
+        near = max(_MIN_MERGE_PX, int(_MERGE_SHARE * min(box_w, box_h)))
+        # (only lines across most of the artwork: a fold runs the carton's height, where a rule dividing a label's
+        # columns, or a table's, runs a part of one panel -- taken for a fold, it split the panel and broke what is on it)
+        for found, horizontal, span in ((lines_y, True, box_w), (lines_x, False, box_h)):
+            for at, run in _long_lines(evidence, horizontal=horizontal, length=max(24, int(_RASTER_FOLD_SHARE * span))).items():
+                if not any(abs(at - known) <= near for known in found):
+                    found[at] = run
 
     tolerance = max(_MIN_MERGE_PX, int(_MERGE_SHARE * min(box_w, box_h)))
     # A PDF's fold lines are drawn solid (a dashed stroke is drawn whole here): a real fold runs along nearly all of

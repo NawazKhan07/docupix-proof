@@ -57,8 +57,11 @@ _TWO_CLASSES_RATIO = 1.6  # thick / thin, at least, to be two thicknesses
 _MAX_CLASS_RATIO = 4.5  # ...and at most
 _CLASS_SPREAD = 0.3  # each thickness is tight within this share (and a pixel)
 _SINGLE_CLASS_WIDE_OVER_GAP = 0.85  # when every bar is alike, wide if thicker than this x the space
-_QUIET_GAPS = 1.5  # free space beyond each end, in space-widths
+_QUIET_GAPS = 2.5  # free space beyond each end, in space-widths, at least...
+_QUIET_WIDE_GAPS = 5.0  # ...and beyond one of them at least this much (a code stands clear; lettering has its
+# neighbours a word-space away: the stems of 'mm' in '268 mm (' had none at all)
 _QUIET_INK_SHARE = 0.05
+_EDGE_PX = 2
 
 
 @dataclass(frozen=True)
@@ -193,20 +196,28 @@ def _classify(run: np.ndarray) -> list[bool] | None:
 
 
 def _has_quiet_zone(dark: np.ndarray, run: np.ndarray, along_y: bool) -> bool:
-    """Free space beyond both ends of the row (`along_y`: the bars are stacked, not side by side)."""
+    """Free space beyond both ends of the row (`along_y`: the bars are stacked, not side by side): at least
+    `_QUIET_GAPS` spaces at each end and `_QUIET_WIDE_GAPS` at one -- measured line by line outward from the end bars,
+    each line across the bars' length all but clear of ink (a page's edge is free space)."""
     gap = float(np.median(run[1:, 0] - run[:-1, 1]))
-    margin = max(2, int(round(_QUIET_GAPS * gap)))
     a0, a1 = int(run[:, 0].min()), int(run[:, 1].max())
     c0, c1 = int(run[:, 2].min()), int(run[:, 3].max())
+    limit = int(np.ceil(_QUIET_WIDE_GAPS * gap))
+    extent = dark.shape[0] if along_y else dark.shape[1]
 
-    for start, stop in ((a0 - margin, a0), (a1, a1 + margin)):
-        start = max(0, start)
-        if stop <= start:
-            continue
-        strip = dark[start:stop, c0:c1] if along_y else dark[c0:c1, start:stop]
-        if strip.size and strip.mean() > _QUIET_INK_SHARE:
-            return False
-    return True
+    def free(step: int) -> int:
+        # (from a couple of lines past the end bar: its own soft edge is not something beside it)
+        position, clear = (a0 - 1 - _EDGE_PX, _EDGE_PX) if step < 0 else (a1 + _EDGE_PX, _EDGE_PX)
+        while clear < limit and 0 <= position < extent:
+            line = dark[position, c0:c1] if along_y else dark[c0:c1, position]
+            if line.size and line.mean() > _QUIET_INK_SHARE:
+                return clear
+            clear += 1
+            position += step
+        return limit if clear < limit and not 0 <= position < extent else clear
+
+    before, after = free(-1), free(1)
+    return min(before, after) >= _QUIET_GAPS * gap and max(before, after) >= _QUIET_WIDE_GAPS * gap - 0.5
 
 
 def find_pharmacodes(image: np.ndarray, config: DetectionConfig) -> list[Pharmacode]:

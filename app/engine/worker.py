@@ -16,6 +16,7 @@ individual detectors must not each decide for themselves:
 from __future__ import annotations
 
 import logging
+import difflib
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -28,13 +29,15 @@ import numpy as np
 from app.config import AppConfig, DetectionConfig
 from app.engine.aggregation.coordinate_projection import original_to_suspect
 from app.engine.alignment.aligner import AlignmentError, align
-from app.engine.aggregation.aggregator import add_member, build_clusters
+from app.engine import prepared
+from app.engine.aggregation.aggregator import add_member, build_clusters, combined
 from app.engine.alignment.block_alignment import align_blocks, composite_warp, seam_margin_mask
 from app.engine.alignment.homography import apply_transform, warp_to_reference, warp_validity_mask
 from app.engine.detectors import (
     barcode_diff,
     braille_diff,
     color_diff,
+    elements,
     graphics_diff,
     local_diff,
     movement,
@@ -42,14 +45,16 @@ from app.engine.detectors import (
     text_diff,
     verify,
 )
+from app.engine.detectors import nudge
 from app.engine.detectors.change_regions import ChangeRegion, find_change_regions
 from app.engine.detectors.regions import padded_window
 from app.engine.detectors.text_diff import OcrUnavailableError
 from app.engine.isolation.boundary_mask import apply_mask, boundary_mask, erased_mask
+from app.engine.isolation import auto_area, die_lines
 from app.engine.isolation.block_grid import divide_into_blocks
-from app.engine.preprocessing.scan_normalizer import ink_image, reading_source
+from app.engine.preprocessing.scan_normalizer import ink_pair, reading_source
 from app.logging_config import StageTimer
-from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType, visible_clusters
+from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType, renumbered, visible_clusters
 from app.models.isolation import IsolationGeometry
 from app.models.job import ComparisonMode, DetectorOptions, options_for_mode
 from app.models.result import AlignmentResult, BrailleComparison, SymbolComparison
@@ -92,6 +97,17 @@ class ComparisonOutcome:
     text_compared: bool = True
     # Leaflet only: which of the original's pages were reviewed ("" = every page; the results page has the field).
     compared_pages: str = ""
+    # Every other mode: the page of each file that was compared (0-based; the results page has a selector for each file
+    # of several pages).
+    original_page: int = 0
+    suspect_page: int = 0
+    # The DPI each PDF was compared at (None for an image): the window's own copy of a file may work out another (less
+    # memory was free when the comparison ran), and a zoomed-in re-render must be drawn at the comparison's.
+    original_dpi: float | None = None
+    suspect_dpi: float | None = None
+    # Leaflet's pages and Automatic only (kept inside the worker, never shown or sent): what of the page was compared --
+    # the leaflet or artwork found on it -- in the original's pixels, for the word comparison to read inside.
+    compare_mask: np.ndarray | None = None
     # Block-wise segmentation (SRS block-alignment extension): each interior panel found and aligned on its
     # own, in the original's pixels -- what the results page outlines on the artwork. Empty when no blocks
     # were found, or `DetectionConfig.block_alignment_enabled` is off.
@@ -109,6 +125,9 @@ class ComparisonOutcome:
     # the same list). Kept so the results page can flip a checkbox instantly with nothing recompared
     # (`app.models.diff.visible_clusters`).
     all_clusters: list[DiffCluster] = field(default_factory=list)
+    # Automatic only: its word comparison (the results page's OCR findings) is still being made -- the pixel findings are
+    # sent first, so the reviewer is not kept waiting for findings that start hidden; they follow in an update.
+    ocr_pending: bool = False
 
 
 def run_comparison(
@@ -124,6 +143,9 @@ def run_comparison(
     suspect_lines: np.ndarray | None = None,
     original_words: list | None = None,
     suspect_words: list | None = None,
+    original_strokes: list | None = None,
+    suspect_strokes: list | None = None,
+    align_only: bool = False,
 ) -> ComparisonOutcome:
     """Run one comparison. `progress`, if given, is told what stage the job is at.
 
@@ -134,29 +156,52 @@ def run_comparison(
     (`block_grid.stroked_line_map`): the fold and cut lines the artwork is divided into blocks by. Without them
     the blocks are found from the pictures alone. `original_words`/`suspect_words`, for a PDF with live text, are its
     own words in its picture's pixels (`text_diff.text_layer_words`): what a finding says is taken from them rather
-    than read from the pictures, where they are there.
+    than read from the pictures, where they are there. `original_strokes`/`suspect_strokes`, for a PDF, are its stroked
+    paths with their colours (`die_lines.vector_strokes`): its die lines are found among them exactly.
     """
     options = options or options_for_mode(mode)
     say = progress or (lambda _text: None)
 
     # Erase, in each file, everything outside its own artwork area: what is aligned and compared
     # is then the two artworks alone, on white, not two sheets with a title and marks around them.
+    if options.normalize_scan and suspect_geometry is not None and suspect_geometry.edge_inset_norm > config.detection.scan_edge_inset_max_norm:
+        # A scan's own outline is traced on a soft, shadowed edge and set well inside it to leave that fringe out -- far
+        # enough, on a label whose type runs close to its edge, to cut the first letters off every line. It is kept to a
+        # few pixels: what of the fringe comes in is a thin scan-only mark along the outline, dropped as the carton edge.
+        suspect_geometry = replace(suspect_geometry, edge_inset_norm=config.detection.scan_edge_inset_max_norm)
     original_area = _Area.of(original_image, original_geometry)
     suspect_area = _Area.of(suspect_image, suspect_geometry)
     artwork_original = original_area.blanked(original_image)
     artwork_suspect = suspect_area.blanked(suspect_image)
 
     say("Aligning the files\u2026")
+    # (each slow stage is kept by what it is computed from, so a comparison prepared before Compare -- or one run
+    # again in another mode -- does not do it twice: see `app.engine.prepared`)
+    fingerprints: dict[int, bytes | None] = {}
+
+    def fingerprint(array: np.ndarray | None) -> bytes | None:
+        if array is None:
+            return None
+        if id(array) not in fingerprints:
+            fingerprints[id(array)] = prepared.digest(array)
+        return fingerprints[id(array)]
+
+    def aligned(first: np.ndarray, second: np.ndarray, *geometries) -> AlignmentResult:
+        key = (fingerprint(first), fingerprint(second), prepared.settings_key(config.alignment, *geometries))
+        return prepared.remembered("align", key, lambda: align(first, second, config.alignment, *geometries))
+
+    # A leaflet is aligned by what is printed on it, never by its outline: two versions' trim lines, bleed and marks
+    # differ from each other, and fitting one outline onto the other would carry every line of text off by that much.
+    # (Its area still decides what is compared: `artwork_original`/`artwork_suspect` are blanked outside it.)
+    outlines = (None, None) if mode is ComparisonMode.LEAFLET else (original_geometry, suspect_geometry)
     try:
-        alignment = align(
-            artwork_original, artwork_suspect, config.alignment, original_geometry, suspect_geometry
-        )
+        alignment = aligned(artwork_original, artwork_suspect, *outlines)
     except AlignmentError:
         if original_area.is_whole_page and suspect_area.is_whole_page:
             raise
         # Trimmed to their artwork the files share too little to register (the outlines cut their features): the whole
         # pages are registered instead, and the comparison is still only of the artwork.
-        alignment = align(original_image, suspect_image, config.alignment)
+        alignment = aligned(original_image, suspect_image)
     detection_config, profile = effective_detection_config(config.detection, alignment)
     say("Comparing the artwork\u2026")
 
@@ -166,19 +211,43 @@ def run_comparison(
     # Panels only exist inside an artwork outline: a whole page (no area found, cropped or lifted) also holds the
     # title, notes, colour legend and blank paper, and a carton's fold lines drawn across ALL of that cut it into
     # "panels" that are nothing of the kind.
-    if detection_config.block_alignment_enabled and original_area.boundary is not None and suspect_area.boundary is not None:
+    # A leaflet page whose one page-wide fit is sure (most of its features agree on it, closely) has no panel moved
+    # against the rest: aligning each panel on its own changes nothing there (measured on open-vs-closed pairs: no panel
+    # ever taken) and costs seconds a page. A re-set page, where the fit leaves many features out, still gets it.
+    sure_page_fit = (
+        mode is ComparisonMode.LEAFLET
+        and alignment.inlier_ratio >= detection_config.leaflet_sure_fit_inlier_share
+        and alignment.residual_error_px <= detection_config.leaflet_sure_fit_residual_px
+    )
+    if (
+        detection_config.block_alignment_enabled
+        and not sure_page_fit
+        and original_area.boundary is not None
+        and suspect_area.boundary is not None
+    ):
         with StageTimer(logger, "block_alignment"):
             # Every panel and flap of the artwork, in both files: each original block is aligned on its own
             # against its counterpart, the way cropping just that block in both files and aligning them would.
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                divided = pool.map(
-                    lambda job: divide_into_blocks(*job, detection_config.block_min_area_fraction),
-                    [(original_image, original_area.boundary, original_lines), (suspect_image, suspect_area.boundary, suspect_lines)],
+            def divided(job) -> list:
+                image, boundary, lines = job
+                key = (fingerprint(image), fingerprint(boundary), fingerprint(lines), detection_config.block_min_area_fraction)
+                return prepared.remembered(
+                    "blocks", key, lambda: divide_into_blocks(image, boundary, lines, detection_config.block_min_area_fraction)
                 )
-                blocks, suspect_blocks = list(divided)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                blocks, suspect_blocks = list(
+                    pool.map(divided, [(original_image, original_area.boundary, original_lines), (suspect_image, suspect_area.boundary, suspect_lines)])
+                )
             if blocks:
-                block_alignments = align_blocks(
-                    artwork_original, artwork_suspect, blocks, alignment.transform, config.alignment, suspect_blocks
+                key = (
+                    fingerprint(artwork_original), fingerprint(artwork_suspect),
+                    prepared.settings_key(blocks, alignment.transform, config.alignment, suspect_blocks),
+                )
+                block_alignments = prepared.remembered(
+                    "block_alignment",
+                    key,
+                    lambda: align_blocks(artwork_original, artwork_suspect, blocks, alignment.transform, config.alignment, suspect_blocks),
                 )
 
     with StageTimer(logger, "warp_to_shared_space"):
@@ -200,6 +269,17 @@ def run_comparison(
         compare_mask = _build_compare_mask(
             suspect_image.shape[:2], reference_shape, alignment.transform, original_area, suspect_area
         )
+        if options.normalize_scan and suspect_area.is_whole_page and _glass_beyond_page(suspect_image.shape[:2], alignment.transform, reference_shape):
+            # A scan with no area set is an item laid on the glass -- a label, a carton panel -- and the scanner's page
+            # round it: what of the digital file lies beyond the item (a proof sheet's other artworks, its dimension
+            # lines and notes, 'FRONT', 'ACTUAL SIZE') is nothing the scan could show, missing or not. Only the item is
+            # compared.
+            # (Widened by the digital file's own print lying mostly inside it, whole: a line the scan is missing at the
+            # item's edge is still compared, as missing.)
+            extent = auto_area.scan_extent(suspect_image)
+            if extent is not None:
+                item = auto_area.item_in_artwork(original_image, _warped(extent, alignment.transform, reference_shape))
+                compare_mask &= item
         # What the reviewer is shown as "what was covered" (FR: what was left out is visible, not assumed) --
         # the crop/lift/erase choices alone, before any seam margin is additionally hidden from detectors below.
         # A seam is this composite's own construction, not a choice the reviewer made or needs to see as a hole.
@@ -209,9 +289,118 @@ def run_comparison(
                 reference_shape, block_alignments, detection_config.block_seam_margin_px
             )
 
+    if align_only:
+        return ComparisonOutcome(
+            alignment=alignment,
+            candidates=[],
+            clusters=[],
+            all_clusters=[],
+            aligned_original=original_image,
+            aligned_suspect=warped_suspect,
+            symbol_comparisons=[],
+            braille=None,
+            warnings=[],
+            detection_profile=profile,
+            used_change_regions=False,
+            mode=mode,
+            compared_outline=compared_area_outline(reported_compare_mask),
+            block_outlines=[block.polygon for block in blocks] if block_alignments else [],
+            block_alignments=[(a.block.polygon, a.transform) for a in block_alignments if a.locally_aligned],
+            notes=["Files updated and aligned. Click Recompare to run comparison."],
+            graphics_compared=True,
+            text_compared=True,
+        )
+
+    if detection_config.ignore_die_lines:
+        # A carton's die lines -- cut, crease, perforation -- are not the artwork: one file drawing them and the other
+        # not, or in another colour or dash, is never a difference. Both files' are left out of what is compared.
+        with StageTimer(logger, "die_lines"):
+            die = _die_lines_to_ignore(
+                original_image, suspect_image, original_area, suspect_area, original_strokes, suspect_strokes,
+                alignment.transform, reference_shape,
+            )
+        if die is not None:
+            # each die line is drawn out of both pictures -- filled from what lies beside it, so a band or a panel it
+            # crosses stays one band, one panel -- rather than cut out of the comparison (the pictures shown keep it)
+            artwork_original = die_lines.drawn_out(artwork_original, die)
+            warped_artwork = die_lines.drawn_out(warped_artwork, die)
+
     # FR-2.1, enforced once here rather than trusted to each detector.
     masked_original = apply_mask(artwork_original, compare_mask)
     masked_suspect = apply_mask(warped_artwork, compare_mask)
+    # Everything from here on is worked out on the box round what is compared, not the whole page: a proof sheet's
+    # artwork can be a third of it (a second plate below, a job sheet beside), and every detector's work grows with the
+    # pixels. The findings are put back on the page at the end (`_on_page`).
+    detect_frame = _detection_frame(compare_mask)
+    page_original, page_warped = original_image, warped_suspect
+    detect_transform = alignment.transform
+    original_boundary = original_area.boundary
+    if detect_frame is not None:
+        fx0, fy0, fx1, fy1 = detect_frame
+        compare_mask = compare_mask[fy0:fy1, fx0:fx1]
+        masked_original = masked_original[fy0:fy1, fx0:fx1]
+        masked_suspect = masked_suspect[fy0:fy1, fx0:fx1]
+        original_image = original_image[fy0:fy1, fx0:fx1]
+        warped_suspect = warped_suspect[fy0:fy1, fx0:fx1]
+        if original_boundary is not None:
+            original_boundary = original_boundary[fy0:fy1, fx0:fx1]
+        detect_transform = np.array([[1.0, 0.0, -fx0], [0.0, 1.0, -fy0], [0.0, 0.0, 1.0]]) @ alignment.transform
+        logger.info("detection limited to the compared area", extra={"box": list(detect_frame), "page": list(page_original.shape[:2])})
+    if mode is ComparisonMode.AUTOMATIC and detection_config.food_label:
+        # A food label is compared by what is printed on it, its own way (`app.engine.food_label`).
+        from app.engine import food_label
+
+        layers = (
+            in_compared_area(_words_in_frame(original_words, detect_frame), compare_mask),
+            in_compared_area(_words_in_frame(_suspect_words_in_frame(suspect_words, alignment.transform, block_alignments), detect_frame), compare_mask),
+        )
+        found = food_label.compare_label(masked_original, masked_suspect, compare_mask, detection_config, say, *layers)
+        clusters = found.clusters
+        candidates = [member for cluster in clusters for member in cluster.members]
+        if detect_frame is not None:
+            candidates, clusters, _all, _symbols, _braille, _shown_o, _shown_s = _on_page(
+                detect_frame, page_original.shape[:2], candidates, clusters, [], [], None, None, None
+            )
+        for cluster in clusters:
+            cluster.bbox_in_suspect = original_to_suspect(cluster.moved_to or cluster.bbox_in_original, alignment.transform)
+        return ComparisonOutcome(
+            alignment=alignment,
+            candidates=candidates,
+            clusters=clusters,
+            all_clusters=list(clusters),
+            aligned_original=page_original,
+            aligned_suspect=page_warped,
+            symbol_comparisons=[],
+            braille=None,
+            warnings=found.warnings,
+            detection_profile=profile,
+            used_change_regions=False,
+            mode=mode,
+            compared_outline=compared_area_outline(reported_compare_mask),
+            graphics_compared=True,
+            text_compared=True,
+            block_outlines=[block.polygon for block in blocks] if block_alignments else [],
+            block_alignments=[(a.block.polygon, a.transform) for a in block_alignments if a.locally_aligned],
+            compare_mask=reported_compare_mask,
+            notes=found.notes,
+        )
+
+    braille_note = ""
+    braille_dots: np.ndarray | None = None
+    if options.normalize_scan and detection_config.scan_ignore_braille:
+        # A print carries Braille as embossing, not ink: a digital file's Braille dots (drawn over the artwork, often over
+        # its type) are never in the scan, and are neither graphics missing from it nor letters to read. Where they are
+        # is left out of the graphics compared, and filled in from round them in the pictures the words are read from --
+        # only there: the pictures themselves are made as ever (their paper and ink are measured over the whole page,
+        # and a page without its dots measured a little differently everywhere). The pictures shown keep them.
+        with StageTimer(logger, "braille_left_out"):
+            found = braille_diff.braille_mask(masked_original)
+        if found is not None:
+            braille_dots, count = found
+            braille_note = (
+                f"The digital file's Braille ({count} dots) was left out: a print carries Braille as embossing, not ink, "
+                "so it is neither compared as graphics nor read as text."
+            )
 
     candidates: list[DiffCandidate] = []
     warnings: list[str] = []
@@ -226,15 +415,14 @@ def run_comparison(
     # threshold applied first throws that away (a harsh scan lost its small print and the whole paragraph
     # read as removed). Barcodes are not decoded here, only compared as the marks they are.
     ink_original = ink_suspect = None
+    shown_original = shown_suspect = None  # the ink pictures as the reviewer sees them (`scan_normalizer.InkPictures`)
     read_original = read_suspect = None  # what the words are read from, where that is not the ink picture
     other_original = other_suspect = None  # what a line that differs is read from as well
     if options.normalize_scan:
         say("Removing the background colour…")
-        with StageTimer(logger, "ink_pictures"), ThreadPoolExecutor(max_workers=2) as pool:
-            # (OpenCV and NumPy release the interpreter lock, so the two files are done side by side)
-            pending = pool.submit(ink_image, masked_suspect, detection_config, compare_mask)
-            ink_original = ink_image(masked_original, detection_config, compare_mask)
-            ink_suspect = pending.result()
+        with StageTimer(logger, "ink_pictures"):
+            # made together, so a coloured panel comes out the same way in both (see `ink_pair`)
+            ink_original, ink_suspect, shown_original, shown_suspect = ink_pair(masked_original, masked_suspect, detection_config, compare_mask)
         if (detection_config.scan_reading_digital, detection_config.scan_reading_scan) != ("ink", "ink"):
             with StageTimer(logger, "reading_pictures"):
                 read_original = (
@@ -251,6 +439,16 @@ def run_comparison(
             with StageTimer(logger, "alternate_pictures"):
                 other_original = reading_source(masked_original, detection_config, compare_mask, detection_config.scan_reading_alternate)
                 other_suspect = reading_source(masked_suspect, detection_config, compare_mask, detection_config.scan_reading_alternate)
+        if braille_dots is not None:
+            compare_mask = compare_mask & ~braille_dots  # (from here on: the pictures above were made as ever)
+            fill = cv2.dilate(braille_dots.astype(np.uint8), np.ones((3, 3), np.uint8))
+            ink_original, ink_suspect, shown_original, shown_suspect = (
+                cv2.inpaint(ink, fill, 3, cv2.INPAINT_TELEA) for ink in (ink_original, ink_suspect, shown_original, shown_suspect)
+            )
+            read_original, read_suspect, other_original, other_suspect = (
+                None if picture is None else cv2.inpaint(picture, fill, 3, cv2.INPAINT_TELEA)
+                for picture in (read_original, read_suspect, other_original, other_suspect)
+            )
 
     used_regions = False
     # Graphics of files that do not register exactly are compared by where INK is, within
@@ -288,7 +486,7 @@ def run_comparison(
     # Compare where INK is, at full resolution, tolerating the registration error we measured (FR-6.3 for scans:
     # colour is ignored there). It is independent of the colour, similarity and text work below (and mostly NumPy and
     # OpenCV, which release the interpreter lock), so it runs beside them and is collected when its result is needed.
-    structure_pool = ThreadPoolExecutor(max_workers=2)
+    structure_pool = ThreadPoolExecutor(max_workers=3)  # structure, local and (Scan vs Digital) barcode jobs, side by side
     structure_job = (
         structure_pool.submit(structure_diff.detect, masked_original, masked_suspect, detection_config, structure_slack, compare_mask)
         if use_structure
@@ -296,8 +494,14 @@ def run_comparison(
     )
     # The deep local comparison (full size, tile by tile) runs beside it: it is what finds a small real change that the
     # reduced-size detectors' tolerance hides, and what the findings' borders are fitted to.
+    local_config = detection_config
+    if local_wanted and detection_config.local_calibrate:
+        # the tile comparison's bar, set from how much THIS pair differs where it prints the same (its noise)
+        noise = local_diff.measure_noise(masked_original, masked_suspect, detection_config, compare_mask)
+        local_config = local_diff.calibrated(detection_config, noise)
+        logger.info("local comparison calibrated", extra={"noise": noise, "proof": local_config.local_proof_tolerance})
     local_job = (
-        structure_pool.submit(local_diff.detect, masked_original, masked_suspect, detection_config, compare_mask)
+        structure_pool.submit(local_diff.detect, masked_original, masked_suspect, local_config, compare_mask)
         if local_wanted
         else None
     )
@@ -386,7 +590,14 @@ def run_comparison(
                 )
             if text_detected and options.normalize_scan:
                 try:
-                    scan_text = text_diff.detect_scan(small_original, small_suspect, detection_config, small_read, small_other)
+                    # (the digital file's own words, where it has any, at the reading's scale: exact where reading guesses)
+                    full = ink_original.shape
+                    sx, sy = small_original.shape[1] / full[1], small_original.shape[0] / full[0]
+                    layer = [
+                        replace(word, bbox=BoundingBox(word.bbox.x0 * sx, word.bbox.y0 * sy, word.bbox.x1 * sx, word.bbox.y1 * sy))
+                        for word in (in_compared_area(_words_in_frame(original_words, detect_frame), compare_mask) or [])
+                    ] or None
+                    scan_text = text_diff.detect_scan(small_original, small_suspect, detection_config, small_read, small_other, layer)
                     working_candidates += scan_text.candidates
                     same_text_boxes = scan_text.same_text
                     if scan_text.unreadable_lines:
@@ -422,15 +633,26 @@ def run_comparison(
         # scan's bars are compared with its as marks.
         say("Comparing the barcodes…")
         candidates += barcode_job.result()
+        if detection_config.scan_colour_swaps:
+            # Colour is not compared in a scan (scanning shifts every colour a little), but a solid area printed in a
+            # different ink -- red in the file, teal in the print -- is not a shift: it is found by its hue.
+            with StageTimer(logger, "colour_swaps"):
+                candidates += _colour_swaps(masked_original, masked_suspect, compare_mask)
         # A print never carries the die line, nor what the digital file draws in its colour (cut and crease lines, notes
         # to the printer -- 'unvarnished area', a varnish-free box): missing from the scan, that is not a difference.
-        candidates, non_printing = _drop_non_printing(candidates, original_image, original_area.boundary)
+        candidates, non_printing = _drop_non_printing(candidates, original_image, original_boundary, warped_suspect)
+        candidates, carton_edges = _drop_at_carton_edges(candidates, masked_original, compare_mask, ink_original, ink_suspect)
         candidates, over_text = _drop_over_same_text(candidates, same_text_boxes, original_image.shape[:2])
+        candidates, residual = _drop_residual_ink(candidates, ink_original, ink_suspect, detection_config.scan_residual_ink_px)
         candidates = [_line_only(candidate) for candidate in candidates]
+        if residual:
+            logger.info("residual ink left out of the graphics", extra={"count": residual})
         if over_text:
             logger.info("graphics findings over unchanged text dropped", extra={"count": over_text})
+        if carton_edges:
+            logger.info("residue along the carton's edges dropped", extra={"count": carton_edges})
         if non_printing:
-            logger.info("non-printing die-colour findings dropped", extra={"count": non_printing})
+            logger.info("scan marks along the die line dropped", extra={"count": non_printing})
 
     # Symbols and Braille dots run at full resolution: a small barcode or a
     # 1 mm Braille dot does not survive the detection downscale.
@@ -465,16 +687,43 @@ def run_comparison(
         # A difference in the pixels is a change only if the two files really differ in its box, not merely along
         # an edge one of them draws a little differently (see `verify`).
         candidates = verify.drop_residue(candidates, original_image, warped_suspect, detection_config)
+        if mode is ComparisonMode.LEAFLET and detection_config.nudge_tolerance_px > 0:
+            # An open document compared with its closed (outlined) copy: every letter is re-drawn a pixel or so from
+            # where it was, each by its own amount. Letters only moved like that are not a change.
+            candidates, nudged = nudge.drop_nudged(
+                candidates, masked_original, masked_suspect, detection_config.nudge_tolerance_px, detection_config.color_delta_e_threshold
+            )
+            if nudged:
+                logger.info("moved-only differences dropped", extra={"count": nudged})
 
     say("Grouping the differences\u2026")
-    clusters = build_clusters(candidates, alignment.transform, config.clustering)
+    clusters = build_clusters(candidates, detect_transform, config.clustering)
+    if pixel_detectors and not options.normalize_scan:
+        # the pieces of one line of text -- its letters, each a difference where the line was re-set -- are one finding,
+        # read and described once
+        # ...and the pieces of one photograph (a picture re-edited differs by the hundred, speck by speck) are one too.
+        # (Photographs first: a photograph's own edges -- hair, a rim -- are line-shaped too, and are not text.)
+        with StageTimer(logger, "lines_grouped"):
+            pictures, text_lines = None, []
+            if len(clusters) > 1 and (detection_config.group_text_lines or detection_config.group_pictures):
+                every_line = _text_lines((masked_original, masked_suspect))
+                pictures = _pictures((masked_original, masked_suspect), masked_original)
+                text_lines = _outside_pictures(every_line, pictures)
+            if detection_config.group_text_lines:
+                clusters = _by_text_line(clusters, text_lines)
+        if detection_config.group_pictures and pictures is not None:
+            with StageTimer(logger, "pictures_grouped"):
+                clusters = _by_picture(clusters, masked_original, masked_suspect, text_lines, pictures)
+        if detection_config.match_moved_elements:
+            # an element re-placed or resized (a logo a vendor re-laid) is one finding, not one at each of its edges
+            clusters = elements.matched_elements(clusters, masked_original, masked_suspect, local_config)
     all_clusters = clusters
     if options.normalize_scan:
         # Both were just detected above regardless of the checkboxes: showing fewer of them is a filter,
         # not a smaller comparison, so a results-page toggle needs nothing recomputed (`visible_clusters`).
-        clusters = visible_clusters(clusters, text_wanted=text_wanted, graphics_wanted=graphics_wanted)
+        clusters = renumbered(visible_clusters(clusters, text_wanted=text_wanted, graphics_wanted=graphics_wanted), all_clusters)
     if residual_mask is not None:
-        _fit_borders(clusters, residual_mask, alignment.transform, halo=1 + detection_config.local_forgive_px)
+        _fit_borders(clusters, residual_mask, detect_transform, halo=1 + detection_config.local_forgive_px)
 
     if options.compare_text and not options.normalize_scan:
         # What a difference says is READ from its own box in each file, never found by comparing two readings of a page.
@@ -483,8 +732,8 @@ def run_comparison(
             if not text_diff.ocr_available():
                 raise OcrUnavailableError(text_diff._OCR_UNAVAILABLE)
             layers = (
-                _in_compared_area(original_words, compare_mask),
-                _in_compared_area(_suspect_words_in_frame(suspect_words, alignment.transform, block_alignments), compare_mask),
+                in_compared_area(_words_in_frame(original_words, detect_frame), compare_mask),
+                in_compared_area(_words_in_frame(_suspect_words_in_frame(suspect_words, alignment.transform, block_alignments), detect_frame), compare_mask),
             )
             _describe_clusters(clusters, masked_original, masked_suspect, detection_config, warnings, *layers)
         except OcrUnavailableError as exc:
@@ -493,8 +742,15 @@ def run_comparison(
 
     if pixel_detectors and not options.normalize_scan:
         clusters = _mark_moves(clusters, masked_original, masked_suspect, detection_config)
+        clusters = _consolidated(clusters, masked_original, masked_suspect)
         all_clusters = clusters
 
+    if detect_frame is not None:
+        candidates, clusters, all_clusters, symbol_comparisons, braille_comparison, shown_original, shown_suspect = _on_page(
+            detect_frame, page_original.shape[:2], candidates, clusters, all_clusters, symbol_comparisons, braille_comparison,
+            shown_original, shown_suspect,
+        )
+        original_image, warped_suspect = page_original, page_warped
     logger.info(
         "comparison finished",
         extra={
@@ -520,15 +776,102 @@ def run_comparison(
         used_change_regions=used_regions,
         mode=mode,
         compared_outline=compared_area_outline(reported_compare_mask),
-        ink_original=ink_original,
-        ink_suspect=ink_suspect,
+        # (each stroke cut where it is half its strength (`scan_normalizer.InkPictures`), so a scan's blurred type is shown
+        # no bolder than the file's; once a whole picture was thinned instead, and thin strokes broke)
+        ink_original=shown_original,
+        ink_suspect=shown_suspect,
         graphics_compared=graphics_wanted,
         text_compared=text_wanted,
         block_outlines=[block.polygon for block in blocks] if block_alignments else [],
         block_alignments=[
             (alignment.block.polygon, alignment.transform) for alignment in block_alignments if alignment.locally_aligned
         ],
+        compare_mask=reported_compare_mask if mode in (ComparisonMode.LEAFLET, ComparisonMode.AUTOMATIC) else None,
+        notes=[braille_note] if braille_note else [],
     )
+
+
+_FRAME_MARGIN_SHARE = 0.01  # the box detection works in is what is compared with this share of the page round it...
+_FRAME_MARGIN_MIN_PX = 32
+_FRAME_WORTH = 0.85  # ...and is used where it is less than this share of the page (otherwise the page is, as it is)
+
+
+def _detection_frame(compare_mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """(x0, y0, x1, y1) the box round what is compared, with a margin, that detection works in -- None where it is
+    nearly the whole page (or nothing is compared)."""
+    if not compare_mask.any():
+        return None
+    height, width = compare_mask.shape
+    rows = np.flatnonzero(compare_mask.any(axis=1))
+    columns = np.flatnonzero(compare_mask.any(axis=0))
+    margin = max(_FRAME_MARGIN_MIN_PX, int(_FRAME_MARGIN_SHARE * max(height, width)))
+    x0, x1 = max(0, int(columns[0]) - margin), min(width, int(columns[-1]) + 1 + margin)
+    y0, y1 = max(0, int(rows[0]) - margin), min(height, int(rows[-1]) + 1 + margin)
+    if (x1 - x0) * (y1 - y0) >= _FRAME_WORTH * height * width:
+        return None
+    return x0, y0, x1, y1
+
+
+def _words_in_frame(words: list | None, frame: tuple[int, int, int, int] | None) -> list | None:
+    """A file's own words (in the original's page pixels) in the detection box's pixels."""
+    if words is None or frame is None:
+        return words
+    x0, y0 = frame[0], frame[1]
+    return [replace(word, bbox=_box_moved(word.bbox, -x0, -y0)) for word in words]
+
+
+def _box_moved(box: BoundingBox | None, dx: float, dy: float) -> BoundingBox | None:
+    return None if box is None else BoundingBox(box.x0 + dx, box.y0 + dy, box.x1 + dx, box.y1 + dy)
+
+
+def _on_page(frame, page_shape, candidates, clusters, all_clusters, symbols, braille, shown_original, shown_suspect):
+    """What detection found in its box (`_detection_frame`), put back on the original's page: every box in the
+    original's frame moved by the box's corner (a box in the suspect's own pixels is already there), the ink pictures
+    laid on a blank page."""
+    x0, y0 = frame[0], frame[1]
+    moved: set[int] = set()
+
+    def candidate(member: DiffCandidate) -> None:
+        if id(member) in moved:
+            return
+        moved.add(id(member))
+        member.bbox = _box_moved(member.bbox, x0, y0)
+        member.moved_to = _box_moved(member.moved_to, x0, y0)
+
+    for member in candidates:
+        candidate(member)
+    for cluster in [*clusters, *all_clusters]:
+        if id(cluster) in moved:
+            continue
+        moved.add(id(cluster))
+        cluster.bbox_in_original = _box_moved(cluster.bbox_in_original, x0, y0)
+        cluster.moved_to = _box_moved(cluster.moved_to, x0, y0)
+        for member in cluster.members:
+            candidate(member)
+    symbols = [
+        replace(symbol, bbox=_box_moved(symbol.bbox, x0, y0), suspect_bbox=_box_moved(symbol.suspect_bbox, x0, y0))
+        for symbol in symbols
+    ]
+    if braille is not None:
+        # (the region, and each line and cell read: the Braille tab shows each of them where it is)
+        lines = [
+            replace(
+                line,
+                bbox=_box_moved(line.bbox, x0, y0),
+                cells=[replace(cell, bbox=_box_moved(cell.bbox, x0, y0)) for cell in line.cells],
+            )
+            for line in braille.lines
+        ]
+        braille = replace(braille, region=_box_moved(braille.region, x0, y0), lines=lines)
+
+    def on_blank(picture):
+        if picture is None:
+            return None
+        page = np.full((*page_shape, *picture.shape[2:]), 255, picture.dtype)
+        page[y0 : y0 + picture.shape[0], x0 : x0 + picture.shape[1]] = picture
+        return page
+
+    return candidates, clusters, all_clusters, symbols, braille, on_blank(shown_original), on_blank(shown_suspect)
 
 
 # The outline is traced on a copy of the mask no larger than this (a 300 DPI carton page is ~5000 px, so
@@ -690,45 +1033,18 @@ def _drop_die_lines(
     return [c for c in candidates if id(c) not in dropped_ids], len(dropped)
 
 
-_DIE_RING_PX = 10  # the die line is looked for this close to either side of the artwork's outline
-_DIE_MIN_CHROMA = 30.0  # a die line is drawn in a spot colour: a black outline says nothing about what does not print
-_DIE_SAME_COLOUR = 25.0  # ink this close (CIE76) to the die line's colour is drawn in it
-_DIE_MIN_SHARE = 0.5  # the outline is the die colour if this share of the ink along it is one colour
 _DIE_FINDING_SHARE = 0.8  # a finding is the die colour's if this share of the digital file's ink in it is
 _PAPER_DISTANCE = 20.0  # a pixel this far (CIE76) from white is ink
-_DIE_MIN_TINT = 0.15  # a tint of the die colour at least this strong is its ink
 _DIE_EDGE_MAX_THICKNESS_PX = 40  # a mark only the scan has, this thin at most (a cut edge's shadow, round a corner)...
 _DIE_EDGE_REACH_PX = 8  # ...with the digital file's die line within this of it...
 _DIE_EDGE_COVER = 0.7  # ...along this share of its length, is the carton's own edge
 
 
-def _lab(pixels: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(pixels.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32) * np.array(
-        [100 / 255, 1, 1], np.float32
-    ) - np.array([0, 128, 128], np.float32)
+_lab = die_lines.lab
 
 
 def _die_colour(image: np.ndarray, boundary: np.ndarray | None) -> np.ndarray | None:
-    """The colour the digital file's die line is drawn in (CIE Lab), from the ink along its artwork's outline -- None if
-    there is no outline, or the ink along it is not mostly one spot colour."""
-    if boundary is None:
-        return None
-    ring_kernel = np.ones((2 * _DIE_RING_PX + 1, 2 * _DIE_RING_PX + 1), np.uint8)
-    solid = boundary.astype(np.uint8)
-    ring = (cv2.dilate(solid, ring_kernel) > 0) & (cv2.erode(solid, ring_kernel) == 0)
-    pixels = image[ring]
-    if len(pixels) > 200_000:
-        pixels = pixels[:: len(pixels) // 200_000]
-    lab = _lab(pixels)
-    inked = lab[np.linalg.norm(lab - np.array([100, 0, 0], np.float32), axis=1) > _PAPER_DISTANCE]
-    if len(inked) < 100:
-        return None
-    colour = np.median(inked, axis=0)
-    if float(np.hypot(colour[1], colour[2])) < _DIE_MIN_CHROMA:
-        return None
-    if float((np.linalg.norm(inked - colour, axis=1) < _DIE_SAME_COLOUR).mean()) < _DIE_MIN_SHARE:
-        return None
-    return colour
+    return die_lines.die_colour(image, boundary)
 
 
 _SCAN_LINE_MAX_THICKNESS_PX = 28  # a scan's graphics finding this thin at most...
@@ -756,9 +1072,232 @@ def _line_only(candidate: DiffCandidate) -> DiffCandidate:
     return replace(candidate, uncertain=True, confidence=min(candidate.confidence, text_diff.LIKELY_MISREAD_CONFIDENCE), detail=f"{candidate.detail} ({why})")
 
 
+_EDGE_WORK_MIN_PX = 150  # the digital file's line-work: thin ink (no solid part) running at least this far either way...
+_EDGE_WORK_SOLID_PX = 9  # ..."solid" being what survives an opening this wide (a panel, a bar, bold type)
+_EDGE_WORK_INK = 40.0  # (CIE76) a pixel this far from white is ink here (a pale tint is not line-work)
+_EDGE_MAX_THICKNESS_PX = 28  # a graphics finding this thin at most...
+_EDGE_NEAREST_PX = 24  # ...coming within this of a cut or fold line or the artwork's outline (~2 mm at 300 DPI)...
+_EDGE_ALONG_PX = 40  # ...and lying this close to it on average is residue of the carton's edge
+# A finding of any size whose differing ink is only strokes -- a cut or fold line, a carton edge, a crease, a hairline where
+# two edges fall a pixel apart -- is line-work too: thin and long (in the finding's box: an edge crossing a small box is a
+# short piece of it), or a sliver (thin, however short)...
+_EDGE_STROKE_MIN_PX = 40
+_EDGE_STROKE_THICK_PX = 6.0
+_EDGE_LONG_PX = 60  # (and one stroke at least this long is an edge's)
+_EDGE_SLIVER_THICK_PX = 3.0
+_EDGE_SPECK_PX = 30  # (a piece smaller than this is a speck: neither)
+_EDGE_STROKES_SHARE = 0.7  # ...if strokes are this much of it, and what else there is is no more than
+_EDGE_FEW_MARKS = 2  # ...this many pieces of its own (letters, blocks)...
+_EDGE_MARKS_PX = 150  # ...with less ink than this in all. More marks than that are print beside the edge: kept, alone
+_EDGE_MARK_PAD_PX = 4
+_EDGE_ONE_SIDE = 0.9  # marks this much in the scan's ink alone are added (in the file's alone, missing)
+# (measured: a carton's flap edge 88% strokes and one 58 px blob; a flap edge with '06 ATFAH' printed on it, 75% strokes
+# and seven letters, 524 px; real print elsewhere 0-38% strokes)
+
+
+def _apart_from_strokes(differs: np.ndarray) -> tuple[bool, tuple[int, int, int, int] | None]:
+    """The ink two files differ by in a finding (`differs`, a mask) told apart from line-work (`_EDGE_*`): (it is line-work
+    only, the box (x0, y0, x1, y1) of what else is there when that is print beside line-work -- a long stroke, a carton's
+    edge, and several marks of their own: the finding is those -- or None)."""
+    count, _labels, stats, _centres = cv2.connectedComponentsWithStats(differs.astype(np.uint8), connectivity=8)
+    strokes, edge, marks = 0, False, []
+    for label in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[label])
+        if area < _EDGE_SPECK_PX:
+            continue
+        length = max(width, height)
+        thickness = area / max(1, length)
+        if (length >= _EDGE_STROKE_MIN_PX and thickness <= _EDGE_STROKE_THICK_PX) or thickness <= _EDGE_SLIVER_THICK_PX:
+            strokes += area
+            edge = edge or length >= _EDGE_LONG_PX
+        else:
+            marks.append((x, y, x + width, y + height, area))
+    marked = sum(mark[4] for mark in marks)
+    if not edge:
+        return False, None
+    if strokes >= _EDGE_STROKES_SHARE * (strokes + marked) and len(marks) <= _EDGE_FEW_MARKS and marked < _EDGE_MARKS_PX:
+        return True, None
+    if len(marks) <= _EDGE_FEW_MARKS:
+        return False, None  # (a mark or two of real size beside it: left as it was found)
+    pad = _EDGE_MARK_PAD_PX
+    return False, (
+        max(0, min(m[0] for m in marks) - pad),
+        max(0, min(m[1] for m in marks) - pad),
+        max(m[2] for m in marks) + pad,
+        max(m[3] for m in marks) + pad,
+    )
+
+
+def _drop_at_carton_edges(
+    candidates: list[DiffCandidate],
+    original: np.ndarray,
+    compare_mask: np.ndarray,
+    ink_original: np.ndarray | None = None,
+    ink_suspect: np.ndarray | None = None,
+) -> tuple[list[DiffCandidate], int]:
+    """Leave out what a scanned carton shows along its cut and fold lines and a digital file does not, or the other way
+    round: the shadow of a cut edge or a fold, a crease, the file's own cut line (never printed), the bleed printed past a
+    cut that the cut carton no longer has. A graphics finding no thicker than a line or a sliver, lying along the digital
+    file's line-work (its cut and fold lines, whatever their colour: long thin ink) or the artwork's outline, is that.
+    Real print near an edge -- a colour bar, a date wheel, a code -- is thicker, or not along it (measured: residue within
+    0-21 px of the lines, real small print 30+). And a finding of any size -- a whole flap boxed for its edge -- where the
+    ink the two ink pictures differ by is only line-work (`_apart_from_strokes`: a carton edge running diagonally has a wide box,
+    though it is one thin stroke) is that residue too; real print differs by letters, blocks and symbols."""
+    residue = set()
+    if ink_original is not None and ink_suspect is not None:
+        height, width = ink_original.shape[:2]
+        reframed = []
+        for candidate in candidates:
+            if candidate.type is DiffType.GRAPHICS and not candidate.printers_note:
+                b = candidate.bbox
+                x0, y0 = max(0, int(b.x0)), max(0, int(b.y0))
+                x1, y1 = min(width, int(np.ceil(b.x1)) + 1), min(height, int(np.ceil(b.y1)) + 1)
+                if x1 > x0 and y1 > y0:
+                    before, after = ink_original[y0:y1, x0:x1], ink_suspect[y0:y1, x0:x1]
+                    only_lines, marks = _apart_from_strokes(cv2.absdiff(before, after) >= _RESIDUE_INK_LEVELS)
+                    if only_lines:
+                        residue.add(id(candidate))
+                    elif marks is not None:  # print beside the edge (a code on a flap): it alone is the finding
+                        mx0, my0, mx1, my1 = marks
+                        was, now = before[my0:my1, mx0:mx1].astype(np.int16), after[my0:my1, mx0:mx1].astype(np.int16)
+                        differs = np.abs(was - now) >= _RESIDUE_INK_LEVELS
+                        darker = float((now < was)[differs].mean()) if differs.any() else 0.5
+                        subtype, detail = candidate.subtype, candidate.detail
+                        if darker >= _EDGE_ONE_SIDE:
+                            subtype, detail = DiffSubtype.ADDED, "Graphic added in suspect"
+                        elif darker <= 1.0 - _EDGE_ONE_SIDE:
+                            subtype, detail = DiffSubtype.REMOVED, "Graphic missing from suspect"
+                        candidate = replace(
+                            candidate,
+                            bbox=BoundingBox(x0 + mx0, y0 + my0, min(width, x0 + mx1), min(height, y0 + my1)),
+                            subtype=subtype,
+                            detail=detail,
+                        )
+            reframed.append(candidate)
+        candidates = reframed
+    small = [
+        c for c in candidates
+        if c.type is DiffType.GRAPHICS and min(c.bbox.width, c.bbox.height) <= _EDGE_MAX_THICKNESS_PX and not c.printers_note
+        and id(c) not in residue
+    ]
+    if not small:
+        return [c for c in candidates if id(c) not in residue], len(residue)
+    lab = cv2.cvtColor(original, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ink = (np.linalg.norm(lab - np.array([255.0, 128.0, 128.0], np.float32), axis=2) > _EDGE_WORK_INK).astype(np.uint8)
+    del lab
+    solid = cv2.morphologyEx(ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (_EDGE_WORK_SOLID_PX,) * 2))
+    thin = ink & (1 - cv2.dilate(solid, np.ones((3, 3), np.uint8)))
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(thin, connectivity=8)
+    long = np.zeros(count, bool)
+    long[1:] = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT]) >= _EDGE_WORK_MIN_PX
+    edges = long[labels].astype(np.uint8)
+    del labels, thin, solid, ink
+    outline, _hierarchy = cv2.findContours(compare_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(edges, outline, -1, 1, 1)
+    distance = cv2.distanceTransform(1 - edges, cv2.DIST_L2, 5)
+    height, width = distance.shape
+    for candidate in small:
+        b = candidate.bbox
+        x0, y0 = max(0, int(b.x0)), max(0, int(b.y0))
+        x1, y1 = min(width, int(np.ceil(b.x1)) + 1), min(height, int(np.ceil(b.y1)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        near = distance[y0:y1, x0:x1]
+        if float(near.min()) <= _EDGE_NEAREST_PX and float(near.mean()) <= _EDGE_ALONG_PX:
+            residue.add(id(candidate))
+    return [c for c in candidates if id(c) not in residue], len(residue)
+
+
 _SAME_TEXT_SCALE = 4  # where the text reads the same is marked on a copy this many times smaller
 _SAME_TEXT_REACH_PX = 6  # ...reaching this far round each word (a scan's letters spread a little)
 _SAME_TEXT_COVER = 0.6  # a graphics finding lying this much over text that reads the same is that text, as scanned
+
+
+_SWAP_SCALE = 0.25  # hues are compared on a copy this share of the size
+_SWAP_MIN_CHROMA = 15.0  # (Lab) both files' colour at least this saturated: not paper (a scan's is <= ~10), grey or black
+_SWAP_MIN_HUE_DEG = 60.0  # hues further apart than this are different inks (a scan shifts a hue by far less)
+_SWAP_EDGE_PX = 8  # (full size) the edges of an area are not judged: misregistration, anti-aliasing, a scan's fringes
+_SWAP_MIN_AREA_PX = 900  # (full size, ~2.5 x 2.5 mm at 300 DPI) a solid area at least this big: not a letter's stroke
+_HUE_NAMES = ((15, "red"), (40, "orange"), (70, "yellow"), (160, "green"), (200, "teal"), (250, "blue"), (290, "purple"), (330, "magenta"), (360, "red"))
+
+
+def _hue_name(rgb: np.ndarray) -> str:
+    """A plain name for a colour (its hue; a pale red or magenta is pink), for a reviewer to read."""
+    hsv = cv2.cvtColor(np.uint8([[rgb]]), cv2.COLOR_RGB2HSV_FULL)[0, 0]
+    hue = float(hsv[0]) * 360.0 / 256.0
+    name = next(name for limit, name in _HUE_NAMES if hue < limit)
+    if name in ("red", "magenta") and hsv[1] < 110 and hsv[2] > 170:
+        return "pink"
+    return name
+
+
+def _colour_swaps(original: np.ndarray, suspect: np.ndarray, compare_mask: np.ndarray) -> list[DiffCandidate]:
+    """Solid areas printed in a different colour in the two files -- where both are clearly coloured (not paper, grey or
+    a pale tint) and their hues are far apart -- as colour findings, saying which colours. Scan vs Digital only: every
+    other colour difference there is how scanning reproduced it."""
+    height, width = original.shape[:2]
+    size = (max(1, round(width * _SWAP_SCALE)), max(1, round(height * _SWAP_SCALE)))
+    labs = [cv2.cvtColor(cv2.resize(image, size, interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2LAB).astype(np.float32) for image in (original, suspect)]
+    chromas, hues = [], []
+    for lab in labs:
+        a, b = lab[..., 1] - 128.0, lab[..., 2] - 128.0
+        chromas.append(np.hypot(a, b))
+        hues.append(np.degrees(np.arctan2(b, a)))
+    apart = np.abs(hues[0] - hues[1])
+    apart = np.minimum(apart, 360.0 - apart)
+    valid = cv2.resize(compare_mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST) > 0
+    swapped = (chromas[0] >= _SWAP_MIN_CHROMA) & (chromas[1] >= _SWAP_MIN_CHROMA) & (apart >= _SWAP_MIN_HUE_DEG) & valid
+    edge = max(1, round(_SWAP_EDGE_PX * _SWAP_SCALE))
+    swapped = cv2.erode(swapped.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (2 * edge + 1, 2 * edge + 1)))
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(swapped, connectivity=8)
+    found = []
+    small_images = [cv2.resize(image, size, interpolation=cv2.INTER_AREA) for image in (original, suspect)]
+    for label in range(1, count):
+        x, y, w, h, area = stats[label]
+        if area * (1.0 / _SWAP_SCALE) ** 2 < _SWAP_MIN_AREA_PX:
+            continue
+        pixels = labels == label
+        was, now = (_hue_name(np.median(image[pixels], axis=0).astype(np.uint8)) for image in small_images)
+        scale = 1.0 / _SWAP_SCALE
+        box = BoundingBox((x - edge) * scale, (y - edge) * scale, (x + w + edge) * scale, (y + h + edge) * scale)
+        detail = f"Colour changed: {was} in the digital file, {now} in the scan" if was != now else "Colour changed (a different ink)"
+        found.append(DiffCandidate(box, DiffType.COLOUR, DiffSubtype.CHANGED, 1.0, detail, magnitude=float(np.median(apart[labels == label]))))
+    return found
+
+
+_RESIDUE_INK_LEVELS = 128  # the two ink pictures differ at a pixel by at least this much: one has ink there, one not
+_RESIDUE_TOTAL_SHARE = 2.5  # residue is little ink in all too: less than this many times the largest-piece limit
+# (measured: specks and slivers total <= 73 px; a date wheel of 19 tiny digits, 266)
+
+
+def _drop_residual_ink(
+    candidates: list[DiffCandidate], ink_original: np.ndarray | None, ink_suspect: np.ndarray | None, largest_px: int
+) -> tuple[list[DiffCandidate], int]:
+    """Leave out graphics findings that are only residual ink -- a scan's dust, a speck of toner, a hair of bleed along a
+    stroke, a sliver where the two pictures' edges fall a pixel apart: the ink the two files differ by there comes in no
+    piece bigger than `largest_px` (at the pictures' resolution), and is little in all. A mark that is really printed differently -- a symbol
+    added, part of a logo missing -- is a solid piece of ink well above it. Text findings are never left out so: a full
+    stop or a decimal point missing is small and still a change."""
+    if ink_original is None or ink_suspect is None or largest_px <= 0:
+        return candidates, 0
+    height, width = ink_original.shape[:2]
+    kept, dropped = [], 0
+    for candidate in candidates:
+        if candidate.type is DiffType.GRAPHICS:
+            b = candidate.bbox
+            x0, y0 = max(0, int(b.x0)), max(0, int(b.y0))
+            x1, y1 = min(width, int(np.ceil(b.x1)) + 1), min(height, int(np.ceil(b.y1)) + 1)
+            if x1 > x0 and y1 > y0:
+                differs = cv2.absdiff(ink_original[y0:y1, x0:x1], ink_suspect[y0:y1, x0:x1]) >= _RESIDUE_INK_LEVELS
+                count, _labels, stats, _centres = cv2.connectedComponentsWithStats(differs.astype(np.uint8), connectivity=8)
+                largest = int(stats[1:, cv2.CC_STAT_AREA].max()) if count > 1 else 0
+                total = int(stats[1:, cv2.CC_STAT_AREA].sum()) if count > 1 else 0
+                # (small print -- a date wheel's digits, a batch code -- is small pieces too, but many: ink enough in all)
+                if largest < largest_px and total < _RESIDUE_TOTAL_SHARE * largest_px:
+                    dropped += 1
+                    continue
+        kept.append(candidate)
+    return kept, dropped
 
 
 def _drop_over_same_text(
@@ -789,22 +1328,18 @@ def _drop_over_same_text(
     return kept, dropped
 
 
-def _die_tinted(lab: np.ndarray, colour: np.ndarray) -> np.ndarray:
-    """Which of these (CIE Lab) pixels are ink of the die colour -- the colour itself, or a tint of it with the paper
-    (a thin die line's anti-aliased edge is a pale version of it): near the line from white to the die colour."""
-    white = np.array([100, 0, 0], np.float32)
-    along = colour - white
-    t = np.clip(((lab - white) @ along) / float(along @ along), 0.0, 1.0)
-    nearest = white + t[:, None] * along
-    return (np.linalg.norm(lab - nearest, axis=1) < _DIE_SAME_COLOUR) & (t >= _DIE_MIN_TINT)
+_die_tinted = die_lines.die_tinted
 
 
 def _drop_non_printing(
-    candidates: list[DiffCandidate], original: np.ndarray, boundary: np.ndarray | None
+    candidates: list[DiffCandidate], original: np.ndarray, boundary: np.ndarray | None, suspect: np.ndarray | None = None
 ) -> tuple[list[DiffCandidate], int]:
-    """Leave out what the digital file has and a print cannot (`_die_colour`): something missing from (or changed in) the
-    scan where nearly all the digital file's ink is the die line's colour; and a thin mark only the scan has, lying
-    along the die line (the carton's own cut or creased edge, which the scanner sees)."""
+    """Set apart what the digital file has and a print cannot (`_die_colour`): something missing from (or changed in) the
+    scan where nearly all the digital file's ink is the die line's colour -- a note to the printer, kept as one
+    (`DiffCandidate.printers_note`: listed only on request) -- and leave out a thin mark only the scan has, lying along
+    the die line (the carton's own cut or creased edge, which the scanner sees; the count returned). But where the scan
+    (`suspect`) prints something there of its own -- a colour bar beside a note to the printer, in one finding with it --
+    that is kept as a finding, framed round what the scan prints."""
     colour = _die_colour(original, boundary)
     if colour is None:
         return candidates, 0
@@ -825,6 +1360,9 @@ def _drop_non_printing(
         x0, y0 = max(0, int(box.x0) - pad), max(0, int(box.y0) - pad)
         x1, y1 = min(width, int(np.ceil(box.x1)) + 1 + pad), min(height, int(np.ceil(box.y1)) + 1 + pad)
         crop = original[y0:y1, x0:x1]
+        if crop.size == 0:
+            kept.append(candidate)  # (a finding off the picture's edge: nothing there to tell it by)
+            continue
         lab = _lab(crop)
         inked = np.linalg.norm(lab - np.array([100, 0, 0], np.float32), axis=1) > _PAPER_DISTANCE / 2
         die = _die_tinted(lab, colour) & inked
@@ -835,11 +1373,46 @@ def _drop_non_printing(
             non_printing = along_x >= _DIE_EDGE_COVER
         else:
             non_printing = bool(inked.any()) and float(die.sum()) >= _DIE_FINDING_SHARE * float(inked.sum())
+            if non_printing and suspect is not None:
+                own = _printed_beside(suspect[y0:y1, x0:x1], die.reshape(crop.shape[:2]))
+                if own is not None:
+                    ox0, oy0, ox1, oy1 = own
+                    kept.append(replace(candidate, bbox=BoundingBox(x0 + ox0, y0 + oy0, x0 + ox1, y0 + oy1), subtype=DiffSubtype.ADDED, detail="Graphic added in suspect"))
+                    continue
+            if non_printing:
+                # a note to the printer, missing from the print as it always is: listed apart, on request
+                kept.append(replace(candidate, printers_note=True, detail=f"{candidate.detail} {_PRINTERS_NOTE_DETAIL}".strip()))
+                continue
         if non_printing:
             dropped += 1
         else:
             kept.append(candidate)
     return kept, dropped
+
+
+_PRINTERS_NOTE_DETAIL = "(a note to the printer, in the die line's colour: never printed)"
+_BESIDE_REACH_PX = 6  # the scan's ink this near the digital file's non-printing marks is theirs (registration)
+_BESIDE_MIN_PX = 200  # ...and at least this much of it elsewhere in the finding is the scan's own print
+
+
+_BESIDE_EDGE_PX = 6  # (the band round a finding's box where print is its neighbours')
+
+
+def _printed_beside(scan_crop: np.ndarray, non_printing: np.ndarray) -> tuple[int, int, int, int] | None:
+    """(x0, y0, x1, y1) in the crop of what the scan prints there away from the digital file's non-printing marks, or
+    None if it prints nothing more than its paper there."""
+    lab = _lab(scan_crop).reshape(scan_crop.shape[0], scan_crop.shape[1], 3)
+    inked = np.linalg.norm(lab - np.array([100, 0, 0], np.float32), axis=2) > _PAPER_DISTANCE
+    near = cv2.dilate(non_printing.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * _BESIDE_REACH_PX + 1,) * 2)) > 0
+    own = inked & ~near
+    # (print at the very edge of the box is a neighbour's -- a colour bar just below a note -- not something printed here)
+    edge = _BESIDE_EDGE_PX
+    own[:edge, :] = own[-edge:, :] = False
+    own[:, :edge] = own[:, -edge:] = False
+    if int(own.sum()) < _BESIDE_MIN_PX:
+        return None
+    ys, xs = np.nonzero(own)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
 _LONG_LINE_PX = 400  # a straight line this long (in pieces that meet end to end) is a cut or crease line, whatever is beside it
@@ -988,21 +1561,28 @@ def _fit_borders(clusters: list[DiffCluster], residual: np.ndarray, transform: n
 def _suspect_words_in_frame(words: list | None, transform: np.ndarray, block_alignments) -> list | None:
     """The suspect's own words (its pixels) carried into the original's frame the way its picture was: by the block's
     own transform where the block they lie in was aligned on its own, by the whole sheet's elsewhere."""
+    pieces = [(a.block.polygon, a.transform) for a in (block_alignments or []) if a.locally_aligned]
+    return suspect_words_in_frame(words, transform, pieces)
+
+
+def suspect_words_in_frame(words: list | None, transform: np.ndarray, pieces) -> list | None:
+    """`_suspect_words_in_frame` with the locally aligned blocks as `ComparisonOutcome.block_alignments` keeps them:
+    (polygon in the original's pixels, suspect -> original transform) pairs."""
     if words is None:
         return None
-    local = [(a.block, a.transform) for a in (block_alignments or []) if a.locally_aligned]
+    local = []
+    for polygon, block_transform in pieces or []:
+        outline = np.array(polygon, np.float32)
+        local.append((outline, cv2.boundingRect(outline), block_transform))
     carried = []
     for word in words:
         b = word.bbox
         corners = np.array([[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]], np.float64)
         moved = apply_transform(transform, corners)
         if local:
-            centre = moved.mean(axis=0)
-            for block, block_transform in local:
-                box = block.bbox
-                if box.x0 <= centre[0] <= box.x1 and box.y0 <= centre[1] <= box.y1 and cv2.pointPolygonTest(
-                    np.array(block.polygon, np.float32), (float(centre[0]), float(centre[1])), False
-                ) >= 0:
+            cx, cy = moved.mean(axis=0)
+            for outline, (bx, by, bw, bh), block_transform in local:
+                if bx <= cx <= bx + bw and by <= cy <= by + bh and cv2.pointPolygonTest(outline, (float(cx), float(cy)), False) >= 0:
                     moved = apply_transform(block_transform, corners)
                     break
         (x0, y0), (x1, y1) = moved.min(axis=0), moved.max(axis=0)
@@ -1010,7 +1590,7 @@ def _suspect_words_in_frame(words: list | None, transform: np.ndarray, block_ali
     return carried
 
 
-def _in_compared_area(words: list | None, compare_mask: np.ndarray) -> list | None:
+def in_compared_area(words: list | None, compare_mask: np.ndarray) -> list | None:
     """The words whose middle lies in what is compared (the rest are blanked out of the pictures, so not there to read)."""
     if words is None:
         return None
@@ -1034,10 +1614,32 @@ def _describe_clusters(
 ) -> None:
     """Give each finding the text change its own box shows (its type and description follow)."""
     # (A recoloured area is a colour finding whatever is printed on it: the words on it are findings of their own.)
-    describable = [cluster for cluster in clusters if not all(member.region for member in cluster.members)]
+    # (Nor is an element found moved whole -- the same picture re-placed, `elements.matched_elements`: read at its old
+    # place, the suspect there shows what moved in or out, which would make it a text change it is not.)
+    describable = [
+        cluster
+        for cluster in clusters
+        if not all(member.region for member in cluster.members)
+        and not (cluster.moved_to is not None and all(member.subtype is DiffSubtype.MOVED for member in cluster.members))
+    ]
     chosen = describable[: config.text_describe_max_findings]
     described_all = text_diff.describe([c.bbox_in_original for c in chosen], original, suspect, config, original_layer, suspect_layer)
+    # In an element found moved but changed (`moved_to`), its words are also read where the element now is in the
+    # suspect -- and whichever reading pairs words that are more alike is the one (a re-placed batch label read in place
+    # pairs each line with the one above it: '150.00' -> '2022-03'; lined up, '2022-02' -> '2022-03'). Something in it
+    # that moved its own way reads better in place, and is left so. (All read at once, over the suspect with each such
+    # part laid back where it was: a reading costs little beside starting the reader.)
+    went = [cluster for cluster in chosen if cluster.moved_to is not None]
+    lined_up_all = dict(zip(map(id, went), _described_where_they_went(went, original, suspect, config))) if went else {}
     for cluster, described in zip(chosen, described_all):
+        if cluster.moved_to is not None:
+            lined_up = lined_up_all.get(id(cluster))
+            if lined_up is None:
+                if described is not None and described.was_text and described.now_text and described.was_text != described.now_text:
+                    # the words read the same once lined up: the change read in place was only the element's move
+                    described = None
+            elif _pairing(lined_up) > (0.0 if described is None else _pairing(described)):
+                described = lined_up  # (only a reading that pairs words: words only added or missing prove nothing)
         if described is not None:
             add_member(cluster, described)
     if len(describable) > len(chosen):
@@ -1047,12 +1649,558 @@ def _describe_clusters(
         )
 
 
+def _pairing(described: DiffCandidate) -> float:
+    """How alike the words a text change pairs are: 1 where both sides are the same words (a font, a size, a move), the
+    likeness of the two where one was changed to the other ('2022-02' -> '2022-03'), 0 where nothing is paired (words
+    only added or only missing)."""
+    was, now = described.was_text, described.now_text
+    if not (was and now):
+        changed = _CHANGED_WORDS.search(described.detail)
+        if changed:
+            was, now = changed.group(1), changed.group(2)
+        elif _QUOTED_WORDS.search(described.detail):
+            return 0.0  # (added or missing)
+        elif "'" in described.detail:
+            return 1.0  # the same words, said of differently
+        else:
+            return 0.0
+    return difflib.SequenceMatcher(None, was, now).ratio()
+
+
+_CHANGED_WORDS = re.compile(r"'(.*)' -> '(.*)'")
+
+
+def _described_where_they_went(
+    clusters: list[DiffCluster], original: np.ndarray, suspect: np.ndarray, config: DetectionConfig
+) -> list[DiffCandidate | None]:
+    """The text change in each of `clusters`' boxes with the suspect read where that box's content now is (`moved_to`):
+    the suspect's part brought back over the original's, so line meets line ('2019-03' -> '2019-04', not '2019-03'
+    against the line above it, which is what lies at the old place). One reading for all: a copy of the suspect with
+    each part laid back where it was."""
+    height, width = original.shape[:2]
+    lined_up = suspect.copy()
+    # each element laid back once, its whole area (its parts share how it moved), so no part's surroundings are another's
+    elements: dict[tuple, list[BoundingBox]] = {}
+    for cluster in clusters:
+        box, went = cluster.bbox_in_original, cluster.moved_to
+        if box.width <= 0 or box.height <= 0:
+            continue
+        scale_x, scale_y = went.width / box.width, went.height / box.height
+        # (a point x of the original is went.x0 + (x - box.x0) * scale_x in the suspect: x * scale_x + offset_x)
+        how = (round(scale_x, 3), round(scale_y, 3), round(went.x0 - box.x0 * scale_x), round(went.y0 - box.y0 * scale_y))
+        elements.setdefault(how, []).append(box)
+    for (scale_x, scale_y, offset_x, offset_y), boxes in elements.items():
+        pad = max(8.0, max(box.height for box in boxes))
+        x0, y0 = max(0, int(min(b.x0 for b in boxes) - pad)), max(0, int(min(b.y0 for b in boxes) - pad))
+        x1 = min(width, int(math.ceil(max(b.x1 for b in boxes) + pad)))
+        y1 = min(height, int(math.ceil(max(b.y1 for b in boxes) + pad)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        to_suspect = np.float32([[scale_x, 0, x0 * scale_x + offset_x], [0, scale_y, y0 * scale_y + offset_y]])
+        lined_up[y0:y1, x0:x1] = cv2.warpAffine(
+            suspect, to_suspect, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE
+        )
+    return text_diff.describe([cluster.bbox_in_original for cluster in clusters], original, lined_up, config)
+
+
 _MOVE_MIN_PX = 6  # something that is this far from where it was, or further, has moved (nearer is the registration)
 _MOVE_MAX_PX = 2400
 _MOVE_SIZE_TOLERANCE = 0.12  # the two boxes' sides may differ by this much (the ink softens at an edge)
 _MOVE_MIN_SIMILARITY = 0.8  # normalised correlation of what is in them
 _MOVE_MIN_STRUCTURE = 10.0
 _QUOTED_WORDS = re.compile(r"'(.*)' (?:missing from suspect|added in suspect)")
+
+
+_INSIDE_SHARE = 0.9  # a finding with this much of its box inside another's lies inside it
+_SAME_LINE_HEIGHTS = 2.5  # a text finding no taller than this many times another text finding inside it is one line with it
+_ELEMENT_HOST_HEIGHTS = 3.0  # a changed graphic no taller than this many times what lies in it is one element with it
+_UPRIGHT_ASPECT = 1.5  # a finding this many times taller than wide can be a piece of a word running up the page...
+_UPRIGHT_OVERLAP = 0.6  # ...and two such, overlapping across by this share of the narrower...
+_UPRIGHT_GAP = 0.35  # ...no further apart along than this share of their width, are one word's pieces
+_RECOLOUR_TOLERANCE = 30.0  # (RGB distance) pixels this far apart differ
+_RECOLOUR_MARK = 60.0  # (RGB distance) a pixel this far from its file's area colour is a mark on it
+_RECOLOUR_SLACK_PX = 1  # marks this close in the two files are the same marks
+_RECOLOUR_SAME_MARKS = 0.9  # a finding inside a recoloured area whose marks agree this well is part of the recolour
+
+
+_LINE_SCALE = 0.5  # text lines are found on a copy this share of the size
+_LINE_EDGE = 40  # (8-bit) a step this big between neighbouring pixels is the edge of a mark (dark on light or light on dark)
+_LINE_JOIN_PX = 14  # (full size) marks this close along a line are one line (letters of a word, words of a line)
+_LINE_MIN_PX = 8  # a line is this tall at least (full size)...
+_LINE_MAX_PX = 140  # ...and no taller (a picture, a panel, a block of paragraphs is not a line)
+_LINE_ELONGATION = 1.3  # ...and this many times longer than it is tall
+_LINE_INSIDE = 0.45  # a finding with this share of its box in one line is a piece of it (a letter's box reaches
+# above and below the line's, kept clear of its neighbours)
+_LINE_MAX_FINDING_HEIGHTS = 1.6  # ...unless it is taller than this many times the line (a graphic the line runs through)
+_LINE_RUN_GAP_HEIGHTS = 3.0  # pieces this many line-heights apart along the line, or further, are separate edits
+
+
+def _text_lines(images: tuple[np.ndarray, ...]) -> list[tuple[float, float, float, float]]:
+    """The lines of text in either picture (shared frame, full-size (x0, y0, x1, y1)), found from the pictures alone (no
+    reading): marks close together along a row are words, line-shaped and the height of type; words side by side, their
+    gap small for their height (a heading's words are further apart than body text's), are one line. Type set on its side
+    is looked for down the columns only where no row of type is: a paragraph's letters are close down the page too, and
+    taken for columns they tied every line of it into one. The same line in the two files (overlapping) is one line."""
+    scale = _LINE_SCALE
+    shape = (max(1, round(images[0].shape[0] * scale)), max(1, round(images[0].shape[1] * scale)))
+    join = max(3, round(_LINE_JOIN_PX * scale)) | 1
+    low, high = _LINE_MIN_PX * scale, _LINE_MAX_PX * scale
+    found: list[tuple[float, float, float, float]] = []
+    for image in images:
+        gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+        edges = (cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)) > _LINE_EDGE).astype(np.uint8)
+        rows = np.zeros(shape, np.uint8)
+        for along_x in (True, False):
+            marks = edges if along_x else edges & (1 - cv2.dilate(rows, np.ones((5, 5), np.uint8)))
+            kernel = (1, join) if along_x else (join, 1)
+            joined = cv2.morphologyEx(marks, cv2.MORPH_CLOSE, np.ones(kernel, np.uint8))
+            _count, _labels, stats, _centres = cv2.connectedComponentsWithStats(joined, connectivity=8)
+            words = []
+            for x, y, w, h, _area in stats[1:]:
+                a0, c0, along, across = (x, y, w, h) if along_x else (y, x, h, w)
+                if low <= across <= high and along >= _LINE_ELONGATION * across:
+                    words.append([a0, c0, a0 + along, c0 + across])
+            for a0, c0, a1, c1 in _joined_words(words):
+                x0, y0, x1, y1 = (a0, c0, a1, c1) if along_x else (c0, a0, c1, a1)
+                if along_x:
+                    rows[y0:y1, x0:x1] = 1
+                found.append((x0 / scale, y0 / scale, x1 / scale, y1 / scale))
+    # the same line in both files (it may sit a little apart, or run a little longer, in one): one line
+    merged: list[list[float]] = []
+    for box in sorted(found, key=lambda b: (b[1], b[0])):
+        for line in merged:
+            if _same_line(line, box):
+                line[0], line[1], line[2], line[3] = min(line[0], box[0]), min(line[1], box[1]), max(line[2], box[2]), max(line[3], box[3])
+                break
+        else:
+            merged.append(list(box))
+    return [tuple(line) for line in merged]
+
+
+_SAME_LINE_OVERLAP = 0.6  # two lines overlapping this much (of the smaller, each way) are one
+
+
+def _same_line(a, b) -> bool:
+    across = min(a[3], b[3]) - max(a[1], b[1])
+    along = min(a[2], b[2]) - max(a[0], b[0])
+    if across <= 0 or along <= 0:
+        return False
+    return (
+        across >= _SAME_LINE_OVERLAP * min(a[3] - a[1], b[3] - b[1])
+        and along >= _SAME_LINE_OVERLAP * min(a[2] - a[0], b[2] - b[0])
+    )
+
+
+_PICTURE_SCALE = 0.25  # photographs are found on a copy this share of the size
+_PICTURE_TONE = (3.0, 40.0)  # a gentle step between neighbours (a photograph's tones), not flat and not a printed edge
+# (a panel shaded from one colour to another is gentle too: what is on it is kept out by being text, or too big a piece)
+_PICTURE_WINDOW_PX = 60  # (full size) judged over a window this wide...
+_PICTURE_TONAL_SHARE = 0.45  # ...where this share of it is such steps
+_PICTURE_SHARP = 60.0  # a step this big is a printed edge (type, a rule)...
+_PICTURE_MAX_SHARP_SHARE = 0.12  # ...and a window with more than this share of them is type (small print's soft
+# letters are gentle steps too, but among sharp ones), not a photograph
+_PICTURE_MIN_SIDE_PX = 150  # (full size) a photograph this big each way at least
+_PICTURE_INSIDE = 0.6  # a finding with this share of its box in a photograph is a piece of it
+_PICTURE_TONE_BIN = 16  # tones are counted in bands of this many grey levels
+_PICTURE_TWO_TONES = 0.6  # a region with this much of it in its two commonest bands is not a photograph (measured:
+# photographs 26-60% -- more where one lies on a flat background --, panels of type on a tint or a screen 62-91%)
+_PICTURE_MIN_PIECES = 3  # ...and this many pieces of one photograph are one finding
+_PICTURE_PIECE_SHARE = 0.5  # (a finding as big as this share of the photograph, or more, is not a piece of it)
+
+
+def _pictures(images: tuple[np.ndarray, ...], tones_of: np.ndarray | None = None) -> np.ndarray:
+    """Where the photographs are, in either picture (shared frame): an int32 label per pixel of a copy `_PICTURE_SCALE`
+    the size, 0 elsewhere. A photograph is continuous tone -- most of it gentle steps between neighbouring pixels --
+    where type, rules and flat colour are either flat or a sharp edge."""
+    scale = _PICTURE_SCALE
+    shape = (max(1, round(images[0].shape[0] * scale)), max(1, round(images[0].shape[1] * scale)))
+    window = max(3, round(_PICTURE_WINDOW_PX * scale)) | 1
+    found = np.zeros(shape, np.uint8)
+    for image in images:
+        gray = cv2.resize(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0).astype(np.float32)
+        step = np.maximum(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1)), np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=1)))
+        tonal = ((step >= _PICTURE_TONE[0]) & (step <= _PICTURE_TONE[1])).astype(np.float32)
+        sharp = (step > _PICTURE_SHARP).astype(np.float32)
+        share = cv2.boxFilter(tonal, -1, (window, window))
+        sharp_share = cv2.boxFilter(sharp, -1, (window, window))
+        found |= ((share >= _PICTURE_TONAL_SHARE) & (sharp_share <= _PICTURE_MAX_SHARP_SHARE)).astype(np.uint8)
+    found = cv2.morphologyEx(found, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    found = cv2.morphologyEx(found, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))  # (a photograph's flat patches are in it)
+    count, labels, stats, _centres = cv2.connectedComponentsWithStats(found, connectivity=8)
+    side = _PICTURE_MIN_SIDE_PX * scale
+    keep = np.zeros(count, np.int32)
+    tones = None
+    if tones_of is not None:  # (a panel of type on a tint is two tones, the tint and the ink; a photograph is many)
+        tones = cv2.resize(cv2.cvtColor(tones_of, cv2.COLOR_RGB2GRAY), (shape[1], shape[0]), interpolation=cv2.INTER_AREA) // _PICTURE_TONE_BIN
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_WIDTH] < side or stats[label, cv2.CC_STAT_HEIGHT] < side:
+            continue
+        if tones is not None:
+            x, y, w, h = (int(v) for v in stats[label, :4])
+            inside = tones[y : y + h, x : x + w][labels[y : y + h, x : x + w] == label]
+            counts = np.sort(np.bincount(inside.ravel(), minlength=256 // _PICTURE_TONE_BIN))[::-1]
+            if counts[:2].sum() >= _PICTURE_TWO_TONES * max(1, inside.size):
+                continue  # two tones: a flat (or screened) panel with type on it, not a photograph
+        keep[label] = label
+    return keep[labels]
+
+
+def _outside_pictures(lines: list[tuple[float, float, float, float]], pictures: np.ndarray | None) -> list:
+    """The lines of text not in a photograph (mostly)."""
+    if pictures is None or not pictures.any():
+        return lines
+    scale = _PICTURE_SCALE
+    kept = []
+    for x0, y0, x1, y1 in lines:
+        a0, b0 = max(0, int(x0 * scale)), max(0, int(y0 * scale))
+        a1, b1 = min(pictures.shape[1], int(math.ceil(x1 * scale)) + 1), min(pictures.shape[0], int(math.ceil(y1 * scale)) + 1)
+        window = pictures[b0:b1, a0:a1]
+        if not window.size or (window > 0).mean() < _PICTURE_LINE_SHARE:
+            kept.append((x0, y0, x1, y1))
+    return kept
+
+
+_PICTURE_LINE_SHARE = 0.5  # a 'line' this much inside a photograph is its own edges, not text
+def _by_picture(
+    clusters: list[DiffCluster],
+    original: np.ndarray,
+    suspect: np.ndarray,
+    lines: list[tuple[float, float, float, float]] = (),
+    labels: np.ndarray | None = None,
+) -> list[DiffCluster]:
+    """The graphics and colour findings inside one photograph, where there are several, made one finding: that the
+    picture changed. Text on it stays its own -- what lies on a line of text is left out, read later as the words it is --
+    and so does an area recoloured round the photograph (it is bigger than a piece of it)."""
+    boxes = np.array(lines, np.float32).reshape(-1, 4)
+    candidates = [
+        c
+        for c in clusters
+        if c.category in ("graphics", "colour")
+        and not all(m.printers_note for m in c.members)
+        and _line_of(c.bbox_in_original, boxes) is None
+    ]
+    if len(candidates) < _PICTURE_MIN_PIECES:
+        return clusters
+    if labels is None:
+        labels = _pictures((original, suspect))
+    if not labels.any():
+        return clusters
+    scale = _PICTURE_SCALE
+    groups: dict[int, list[DiffCluster]] = {}
+    for cluster in candidates:
+        b = cluster.bbox_in_original
+        x0, y0 = max(0, int(b.x0 * scale)), max(0, int(b.y0 * scale))
+        x1, y1 = min(labels.shape[1], int(math.ceil(b.x1 * scale)) + 1), min(labels.shape[0], int(math.ceil(b.y1 * scale)) + 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        found = labels[y0:y1, x0:x1].ravel()
+        found = found[found > 0]
+        if not found.size:
+            continue
+        picture = int(np.bincount(found).argmax())
+        size = int((labels == picture).sum())
+        if (found == picture).sum() >= _PICTURE_INSIDE * (x1 - x0) * (y1 - y0) and (x1 - x0) * (y1 - y0) <= _PICTURE_PIECE_SHARE * size:
+            groups.setdefault(picture, []).append(cluster)
+    replaced: dict[int, DiffCluster] = {}
+    absorbed: set[int] = set()
+    for pieces in groups.values():
+        if len(pieces) < _PICTURE_MIN_PIECES:
+            continue
+        one = combined(pieces)
+        one.type = DiffType.GRAPHICS
+        one.detail = f"Picture changed ({len(pieces)} areas of it differ)"
+        replaced[id(pieces[0])] = one
+        absorbed.update(id(c) for c in pieces[1:])
+    if not replaced:
+        return clusters
+    out = [replaced.get(id(c), c) for c in clusters if id(c) not in absorbed]
+    for number, cluster in enumerate(out, start=1):
+        cluster.id = number
+    return out
+
+
+_WORD_GAP_HEIGHTS = 1.0  # words this close along (a share of their height) are one line...
+_WORD_SAME_ROW = 0.6  # ...if they overlap across by this share of the shorter
+
+
+def _joined_words(words: list[list[int]]) -> list[list[int]]:
+    """Word boxes ([along0, across0, along1, across1]) joined into lines: side by side, on one row, the gap between them
+    no more than their height."""
+    words = sorted(words, key=lambda b: (b[1], b[0]))
+    lines: list[list[int]] = []
+    for box in sorted(words, key=lambda b: b[0]):
+        height = box[3] - box[1]
+        for line in lines:
+            overlap = min(line[3], box[3]) - max(line[1], box[1])
+            shorter = min(line[3] - line[1], height)
+            gap = box[0] - line[2]
+            if overlap >= _WORD_SAME_ROW * shorter and -height <= gap <= _WORD_GAP_HEIGHTS * max(height, line[3] - line[1]):
+                line[0], line[1] = min(line[0], box[0]), min(line[1], box[1])
+                line[2], line[3] = max(line[2], box[2]), max(line[3], box[3])
+                break
+        else:
+            lines.append(list(box))
+    return lines
+
+
+def _line_of(b: BoundingBox, boxes: np.ndarray) -> int | None:
+    """The line of text (a row of `boxes`) a finding's box is a piece of -- mostly in it, and no taller -- or None."""
+    if not len(boxes):
+        return None
+    area = max(1.0, b.width * b.height)
+    overlap = (np.clip(np.minimum(boxes[:, 2], b.x1) - np.maximum(boxes[:, 0], b.x0), 0, None)
+               * np.clip(np.minimum(boxes[:, 3], b.y1) - np.maximum(boxes[:, 1], b.y0), 0, None))
+    line = int(np.argmax(overlap))
+    height = float(boxes[line, 3] - boxes[line, 1])
+    if overlap[line] >= _LINE_INSIDE * area and b.height <= _LINE_MAX_FINDING_HEIGHTS * height:
+        return line
+    return None
+
+
+def _by_text_line(clusters: list[DiffCluster], lines: list[tuple[float, float, float, float]]) -> list[DiffCluster]:
+    """Findings that are pieces of one line of text -- in either file -- made one finding. A line re-set (a new size, a
+    little along) differs by every letter, and each letter was a finding of its own ('Graphic moved 613 px left' for the
+    'a' of 'Sugammadex'); a line is what a reviewer reads, and what is described once, by its words. Only what lies in
+    the line and is no taller than it: a graphic or an area the line runs through is its own finding."""
+    if len(clusters) < 2 or not lines:
+        return clusters
+    boxes = np.array(lines, np.float32)
+    groups: dict[int, list[DiffCluster]] = {}
+    for cluster in clusters:
+        if cluster.category not in ("text", "graphics", "colour") or all(m.region or m.printers_note for m in cluster.members):
+            continue
+        b = cluster.bbox_in_original
+        area = max(1.0, b.width * b.height)
+        overlap = (np.clip(np.minimum(boxes[:, 2], b.x1) - np.maximum(boxes[:, 0], b.x0), 0, None)
+                   * np.clip(np.minimum(boxes[:, 3], b.y1) - np.maximum(boxes[:, 1], b.y0), 0, None))
+        line = _line_of(b, boxes)
+        if line is not None:
+            groups.setdefault(line, []).append(cluster)
+    replaced: dict[int, DiffCluster] = {}
+    absorbed: set[int] = set()
+    for line, members in groups.items():
+        x0, y0, x1, y1 = boxes[line]
+        across = min(x1 - x0, y1 - y0)
+        along_x = (x1 - x0) >= (y1 - y0)
+        # (pieces of one re-set stretch lie letter by letter; two edits far apart on one long line are two findings)
+        runs: list[list[DiffCluster]] = []
+        for cluster in sorted(members, key=lambda c: c.bbox_in_original.x0 if along_x else c.bbox_in_original.y0):
+            b = cluster.bbox_in_original
+            if runs:
+                last = runs[-1]
+                reach = max(c.bbox_in_original.x1 if along_x else c.bbox_in_original.y1 for c in last)
+                if (b.x0 if along_x else b.y0) - reach <= _LINE_RUN_GAP_HEIGHTS * across:
+                    last.append(cluster)
+                    continue
+            runs.append([cluster])
+        for pieces in runs:
+            if len(pieces) < 2:
+                continue
+            first = min(pieces, key=lambda c: c.id)
+            replaced[id(first)] = combined(pieces)
+            absorbed.update(id(c) for c in pieces if c is not first)
+    if not replaced:
+        return clusters
+    out = [replaced.get(id(c), c) for c in clusters if id(c) not in absorbed]
+    for number, cluster in enumerate(out, start=1):
+        cluster.id = number
+    return out
+
+
+_DIE_WARP_SLACK_PX = 4  # the suspect's die lines, brought into the original's frame, are widened by this much more
+
+
+def _die_lines_to_ignore(
+    original_image: np.ndarray,
+    suspect_image: np.ndarray,
+    original_area: "_Area",
+    suspect_area: "_Area",
+    original_strokes: list | None,
+    suspect_strokes: list | None,
+    transform: np.ndarray,
+    reference_shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Where either file's die lines are, in the original's pixels (see `die_lines`): None if neither has any to tell."""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        found_original, found_suspect = pool.map(
+            lambda job: die_lines.die_line_mask(*job),
+            [(original_image, original_area.boundary, original_strokes), (suspect_image, suspect_area.boundary, suspect_strokes)],
+        )
+    ignore = None
+    if found_original is not None:
+        ignore = found_original
+    if found_suspect is not None:
+        moved = _warped(found_suspect, transform, reference_shape)
+        size = 2 * _DIE_WARP_SLACK_PX + 1
+        moved = cv2.dilate(moved.astype(np.uint8), np.ones((size, size), np.uint8)).astype(bool)
+        ignore = moved if ignore is None else ignore | moved
+    if ignore is None:
+        return None
+    # the same line drawn in another colour in one of the files (a solid red outline where the other has its pink die
+    # line) runs along the die lines found: it is a die line too
+    also = die_lines.strokes_along(original_strokes, ignore)
+    if suspect_strokes:
+        back = _warped(ignore, np.linalg.inv(transform), suspect_image.shape[:2])
+        along_suspect = die_lines.strokes_along(suspect_strokes, back)
+        if along_suspect is not None:
+            moved = _warped(along_suspect, transform, reference_shape)
+            also = moved if also is None else also | moved
+    if also is not None:
+        ignore = ignore | also
+    logger.info("die lines left out", extra={"pixels": int(ignore.sum())})
+    return ignore
+
+
+def _consolidated(clusters: list[DiffCluster], original: np.ndarray, suspect: np.ndarray) -> list[DiffCluster]:
+    """One finding for one changed thing, once the findings are described (what they are is known only then):
+
+    * what lies inside a word or line whose text changed, moved or is set differently is part of that change (the hyphen
+      of 'eco-pack' gone from inside 'eco-pack' -> 'ecopack'; a piece of a letter inside 'MATRIX' -> 'MATRX');
+    * so is what lies inside a changed graphic only a few times its size (one badge, one mark);
+    * and what lies inside a recoloured area, where its own pixels changed by that same recolour (a letter whose
+      counter shows the panel's new colour is not a letter that changed) -- but not a symbol removed from the panel;
+    * two pieces of one word running up the page (a flap's 'MATRIX', found top half and bottom half) are one.
+    """
+    alive = [cluster for cluster in clusters if cluster.members]
+    order = sorted(range(len(alive)), key=lambda k: -alive[k].bbox_in_original.area)
+    gone: set[int] = set()
+    recolours: dict = {}  # (a recoloured area's old and new colour, worked out once however many findings lie in it)
+    for i in order:  # the biggest first: what lies inside it is looked at while it is still whole
+        if i in gone:
+            continue
+        outer = alive[i]
+        for j in range(len(alive)):
+            if j == i or j in gone:
+                continue
+            inner = alive[j]
+            if inner.bbox_in_original.area >= outer.bbox_in_original.area or not _lies_inside(inner.bbox_in_original, outer.bbox_in_original):
+                continue
+            if _part_of(outer, inner, original, suspect, recolours):
+                _absorb(outer, inner)
+                gone.add(j)
+    alive = [cluster for k, cluster in enumerate(alive) if k not in gone]
+    # pieces of one word running up the page
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(alive)):
+            for j in range(i + 1, len(alive)):
+                if _one_upright_word(alive[i], alive[j]):
+                    first, second = alive[i], alive[j]
+                    keep, other = (first, second) if _text_first(first, second) else (second, first)
+                    _absorb(keep, other)
+                    alive = [cluster for cluster in alive if cluster is not other]
+                    changed = True
+                    break
+            if changed:
+                break
+    for number, cluster in enumerate(sorted(alive, key=lambda c: (c.bbox_in_original.y0, c.bbox_in_original.x0)), start=1):
+        cluster.id = number
+    return sorted(alive, key=lambda c: c.id)
+
+
+def _lies_inside(inner: BoundingBox, outer: BoundingBox) -> bool:
+    return inner.intersection_area(outer) >= _INSIDE_SHARE * max(1.0, inner.area)
+
+
+def _absorb(outer: DiffCluster, inner: DiffCluster) -> None:
+    """`inner`'s members into `outer`, which keeps what it says (it is the finding the reviewer reads)."""
+    outer.members.extend(inner.members)
+    outer.bbox_in_original = outer.bbox_in_original.union(inner.bbox_in_original)
+    outer.bbox_in_suspect = outer.bbox_in_suspect.union(inner.bbox_in_suspect)
+
+
+def _text_first(a: DiffCluster, b: DiffCluster) -> bool:
+    """Whether `a` should stand for the two (a finding that says what the words are, before one that does not)."""
+    return (a.category == "text", a.bbox_in_original.area) >= (b.category == "text", b.bbox_in_original.area)
+
+
+def _part_of(outer: DiffCluster, inner: DiffCluster, original: np.ndarray, suspect: np.ndarray, recolours: dict | None = None) -> bool:
+    if outer.subtype is DiffSubtype.MOVED and inner.subtype is not DiffSubtype.MOVED and outer.category != "text":
+        return False  # a graphic that moved, and something that changed where it now is, are two things
+    if outer.category == "text":
+        # a piece of the words' own pixels is part of them; another reading of words inside a rewritten paragraph is a
+        # change of its own unless it is on the same line (a word of the phrase found twice)
+        return inner.category != "text" or outer.bbox_in_original.height <= _SAME_LINE_HEIGHTS * max(1.0, inner.bbox_in_original.height)
+    if outer.category == "graphics" and outer.subtype is DiffSubtype.CHANGED:
+        return outer.bbox_in_original.height <= _ELEMENT_HOST_HEIGHTS * max(1.0, inner.bbox_in_original.height)
+    if outer.category == "colour":
+        if any(member.type in (DiffType.TEXT, DiffType.NUMBER) and member.subtype is not DiffSubtype.MOVED
+               and "font" not in member.detail.lower() for member in inner.members):
+            return False  # words that changed on a recoloured panel are a change of their own, whatever the panel did
+        return _same_recolour(outer.bbox_in_original, inner.bbox_in_original, original, suspect, recolours)
+    return False
+
+
+_RECOLOUR_SAMPLE_PX = 250_000  # an area's old and new colour are judged from at most about this many of its pixels
+
+
+def _same_recolour(
+    outer: BoundingBox, inner: BoundingBox, original: np.ndarray, suspect: np.ndarray, recolours: dict | None = None
+) -> bool:
+    """Whether `inner` holds the same marks in both files, only over the recoloured area's old colour in one and its new
+    colour in the other: then nothing of its own changed (a letter in a panel that went from grey to red), and it is part
+    of the recolour. A symbol removed from the area, or a digit changed on it, leaves marks in one file only."""
+    height, width = original.shape[:2]
+
+    def crop(image: np.ndarray, box: BoundingBox) -> np.ndarray:
+        x0, y0 = max(0, int(box.x0)), max(0, int(box.y0))
+        x1, y1 = min(width, int(np.ceil(box.x1))), min(height, int(np.ceil(box.y1)))
+        return image[y0:y1, x0:x1].astype(np.float32)
+
+    key = (outer.x0, outer.y0, outer.x1, outer.y1)
+    if recolours is not None and key in recolours:
+        colours = recolours[key]
+    else:
+        x0, y0 = max(0, int(outer.x0)), max(0, int(outer.y0))
+        x1, y1 = min(width, int(np.ceil(outer.x1))), min(height, int(np.ceil(outer.y1)))
+        step = max(1, int(math.ceil(math.sqrt(max(1, (x1 - x0) * (y1 - y0)) / _RECOLOUR_SAMPLE_PX))))
+        a = original[y0:y1:step, x0:x1:step].reshape(-1, 3).astype(np.float32)
+        b = suspect[y0:y1:step, x0:x1:step].reshape(-1, 3).astype(np.float32)
+        differing = np.linalg.norm(a - b, axis=1) > _RECOLOUR_TOLERANCE if len(a) else np.zeros(0, bool)
+        colours = None
+        if differing.sum() * step * step >= 50:
+            colours = np.median(a[differing], axis=0), np.median(b[differing], axis=0)
+        if recolours is not None:
+            recolours[key] = colours
+    if colours is None:
+        return False
+    old_colour, new_colour = colours
+    a, b = crop(original, inner), crop(suspect, inner)
+    if a.size == 0:
+        return False
+    # each file's marks: what stands off its own background (the area's old colour here, its new colour there)
+    marks_a = np.linalg.norm(a - old_colour, axis=2) > _RECOLOUR_MARK
+    marks_b = np.linalg.norm(b - new_colour, axis=2) > _RECOLOUR_MARK
+    if not marks_a.any() and not marks_b.any():
+        return True  # bare area in both: the recolour and nothing else
+    if not marks_a.any() or not marks_b.any():
+        return False  # marks in one file only: something added or removed there
+    near = np.ones((2 * _RECOLOUR_SLACK_PX + 1, 2 * _RECOLOUR_SLACK_PX + 1), np.uint8)
+    near_a = cv2.dilate(marks_a.astype(np.uint8), near).astype(bool)
+    near_b = cv2.dilate(marks_b.astype(np.uint8), near).astype(bool)
+    agreement = min((marks_a & near_b).sum() / marks_a.sum(), (marks_b & near_a).sum() / marks_b.sum())
+    return float(agreement) >= _RECOLOUR_SAME_MARKS
+
+
+def _one_upright_word(a: DiffCluster, b: DiffCluster) -> bool:
+    """Two findings that are pieces of one word running up (or down) the page: both taller than wide, side by side
+    across (their widths overlapping), end to end along, and neither a move while the other is not."""
+    first, second = a.bbox_in_original, b.bbox_in_original
+    for box in (first, second):
+        if box.height < _UPRIGHT_ASPECT * max(1.0, box.width):
+            return False
+    if (a.subtype is DiffSubtype.MOVED) != (b.subtype is DiffSubtype.MOVED):
+        return False
+    across = min(first.x1, second.x1) - max(first.x0, second.x0)
+    narrow = min(first.width, second.width)
+    if across < _UPRIGHT_OVERLAP * narrow:
+        return False
+    if max(first.width, second.width) > 1.6 * max(1.0, narrow):
+        return False  # a line of type is one width all along
+    gap = max(first.y0 - second.y1, second.y0 - first.y1, 0.0)
+    return gap <= _UPRIGHT_GAP * max(first.width, second.width)
 
 
 def _mark_moves(
@@ -1144,6 +2292,7 @@ def _pair_moves(clusters: list[DiffCluster], original: np.ndarray, suspect: np.n
             type=gone.type,
             members=[replace(m, subtype=DiffSubtype.MOVED, magnitude=distance) for m in gone.members + new.members],
             detail=detail,
+            moved_to=new.bbox_in_original,
         )
     if not replaced:
         return clusters
@@ -1222,6 +2371,26 @@ class _Area:
         if self.erased is not None:
             keep &= ~self.erased
         return apply_mask(image, keep)
+
+
+_PAGE_FOR_PAGE = 0.85  # a scan whose page, laid over the digital file's, coincides with it this much is of the document
+
+
+def _glass_beyond_page(suspect_shape: tuple[int, int], transform: np.ndarray, reference_shape: tuple[int, int]) -> bool:
+    """Whether the scan is of the scanner's glass with an item laid on it, rather than of the document itself page for
+    page: its page, laid over the digital file's, is not that page (a page-for-page scan coincides with it)."""
+    height, width = suspect_shape
+    corners = np.float32([[0, 0], [width, 0], [width, height], [0, height]]).reshape(-1, 1, 2)
+    laid = cv2.perspectiveTransform(corners, transform.astype(np.float64)).reshape(-1, 2).astype(np.float32)
+    area = abs(cv2.contourArea(laid))
+    page = np.float32([[0, 0], [reference_shape[1], 0], [reference_shape[1], reference_shape[0]], [0, reference_shape[0]]])
+    page_area = float(reference_shape[0] * reference_shape[1])
+    if area <= 0:
+        return False
+    overlap, _points = cv2.intersectConvexConvex(laid, page)
+    coincide = overlap / (area + page_area - overlap)
+    logger.info("scan page laid over the digital page", extra={"coincide": round(coincide, 3)})
+    return coincide < _PAGE_FOR_PAGE
 
 
 def _warped(mask: np.ndarray, transform: np.ndarray, reference_shape: tuple[int, int]) -> np.ndarray:

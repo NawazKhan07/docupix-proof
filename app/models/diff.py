@@ -111,6 +111,18 @@ class DiffCandidate:
     # A recoloured AREA (a panel, a tint): its finding is the colour; what is written on it is findings of their own, so
     # the words in its box are not read into it.
     region: bool = False
+    # How it was FOUND: SOURCE_OCR by reading and comparing the words (Scan vs Digital's text, Leaflet's text strategy),
+    # SOURCE_PIXELS by comparing the pictures -- even where its words were then read to say what it is.
+    source: str = "pixels"
+    # A change in the words (found by comparing them): what the original says there, and what the suspect says instead.
+    was_text: str = ""
+    now_text: str = ""
+    # Something the digital file has and a print never carries: a note to the printer, drawn in the die line's colour
+    # ('unvarnished area', a varnish-free box, a measurement). Missing from a scan it is no change, so it is listed apart,
+    # only on request ("Printer's notes").
+    printers_note: bool = False
+    # Something MOVED: where it is in the suspect (the shared frame), `bbox` being where it was in the original.
+    moved_to: BoundingBox | None = None
 
     @property
     def category(self) -> str:
@@ -138,10 +150,25 @@ class DiffCluster:
     members: list[DiffCandidate] = field(default_factory=list)
     status: DiffStatus = DiffStatus.ACTIVE
     detail: str = ""
+    # Series: the same difference found in several repeats is one finding -- `bbox_in_suspect` is where it is in the
+    # first of them, these where it is in the others.
+    also_in_suspect: list[BoundingBox] = field(default_factory=list)
+    # Something that MOVED: where it is now in the suspect, in the shared frame both panes draw (`bbox_in_original` is
+    # where it was) -- the suspect pane marks it there.
+    moved_to: BoundingBox | None = None
+    @property
+    def shown_in_suspect(self) -> BoundingBox:
+        """Where the finding is marked in the suspect pane when both panes show the shared frame."""
+        return self.moved_to if self.moved_to is not None else self.bbox_in_original
 
     @property
     def category(self) -> str:
         return _CATEGORIES[self.type]
+
+    @property
+    def suspect_boxes(self) -> list[BoundingBox]:
+        """Every place the finding is on the suspect (one, except a Series finding common to several repeats)."""
+        return [self.bbox_in_suspect, *self.also_in_suspect]
 
     @property
     def subtype(self) -> DiffSubtype:
@@ -156,9 +183,19 @@ class DiffCluster:
         return bool(self.members) and all(member.uncertain for member in self.members)
 
     @property
+    def printers_note(self) -> bool:
+        """Whether it is only a note to the printer (see `DiffCandidate.printers_note`): every member is one."""
+        return bool(self.members) and all(member.printers_note for member in self.members)
+
+    @property
     def types(self) -> set[DiffType]:
         """Every kind of difference merged into this finding (usually just one)."""
         return {member.type for member in self.members} or {self.type}
+
+    @property
+    def sources(self) -> set[str]:
+        """How it was found (see `DiffCandidate.source`): by reading the words, by comparing pixels, or both."""
+        return {member.source for member in self.members} or {SOURCE_PIXELS}
 
     @property
     def is_ignored(self) -> bool:
@@ -177,6 +214,34 @@ class DiffCluster:
 _ALWAYS_SHOWN_TYPES = {DiffType.BARCODE, DiffType.BRAILLE}
 _TEXT_TYPES = {DiffType.TEXT, DiffType.NUMBER}
 _GRAPHICS_TYPES = {DiffType.COLOUR, DiffType.GRAPHICS}
+
+
+def renumbered(shown: list[DiffCluster], hidden: list[DiffCluster] = ()) -> list[DiffCluster]:
+    """The findings shown numbered 1, 2, 3... in reading order (top to bottom, then left to right), the hidden ones after
+    them -- so the list a reviewer reads never skips a number, whatever is filtered out. Printer's notes, listed only on
+    request, are numbered after the rest of what is shown. Returns `shown`, in that order."""
+    def reading(cluster: DiffCluster) -> tuple[float, float]:
+        return cluster.bbox_in_original.y0, cluster.bbox_in_original.x0
+
+    ordered = sorted((c for c in shown if not c.printers_note), key=reading)
+    notes = sorted((c for c in shown if c.printers_note), key=reading)
+    rest = sorted((c for c in hidden if c not in shown), key=reading)
+    for number, cluster in enumerate(ordered + notes + rest, start=1):
+        cluster.id = number
+    return ordered + notes
+
+
+SOURCE_OCR = "ocr"
+SOURCE_PIXELS = "pixels"
+SOURCE_PAGE = "page"  # a whole page one file has and the other not (Leaflet): shown whatever else is hidden
+SOURCE_LABELS = {SOURCE_OCR: "OCR findings", SOURCE_PIXELS: "Pixel findings"}
+
+
+def visible_by_source(clusters: list[DiffCluster], *, ocr_wanted: bool, pixels_wanted: bool) -> list[DiffCluster]:
+    """`clusters` restricted to how they were found (Leaflet's OCR / pixel toggles): a finding found both ways is shown
+    if either is wanted."""
+    wanted = {SOURCE_PAGE} | ({SOURCE_OCR} if ocr_wanted else set()) | ({SOURCE_PIXELS} if pixels_wanted else set())
+    return [cluster for cluster in clusters if cluster.sources & wanted]
 
 
 def visible_clusters(clusters: list[DiffCluster], *, text_wanted: bool, graphics_wanted: bool) -> list[DiffCluster]:

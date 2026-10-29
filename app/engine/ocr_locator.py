@@ -70,6 +70,9 @@ def usable_language(requested: str) -> tuple[str, bool]:
     `requested` may join several with "+" (Tesseract's own syntax): whichever of them are installed are kept, in the
     order given. None installed falls back to English; if that is not installed either, `requested` is returned
     regardless (there is nothing better to try, and Tesseract will say so itself)."""
+    from app.engine.language_detect import resolve
+
+    requested = resolve(requested)  # ("auto": the languages found on the files being compared)
     wanted = [code for code in requested.split("+") if code]
     installed = available_languages()
     if not installed:

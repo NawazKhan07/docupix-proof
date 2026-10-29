@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.models.categories import CATEGORY_COLOURS, CATEGORY_LABELS, SUBTYPE_LABELS
+from app.models.categories import CATEGORY_LABELS, SOURCE_COLOURS, SUBTYPE_LABELS, category_colour
 from app.models.diff import DiffCandidate, DiffCluster, DiffStatus, DiffSubtype, DiffType, BoundingBox
 from app.models.result import AlignmentResult
 from app.ui.diff_list_panel import DiffListPanel, FindingCard
@@ -54,19 +54,65 @@ def test_each_finding_shows_what_it_is_and_what_happened_to_it(panel, outcome):
         assert card.detail_label.text() == cluster.detail
 
 
-def test_each_finding_carries_its_categorys_own_colour(panel, outcome):
+def test_each_finding_is_coloured_by_its_kind(panel, outcome):
     by_id = {c.id: c for c in outcome.clusters}
     for card in _cards(panel):
-        expected = CATEGORY_COLOURS[by_id[card.cluster_id].category]
-        assert expected in card.colour_bar.styleSheet()
+        assert category_colour(by_id[card.cluster_id].category) in card.colour_bar.styleSheet()
 
 
-def test_the_summary_counts_findings_by_kind(panel, outcome):
+def test_the_summary_counts_findings_by_kind_in_their_colours(panel, outcome):
     summary = panel.summary_label.text()
     for category in {c.category for c in outcome.clusters}:
         count = sum(1 for c in outcome.clusters if c.category == category)
         assert f"{count} {CATEGORY_LABELS[category]}" in summary
-        assert CATEGORY_COLOURS[category] in summary
+        assert category_colour(category) in summary
+
+
+def _found(cluster_id: int, source: str) -> DiffCluster:
+    member = DiffCandidate(BoundingBox(0, 20 * cluster_id, 10, 20 * cluster_id + 10), DiffType.TEXT, DiffSubtype.CHANGED, 1.0, "x", source=source)
+    return DiffCluster(
+        id=cluster_id, bbox_in_original=member.bbox, bbox_in_suspect=member.bbox, type=DiffType.TEXT, members=[member], detail="x"
+    )
+
+
+def test_ocr_and_pixel_findings_take_their_own_colours_only_while_picked_as_such(qapp):
+    from PySide6.QtGui import QColor
+
+    from app.models.diff import SOURCE_OCR, SOURCE_PIXELS
+    from app.ui.pane_view import PaneView
+
+    ocr, pixels = _found(1, SOURCE_OCR), _found(2, SOURCE_PIXELS)  # both text
+    assert len({SOURCE_COLOURS[SOURCE_OCR], SOURCE_COLOURS[SOURCE_PIXELS], category_colour("text")}) == 3
+    widget = DiffListPanel()
+    widget.set_source_kinds(True)
+    widget.set_result([ocr, pixels], _alignment(), [])
+
+    def bars():
+        return {card.cluster_id: card.colour_bar.styleSheet() for card in _cards(widget)}
+
+    # all kinds: coloured by kind -- both are text
+    assert not widget.colour_by_source
+    assert all(category_colour("text") in bar for bar in bars().values())
+    # OCR findings picked: coloured by how they were found
+    combo = widget.category_combo
+    combo.setCurrentIndex(combo.findData("source:ocr"))
+    assert widget.colour_by_source
+    assert SOURCE_COLOURS[SOURCE_OCR] in bars()[1] and SOURCE_COLOURS[SOURCE_OCR] in widget.summary_label.text()
+    combo.setCurrentIndex(combo.findData("source:pixels"))
+    assert SOURCE_COLOURS[SOURCE_PIXELS] in bars()[2]
+    # a kind picked again: by kind
+    combo.setCurrentIndex(combo.findData("text"))
+    assert not widget.colour_by_source
+
+    titles = {card.cluster_id: card.title_label.text() for card in _cards(widget)}
+    assert ">OCR<" in titles[1] and ">Pixel<" in titles[2]  # how each was found is always said
+
+    pane = PaneView()
+    pane.set_markers([ocr, pixels], None)
+    assert pane._marker_items[1].pen().color() == QColor(category_colour("text"))
+    pane.set_markers([ocr, pixels], None, by_source=True)
+    assert pane._marker_items[1].pen().color() == QColor(SOURCE_COLOURS[SOURCE_OCR])
+    assert pane._marker_items[2].pen().color() == QColor(SOURCE_COLOURS[SOURCE_PIXELS])
 
 
 def _uncertain(cluster_id: int) -> DiffCluster:
@@ -88,6 +134,44 @@ def test_a_reading_the_pixels_do_not_bear_out_is_listed_apart_and_shown_on_reque
     assert len(widget.visible_clusters()) == 1 and widget.title_label.text() == "Findings (1)"
     assert "possible misread" in _cards(widget)[0].title_label.text()
     widget.close()
+
+
+def _finding(cluster_id: int, *, note: bool = False, y: float = 0) -> DiffCluster:
+    member = DiffCandidate(
+        BoundingBox(0, y, 10, y + 10), DiffType.TEXT, DiffSubtype.REMOVED, 1.0, "'UNVARNISHED AREA' missing" if note else "'a' -> 'b'",
+        printers_note=note,
+    )
+    return DiffCluster(
+        id=cluster_id, bbox_in_original=member.bbox, bbox_in_suspect=member.bbox, type=DiffType.TEXT, members=[member], detail=member.detail
+    )
+
+
+def test_notes_to_the_printer_are_hidden_until_picked_and_then_listed_alone(qapp):
+    """A note the digital file draws for the printer ('unvarnished area') is never printed: it is not counted or drawn with
+    the findings, but "Printer's notes" in the kinds lists them -- and only them."""
+    widget = DiffListPanel()
+    widget.show()
+    change, note = _finding(1), _finding(2, note=True)
+    widget.set_result([change, note], _alignment(), [])
+    qapp.processEvents()
+    assert widget.visible_clusters() == [change] and widget.marker_clusters() == [change]
+    assert widget.title_label.text() == "Findings (1)" and "1 printer's note(s) hidden" in widget.summary_label.text()
+
+    widget.category_combo.setCurrentIndex(widget.category_combo.findText("Printer's notes"))
+    assert widget.visible_clusters() == [note] and widget.marker_clusters() == [note]
+    assert widget.title_label.text() == "Findings (1)" and "printer's note" in _cards(widget)[0].title_label.text()
+    assert "hidden" not in widget.summary_label.text()
+
+    widget.set_result([change], _alignment(), [])  # none now: not offered, and the list is back to every kind
+    assert widget.category_combo.findText("Printer's notes") == -1 and widget.visible_clusters() == [change]
+    widget.close()
+
+
+def test_notes_to_the_printer_are_numbered_after_the_findings():
+    from app.models.diff import renumbered
+
+    note, change = _finding(0, note=True, y=0), _finding(0, y=50)  # the note first in reading order
+    assert renumbered([note, change]) == [change, note] and (change.id, note.id) == (1, 2)
 
 
 # ---------------------------------------------------------------------------

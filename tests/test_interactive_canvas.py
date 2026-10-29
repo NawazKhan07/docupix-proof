@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import QPointF
 
-from app.models.isolation import IsolationTool, NormalizedPolygon
+from app.models.isolation import IsolationTool
 from app.ui.interactive_canvas import InteractiveCanvas
 
 

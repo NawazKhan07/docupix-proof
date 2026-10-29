@@ -33,7 +33,7 @@ import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -56,6 +56,7 @@ _SAME_SHAPE = 0.97  # marks that coincide this well are the same shape: what dif
 _SPLIT_AREA_PX = 250_000  # a group whose box is bigger than this may be a chain of unrelated differences: it is grouped again, closer
 _SPLIT_MIN_REACH_PX = 2
 _SPARSE_FILL = 0.08  # a group whose pixels fill less of its box than this is a drawing of lines, not a region
+_HOLLOW_SHARE = 0.25  # a group round a hole this big (a share of its box) is a frame round something that did not change
 
 
 @dataclass
@@ -110,6 +111,14 @@ def _tile_residual(
 ) -> np.ndarray:
     """Where the tile's core differs between A and B once B is slid into place and one pixel is forgiven (bool).
     `offsets` (the tile's core, H x W x 3, int16) is the colour offset of the recoloured area each pixel lies in."""
+    return _tile_difference(a, b, margin, config, offsets) > config.local_tolerance
+
+
+def _tile_difference(
+    a: np.ndarray, b: np.ndarray, margin: int, config: DetectionConfig, offsets: np.ndarray | None = None
+) -> np.ndarray:
+    """How much the tile's core still differs between A and B, pixel by pixel (levels), once B is slid into place and
+    one pixel is forgiven: what `_tile_residual` holds against `local_tolerance`."""
     height, width = a.shape[:2]
     if config.local_blur_px > 0:
         a = cv2.GaussianBlur(a, (0, 0), config.local_blur_px)
@@ -135,7 +144,7 @@ def _tile_residual(
                 from_b = _from_offset(core_b.astype(np.int16) - moved_a, offsets)
             nearest_a = from_a if nearest_a is None else np.minimum(nearest_a, from_a)
             nearest_b = from_b if nearest_b is None else np.minimum(nearest_b, from_b)
-    return (nearest_a > config.local_tolerance) | (nearest_b > config.local_tolerance)
+    return np.maximum(nearest_a, nearest_b)
 
 
 def _tiles(coarse: np.ndarray) -> list[tuple[int, int]]:
@@ -231,12 +240,22 @@ def _grouped(mask: np.ndarray, reach: int, minimum_line: int = 60, top_level: bo
             if reach > _SPLIT_MIN_REACH_PX:
                 groups += _regrouped(own, reach, x0, y0, minimum_line)
                 continue
-            if pixels < _SPARSE_FILL * area:
+            if pixels < _SPARSE_FILL * area or _hollow(own):
                 groups += [(a, b, c, d, n, _is_line_work(own[b - y0 : d - y0, a - x0 : c - x0], minimum_line)) for a, b, c, d, n, _ in _in_cells(own, x0, y0)]
                 continue
         line = long_enough and own is not None and _is_line_work(own, minimum_line)
         groups.append((x0, y0, x1, y1, pixels, bool(line)))
     return sorted(groups, key=lambda group: -group[4])
+
+
+def _hollow(own: np.ndarray) -> bool:
+    """Whether the differing pixels `own` (one group's box) run round a big hole: a frame -- a panel's border pattern
+    re-laid round a panel that did not change -- whose box would be the whole panel, holding every finding inside it."""
+    contours, hierarchy = cv2.findContours(own.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return False
+    holes = [cv2.contourArea(contour) for contour, links in zip(contours, hierarchy[0]) if links[3] >= 0]
+    return bool(holes) and max(holes) >= _HOLLOW_SHARE * own.shape[0] * own.shape[1]
 
 
 def _regrouped(own: np.ndarray, reach: int, left: int, top: int, minimum_line: int) -> list[tuple[int, int, int, int, int, bool]]:
@@ -316,11 +335,41 @@ def _added_or_removed(original: np.ndarray, suspect: np.ndarray, known: dict) ->
     (a_inside, a_ring), (b_inside, b_ring) = colours
     a_gone = float(np.linalg.norm(a_inside - a_ring)) < _LIKE_PAPER
     b_gone = float(np.linalg.norm(b_inside - b_ring)) < _LIKE_PAPER
+    if a_gone != b_gone and _a_background(original, suspect, inside, (left, top, right, bottom), colours):
+        # A panel's background, with the type and marks printed on it in both files, that has turned the colour of the
+        # paper (a grey panel now white): its colour changed -- the panel is still there, and so is what is on it, each
+        # a finding of its own where it differs -- not a graphic removed with everything on it.
+        return None
     if b_gone and not a_gone:
         return DiffSubtype.REMOVED
     if a_gone and not b_gone:
         return DiffSubtype.ADDED
     return None
+
+
+_BACKGROUND_HOLES = 0.1  # a coloured area whose outline holds at least this share of other pixels (type, marks)...
+_BACKGROUND_PRINTED = 0.15  # ...at least this share of them printed in BOTH files, is a background, not a graphic
+
+
+def _a_background(original: np.ndarray, suspect: np.ndarray, inside: np.ndarray, window: tuple, colours: list) -> bool:
+    """Whether the coloured area (`inside`, within `window` of the page) is a background things are printed on in both
+    files: holes in it (where the type is) that hold print -- off the area's own colour -- in the original and in the
+    suspect alike. A shape removed (a logo, a badge) has nothing printed in its holes in the file it is gone from."""
+    left, top, right, bottom = window
+    contours, _hierarchy = cv2.findContours(inside.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filled = np.zeros(inside.shape, np.uint8)
+    cv2.drawContours(filled, contours, -1, 1, cv2.FILLED)
+    holes = filled.astype(bool) & ~inside
+    if holes.sum() < _BACKGROUND_HOLES * filled.sum():
+        return False
+    for picture, (area_colour, _ring) in zip((original, suspect), colours):
+        crop = picture[top:bottom, left:right]
+        lab = cv2.cvtColor(np.ascontiguousarray(crop), cv2.COLOR_RGB2LAB).astype(np.float32)
+        lab[..., 0] *= 100.0 / 255.0
+        printed = np.linalg.norm(lab[holes] - area_colour, axis=1) >= _LIKE_PAPER
+        if printed.mean() < _BACKGROUND_PRINTED:
+            return False
+    return True
 
 
 def _colour_regions(
@@ -431,9 +480,51 @@ def _colour_regions(
 def detect(
     original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, compare_mask: np.ndarray | None = None
 ) -> LocalResult:
-    """Differences between two aligned pictures, found tile by tile at full size (see the module's account)."""
+    """Differences between two aligned pictures, found tile by tile at full size (see the module's account).
+
+    Worked out on the box round what is compared -- on a proof sheet the artwork can be a third of the page -- laid on
+    the tiles' own grid, so every tile is the tile it is on the page and what is found is exactly what the whole page
+    would give; then put back on the page."""
+    box = _compared_box(compare_mask)
+    if box is None:
+        return _detect(original, suspect, config, compare_mask)
+    x0, y0, x1, y1 = box
+    found = _detect(original[y0:y1, x0:x1], suspect[y0:y1, x0:x1], config, compare_mask[y0:y1, x0:x1])
+    residual = np.zeros(original.shape[:2], bool)
+    residual[y0:y1, x0:x1] = found.residual
+    for candidate in found.candidates:
+        b = candidate.bbox
+        candidate.bbox = BoundingBox(b.x0 + x0, b.y0 + y0, b.x1 + x0, b.y1 + y0)
+    return LocalResult(found.candidates, residual, found.colour_regions)
+
+
+_BOX_WORTH = 0.85  # (the box is used where it is less than this share of the page: otherwise the page, as it is)
+
+
+def _compared_box(compare_mask: np.ndarray | None) -> tuple[int, int, int, int] | None:
+    """(x0, y0, x1, y1) the box round what `compare_mask` compares, out to whole tiles (and a tile more, for what a
+    tile reads round itself) -- None where there is no mask, nothing in it, or the box is nearly the page."""
+    if compare_mask is None or not compare_mask.any():
+        return None
+    height, width = compare_mask.shape
+    rows = np.flatnonzero(compare_mask.any(axis=1))
+    columns = np.flatnonzero(compare_mask.any(axis=0))
+    x0 = max(0, (int(columns[0]) // _TILE_PX - 1) * _TILE_PX)
+    y0 = max(0, (int(rows[0]) // _TILE_PX - 1) * _TILE_PX)
+    x1 = min(width, (int(columns[-1]) // _TILE_PX + 2) * _TILE_PX)
+    y1 = min(height, (int(rows[-1]) // _TILE_PX + 2) * _TILE_PX)
+    if (x1 - x0) * (y1 - y0) >= _BOX_WORTH * height * width:
+        return None
+    return x0, y0, x1, y1
+
+
+def _detect(
+    original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, compare_mask: np.ndarray | None = None
+) -> LocalResult:
     height, width = original.shape[:2]
     residual = np.zeros((height, width), bool)
+    proof = config.local_proof_tolerance
+    strong = np.zeros((height, width), bool) if proof > config.local_tolerance else None
     with StageTimer(logger, "detector_local"):
         coarse = _max_abs(original, suspect) > config.local_coarse_threshold
         if compare_mask is not None:
@@ -463,10 +554,13 @@ def detect(
                     full = np.zeros((a.shape[0] - 2 * margin, a.shape[1] - 2 * margin, 3), np.int16)
                     full[: y1 - y0, : x1 - x0] = tile_offsets
                     tile_offsets = full
-            different = _tile_residual(a, b, margin, config, tile_offsets)[: y1 - y0, : x1 - x0]
+            difference = _tile_difference(a, b, margin, config, tile_offsets)[: y1 - y0, : x1 - x0]
+            different = difference > config.local_tolerance
             if compare_mask is not None:
                 different = different & compare_mask[y0:y1, x0:x1]
             residual[y0:y1, x0:x1] = different  # (tiles do not overlap: each writes only its own part)
+            if strong is not None:
+                strong[y0:y1, x0:x1] = different & (difference > proof)
 
         tiles = _tiles(coarse)
         with ThreadPoolExecutor(max_workers=max(1, min(8, os.cpu_count() or 2))) as pool:
@@ -476,6 +570,8 @@ def detect(
             group
             for group in _grouped(residual, config.local_group_px, config.local_line_min_length_px)
             if group[4] >= config.local_min_pixels
+            # (calibrated: only a difference some of which stands clear of the pair's own noise -- see `calibrated`)
+            and (strong is None or int(strong[group[1] : group[3], group[0] : group[2]].sum()) >= config.local_proof_min_pixels)
         ]
         candidates = [_candidate(original, suspect, group, config) for group in groups[:_MAX_GROUPS]]
         candidates += regions.candidates
@@ -484,3 +580,59 @@ def detect(
         extra={"tiles": len(tiles), "groups": len(groups), "colour_regions": len(regions.candidates), "candidates": len(candidates)},
     )
     return LocalResult(candidates, residual, len(regions.candidates))
+
+
+_NOISE_TILES = 150  # the pair's own noise is measured on at most this many tiles...
+_NOISE_TILE_PERCENTILE = 99.5  # ...each by how far its strongest pixels (bar a few) still differ...
+_NOISE_MIN_INK = 0.02  # ...among tiles with at least this share printed (paper against paper says nothing)
+_NOISE_QUIET_SHARE = 25.0  # (percentile over tiles)
+
+
+def measure_noise(
+    original: np.ndarray, suspect: np.ndarray, config: DetectionConfig, compare_mask: np.ndarray | None = None
+) -> float | None:
+    """How much two aligned pictures differ where they print the same thing -- the pair's own noise (rendering,
+    anti-aliasing, registration, softness), in grey levels, measured the way `_tile_residual` compares: over printed
+    tiles spread across the page, each tile's strongest remaining difference, and of those the quietest quarter's (real
+    changes are in some tiles, never in all). None if too little is printed to say."""
+    height, width = original.shape[:2]
+    margin = config.local_shift_radius_px + config.local_forgive_px + int(math.ceil(3 * config.local_blur_px))
+    rows, columns = math.ceil(height / _TILE_PX), math.ceil(width / _TILE_PX)
+    small = cv2.resize(cv2.cvtColor(original, cv2.COLOR_RGB2GRAY), (columns, rows), interpolation=cv2.INTER_AREA)
+    ink = cv2.resize(((cv2.cvtColor(original, cv2.COLOR_RGB2GRAY) < 200).astype(np.float32)), (columns, rows), interpolation=cv2.INTER_AREA)
+    candidates = [(r, c) for r in range(rows) for c in range(columns) if ink[r, c] >= _NOISE_MIN_INK]
+    if compare_mask is not None:
+        candidates = [(r, c) for r, c in candidates if compare_mask[min(height - 1, r * _TILE_PX + _TILE_PX // 2), min(width - 1, c * _TILE_PX + _TILE_PX // 2)]]
+    del small
+    if len(candidates) < 5:
+        return None
+    step = max(1, len(candidates) // _NOISE_TILES)
+    chosen = candidates[::step][:_NOISE_TILES]
+
+    def level(tile: tuple[int, int]) -> float:
+        row, column = tile
+        y0, x0 = row * _TILE_PX, column * _TILE_PX
+        y1, x1 = min(height, y0 + _TILE_PX), min(width, x0 + _TILE_PX)
+        top, left, bottom, right = max(0, y0 - margin), max(0, x0 - margin), min(height, y1 + margin), min(width, x1 + margin)
+        a, b = original[top:bottom, left:right], suspect[top:bottom, left:right]
+        pad = (margin - (y0 - top), margin - (bottom - y1), margin - (x0 - left), margin - (right - x1))
+        if any(pad):
+            a = cv2.copyMakeBorder(a, *pad, cv2.BORDER_REPLICATE)
+            b = cv2.copyMakeBorder(b, *pad, cv2.BORDER_REPLICATE)
+        difference = _tile_difference(a, b, margin, config)[: y1 - y0, : x1 - x0]
+        return float(np.percentile(difference, _NOISE_TILE_PERCENTILE))
+
+    with ThreadPoolExecutor(max_workers=max(1, min(8, os.cpu_count() or 2))) as pool:
+        levels = list(pool.map(level, chosen))
+    # the quietest quarter of the printed tiles: a pair whose text changed in most tiles (another strength, another
+    # language) still has a quarter that print the same -- the median of all tiles read 191 on such a pair, this 7
+    return float(np.percentile(levels, _NOISE_QUIET_SHARE))
+
+
+def calibrated(config: DetectionConfig, noise: float | None) -> DetectionConfig:
+    """`config` with the bar a difference must prove itself against set from the pair's measured `noise` (see
+    `DetectionConfig.local_calibrate`)."""
+    if not config.local_calibrate or noise is None:
+        return config
+    proof = int(round(min(config.local_tolerance_max, max(config.local_tolerance, config.local_noise_margin * noise))))
+    return replace(config, local_proof_tolerance=proof if proof > config.local_tolerance else 0)

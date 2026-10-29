@@ -15,8 +15,7 @@ import cv2
 import numpy as np
 import pytest
 
-from app.config import AppConfig, ClusteringConfig, DetectionConfig
-from app.engine.aggregation.clustering import cluster_candidates
+from app.config import AppConfig, DetectionConfig
 from app.engine.detectors import local_diff, verify
 from app.engine.worker import _drop_die_lines, _fit_borders, run_comparison
 from app.models.diff import BoundingBox, DiffCandidate, DiffCluster, DiffSubtype, DiffType

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QMenu, QPushButton
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMenu, QPushButton, QWidget
 
 
 class _StayOpenMenu(QMenu):
@@ -126,3 +126,62 @@ class PagePicker(QPushButton):
         if spec != self._announced:
             self._announced = spec
             self.pagesChanged.emit(spec)
+
+
+_BEST_MATCH = -1  # (the list's value for "Best match": Qt cannot look up an item by None)
+
+
+class PageSelector(QWidget):
+    """Which ONE page of a file to compare (every mode but Leaflet): "Page" and a list -- "Best match" (the page the other
+    file's artwork is on, found when comparing) and each page's number. Typing a number picks that page. Shown only for a
+    file of several pages. The choice is announced once per change: None for "Best match", else the 0-based page."""
+
+    pageChosen = Signal(object)
+
+    def __init__(self, label: str = "Page", with_best_match: bool = True, parent=None):
+        super().__init__(parent)
+        self._with_best_match = with_best_match
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        self.label = QLabel(label)
+        self.combo = QComboBox()
+        self.combo.setToolTip("Which page of this file to compare. Type a number to jump to that page.")
+        self.combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        layout.addWidget(self.label)
+        layout.addWidget(self.combo)
+        self.combo.currentIndexChanged.connect(self._on_changed)
+        self._count = 0
+
+    @property
+    def page_count(self) -> int:
+        return self._count
+
+    def set_page_count(self, count: int) -> None:
+        """Offer `count` pages (the choice goes back to "Best match", or page 1 without it)."""
+        self._count = count
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        if self._with_best_match:
+            self.combo.addItem("Best match", _BEST_MATCH)
+        for page in range(count):
+            self.combo.addItem(str(page + 1), page)
+        self.combo.setCurrentIndex(0)
+        self.combo.blockSignals(False)
+
+    @property
+    def choice(self) -> int | None:
+        data = self.combo.currentData()
+        return None if data is None or data == _BEST_MATCH else int(data)
+
+    def set_choice(self, page: int | None) -> None:
+        """Show `page` (0-based; None: "Best match") as the choice, without announcing it."""
+        index = self.combo.findData(_BEST_MATCH if page is None else page)
+        if index < 0:
+            return
+        self.combo.blockSignals(True)
+        self.combo.setCurrentIndex(index)
+        self.combo.blockSignals(False)
+
+    def _on_changed(self, _index: int) -> None:
+        self.pageChosen.emit(self.choice)

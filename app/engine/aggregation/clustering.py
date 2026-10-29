@@ -89,14 +89,25 @@ def cluster_candidates(
     duplicate_iou: float = 0.6,
     moved_tolerance: tuple[float, float] = (6.0, 0.3),
     line_max_gap_px: float = 60.0,
+    panel_area: float | None = None,
 ) -> list[list[DiffCandidate]]:
     """Group candidates into findings (see the module's account). Groups come back in reading order (top-to-bottom, then
-    left-to-right) so callers get stable, human-friendly numbering."""
+    left-to-right) so callers get stable, human-friendly numbering.
+
+    `panel_area` (pixels), where given, is as big as a finding gets by joining: a difference that big on its own (a
+    background whose pattern was re-laid, a panel recoloured) stands alone, and pieces are not joined into one that big
+    (chained -- pieces cut along the tiles touching, one leading to the next -- they would make one panel-wide finding of
+    a panel's changes, each a finding of its own) -- nor into a big box they hardly fill (the strips of a panel's re-laid
+    border, joined at its corners, would make a box round the whole panel)."""
     if not candidates:
         return []
     sets = _DisjointSet(len(candidates))
     compatible = _moved_alike(*moved_tolerance, candidates)
     reach = max(distance_px, 3.0, line_max_gap_px)
+    panel = panel_area if panel_area else math.inf
+    panel_sized = [candidate.bbox.area >= panel for candidate in candidates]
+    group_box = {index: candidate.bbox for index, candidate in enumerate(candidates)} if panel_area else {}
+    group_cover = {index: candidate.bbox.area for index, candidate in enumerate(candidates)} if panel_area else {}
     order = sorted(range(len(candidates)), key=lambda index: candidates[index].bbox.x0)
     for offset, i in enumerate(order):
         a = candidates[i]
@@ -104,17 +115,34 @@ def cluster_candidates(
             b = candidates[j]
             if b.bbox.x0 - a.bbox.x1 > reach:
                 break
+            if panel_sized[i] or panel_sized[j]:
+                continue
             if _joined(a, b, distance_px, line_overlap, line_gap_heights, line_max_height_px, touch_px, duplicate_iou, line_max_gap_px) and compatible(i, j):
+                if panel == math.inf:
+                    sets.union(i, j)
+                    continue
+                root_i, root_j = sets.find(i), sets.find(j)
+                if root_i == root_j:
+                    continue
+                joined = group_box[root_i].union(group_box[root_j])
+                cover = group_cover[root_i] + group_cover[root_j]
+                if joined.area >= panel or (joined.area > _SPARSE_JOIN_SHARE * panel and joined.area > _SPARSE_JOIN * cover):
+                    continue  # (nor into a big box its pieces hardly fill: the sides of a frame round a panel, joined at a corner)
                 sets.union(i, j)
+                group_box[sets.find(i)] = joined
+                group_cover[sets.find(i)] = cover
 
     components: dict[int, list[DiffCandidate]] = defaultdict(list)
     for position, candidate in enumerate(candidates):
         components[sets.find(position)].append(candidate)
-    groups = _merge_elements(list(components.values()))
+    groups = _merge_elements(list(components.values()), panel)
     for members in groups:
         members.sort(key=lambda c: (c.bbox.y0, c.bbox.x0))
     return sorted(groups, key=_reading_order_key)
 
+
+_SPARSE_JOIN = 4.0  # a joined finding's box is at most this many times what its pieces' boxes cover...
+_SPARSE_JOIN_SHARE = 1 / 16  # ...once it is bigger than this share of a panel
 
 _ELEMENT_OVERLAP = 0.6  # two parts of one element (a word, a wordmark) share at least this much of the shorter's height...
 _ELEMENT_HEIGHT_RATIO = 1.6  # ...are about as tall as each other (a letter and the line it is in, not a panel beside it)...
@@ -132,7 +160,7 @@ _PATTERN_SIZE_RATIO = 1.3  # ...the same size and round or square (either way wi
 _PATTERN_GAP = 2.0  # ...and at most this many times their size apart (a cell's dots are set on a grid, rows and diagonals)
 
 
-def _merge_elements(groups: list[list[DiffCandidate]]) -> list[list[DiffCandidate]]:
+def _merge_elements(groups: list[list[DiffCandidate]], panel: float = math.inf) -> list[list[DiffCandidate]]:
     """The findings that are pieces of ONE changed element, joined (a word recoloured or retyped, found letter by letter
     by different detectors -- a colour change on one letter, a graphics change on the next two, the counter of an A;
     the dots of one Braille cell): see `_one_element`. Then whatever lies inside a joined element and is a real part of
@@ -157,6 +185,8 @@ def _merge_elements(groups: list[list[DiffCandidate]]) -> list[list[DiffCandidat
                 break
             if not _moves_agree(moves[i], moves[j]):
                 continue
+            if panel != math.inf and (a.area >= panel or b.area >= panel or a.union(b).area >= panel):
+                continue  # (no element is a panel: see `cluster_candidates`' `panel_area`)
             if _one_element(a, b, same_kind=bool(kinds[i] & kinds[j])) or _one_dot_pattern(a, b, dots[i], dots[j]):
                 sets.union(i, j)
     components: dict[int, list[int]] = defaultdict(list)
@@ -181,7 +211,7 @@ def _merge_elements(groups: list[list[DiffCandidate]]) -> list[list[DiffCandidat
         outer_graphic = max(outer.width, outer.height) <= _SPECK_HOST_MAX_PX and any(
             c.type is DiffType.GRAPHICS and c.subtype is DiffSubtype.CHANGED for c in merged[i]
         )
-        if not (joined[i] or outer_graphic):
+        if not (joined[i] or outer_graphic) or outer.area >= panel:
             continue
         for j in order:
             inner = merged_boxes[j]

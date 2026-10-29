@@ -102,9 +102,17 @@ def test_the_canonical_form_ignores_case_marks_and_the_l_i_1_and_o_0_confusions(
 
 
 def test_what_a_scan_reads_as_marks_or_shakily_is_not_a_word():
-    words = [_word("|"), _word("--"), _word("a", confidence=99), _word("of", confidence=60), _word("mg", confidence=90), _word("Store", confidence=60)]
+    words = [_word("|"), _word("--"), _word("a", x=900, confidence=99), _word("of", confidence=60), _word("mg", confidence=90), _word("Store", confidence=60)]
     kept = [w.text for w in _trustworthy(words, CONFIG)]
-    assert kept == ["mg", "Store"]  # a very short word must be read surely; "of" at 60 is not
+    assert kept == ["mg", "Store"]  # a very short word must be read surely; "of" at 60 is not; a lone letter far off is a speck
+
+
+def test_a_lone_digit_or_letter_read_surely_in_a_phrase_is_a_word():
+    """'7 x 7 mm' -> '9 x 9 mm': the digits that changed are words of one character, kept where they stand in a phrase."""
+    line = [_word("7", x=0, confidence=95), _word("x", x=20, confidence=95), _word("7", x=40, confidence=95), _word("mm)", x=60, confidence=95)]
+    assert [w.text for w in _trustworthy(line, CONFIG)] == ["7", "x", "7", "mm)"]
+    alone = [_word("0", x=0, confidence=95), _word("Store", x=900)]  # (a '0' read off a picture, far from any word)
+    assert [w.text for w in _trustworthy(alone, CONFIG)] == ["Store"]
 
 
 # ---- a line's differences --------------------------------------------------------------------------------------------

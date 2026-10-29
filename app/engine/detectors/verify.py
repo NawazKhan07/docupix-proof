@@ -21,9 +21,9 @@ from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
-from skimage.color import deltaE_ciede2000, rgb2lab
 
 from app.config import DetectionConfig
+from app.engine.detectors.colour_math import ciede2000, rgb_to_lab
 from app.engine.detectors.regions import padded_window
 from app.models.diff import BoundingBox, DiffCandidate, DiffSubtype, DiffType
 
@@ -73,20 +73,15 @@ def _dilated(mask: np.ndarray, slack_px: int) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
 
 
-def _mean_delta(a: np.ndarray, b: np.ndarray) -> float:
-    """CIEDE2000 between the average colours of two sets of RGB pixels (each an (N, 3) array)."""
-    if len(a) == 0:
-        return 0.0
-    mean_a = (a.mean(axis=0) / 255.0).reshape(1, 1, 3)
-    mean_b = (b.mean(axis=0) / 255.0).reshape(1, 1, 3)
-    return float(deltaE_ciede2000(rgb2lab(mean_a), rgb2lab(mean_b))[0, 0])
+def _delta_of_means(mean_a, mean_b) -> float:
+    """CIEDE2000 between two average colours (RGB, 0..255)."""
+    return ciede2000(rgb_to_lab(tuple(float(c) / 255.0 for c in mean_a[:3])), rgb_to_lab(tuple(float(c) / 255.0 for c in mean_b[:3])))
 
 
-def _mean_between(first: np.ndarray, second: np.ndarray) -> float:
-    """CIEDE2000 between the average colours of two sets of RGB pixels."""
-    mean_first = (first.mean(axis=0) / 255.0).reshape(1, 1, 3)
-    mean_second = (second.mean(axis=0) / 255.0).reshape(1, 1, 3)
-    return float(deltaE_ciede2000(rgb2lab(mean_first), rgb2lab(mean_second))[0, 0])
+def _window_means(a: np.ndarray, b: np.ndarray, where: np.ndarray | None = None) -> tuple[tuple, tuple]:
+    """The average colour of two windows (of their pixels in `where`, if given), in one pass each (`cv2.mean`)."""
+    mask = None if where is None else where.astype(np.uint8)
+    return cv2.mean(np.ascontiguousarray(a), mask=mask), cv2.mean(np.ascontiguousarray(b), mask=mask)
 
 
 @dataclass(frozen=True)
@@ -163,15 +158,16 @@ def evidence(
     if a.size == 0:
         return Evidence(0.0, None)
     extent = min(a.shape[0], a.shape[1])
-    delta = _mean_delta(a.reshape(-1, 3), b.reshape(-1, 3))
+    delta = _delta_of_means(*_window_means(a, b))
     found = _marks_within(original, suspect, box, margin, slack_px)
     if found is None:
         return Evidence(delta, None, delta, 0.0, extent)
     background = ~found.near_any
-    background_delta = _mean_delta(a[background], b[background]) if background.sum() >= _MIN_BACKGROUND_PX else 0.0
+    enough_background = int(background.sum()) >= _MIN_BACKGROUND_PX
+    background_delta = _delta_of_means(*_window_means(a, b, background)) if enough_background else 0.0
     contrast = 0.0
-    if background.sum() >= _MIN_BACKGROUND_PX and found.ink.sum() >= _MIN_BACKGROUND_PX // 4:
-        contrast = _mean_between(a[found.ink], a[background])
+    if enough_background and int(found.ink.sum()) >= _MIN_BACKGROUND_PX // 4:
+        contrast = _delta_of_means(cv2.mean(np.ascontiguousarray(a), mask=found.ink.astype(np.uint8)), cv2.mean(np.ascontiguousarray(a), mask=background.astype(np.uint8)))
     return Evidence(delta, found.agreement, background_delta, contrast, extent)
 
 

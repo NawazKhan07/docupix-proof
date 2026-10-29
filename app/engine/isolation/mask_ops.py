@@ -44,5 +44,3 @@ def component_at(mask: np.ndarray, seed: tuple[float, float], seed_radius: float
     return components == label
 
 
-def touches_edge(mask: np.ndarray) -> bool:
-    return bool(mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any())
