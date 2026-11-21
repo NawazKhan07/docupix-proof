@@ -13,6 +13,7 @@ application -> PATH -> the usual Windows install folders.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import shutil
@@ -55,13 +56,20 @@ def find_tesseract() -> Path | None:
     return next((candidate for candidate in _candidates() if candidate.is_file()), None)
 
 
-def available_languages() -> frozenset[str]:
-    """The Tesseract language codes that can actually be read (their tessdata is installed) -- empty if Tesseract
-    itself is not available. `configure_ocr()` should have run first, or this asks whatever `tesseract` PATH finds."""
+@functools.lru_cache(maxsize=8)
+def _cached_available_languages(cmd: str, tessdata: str | None) -> frozenset[str]:
     try:
         return frozenset(pytesseract.get_languages(config=""))
     except Exception:  # noqa: BLE001 -- no engine, or a build too old for --list-langs: nothing is available
         return frozenset()
+
+
+def available_languages() -> frozenset[str]:
+    """The Tesseract language codes that can actually be read (their tessdata is installed) -- empty if Tesseract
+    itself is not available. `configure_ocr()` should have run first, or this asks whatever `tesseract` PATH finds."""
+    cmd = str(getattr(pytesseract.pytesseract, "tesseract_cmd", "tesseract"))
+    tessdata = os.environ.get("TESSDATA_PREFIX")
+    return _cached_available_languages(cmd, tessdata)
 
 
 def usable_language(requested: str) -> tuple[str, bool]:

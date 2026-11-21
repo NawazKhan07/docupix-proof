@@ -155,7 +155,7 @@ def _ocr_many(pictures: list[np.ndarray], page_segmentation: str, lang: str | No
         return []
     runs = max(1, min(os.cpu_count() or 2, len(pictures)))
     shares = [list(range(start, len(pictures), runs)) for start in range(runs)]  # dealt round, so each run gets big and small
-    found: list[dict] = [{}] * len(pictures)
+    found: list[dict] = [{} for _ in range(len(pictures))]
     with ThreadPoolExecutor(max_workers=runs) as pool:
         for share, data in zip(shares, pool.map(lambda share: _ocr_run([pictures[i] for i in share], page_segmentation, lang), shares)):
             for index, page in zip(share, data):

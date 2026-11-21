@@ -961,11 +961,16 @@ class ComparisonViewport(QWidget):
             return {"overlay": compose_overlay(original, suspect)}
 
         zoom = self._zoom
+        min_x = rect.x / zoom if zoom else 0.0
+        max_x = (rect.x + rect.width) / zoom if zoom else 0.0
+        min_y = rect.y / zoom if zoom else 0.0
+        max_y = (rect.y + rect.height) / zoom if zoom else 0.0
         boxes = [
             BoundingBox(
                 b.x0 * zoom - rect.x, b.y0 * zoom - rect.y, b.x1 * zoom - rect.x, b.y1 * zoom - rect.y
             )
             for b in (cluster.bbox_in_original for cluster in self._marker_clusters)
+            if b.x1 > min_x and b.x0 < max_x and b.y1 > min_y and b.y0 < max_y
         ]
         if self._mode is ViewMode.FLICKER:
             return {f"flicker{phase}": compose_flicker(original, suspect, boxes, phase, whole=self._flicker_whole) for phase in (0, 1)}

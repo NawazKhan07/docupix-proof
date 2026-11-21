@@ -8,25 +8,27 @@ for the technical design this codebase follows.
 It never uses the network: OCR, barcode decoding and PDF rendering are all local, and
 `--self-test` (below) proves it by blocking every network attempt while it runs.
 
-## Setup
+> **Quick Start:** For a detailed step-by-step setup and running guide with troubleshooting FAQs, see **[HOW_TO_RUN.md](HOW_TO_RUN.md)**.
 
-```bash
+## Quickstart
+
+```powershell
+# 1. Create and activate a virtual environment
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+.venv\Scripts\Activate.ps1        # Windows PowerShell (source .venv/bin/activate on Linux/macOS)
+
+# 2. Install dependencies in editable mode
 pip install -e ".[dev]"
+
+# 3. Launch the application
+python -m app.main
 ```
 
 **Tesseract OCR** (used for text/number comparison) is a separate native program that
-pip cannot install. Install it (Windows: the UB-Mannheim installer) and the application
+pip cannot install. Install it (Windows: the [UB-Mannheim installer](https://github.com/UB-Mannheim/tesseract/wiki)) and the application
 finds it by itself -- in `TESSERACT_CMD`, next to the application, on `PATH`, or in the
 usual `C:\Program Files\Tesseract-OCR` folder. Without it everything else still works,
 and the results page says plainly that text could not be compared.
-
-## Run
-
-```bash
-python -m app.main
-```
 
 Load an original and a suspect file (PDF, PNG, JPEG, TIFF, BMP), optionally use
 **Edit Artwork Area** on either to crop, lift the artwork from its sheet, place the other file's lifted

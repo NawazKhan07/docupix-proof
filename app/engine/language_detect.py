@@ -87,12 +87,14 @@ _LATIN_SHARE = 0.02  # ...making at least this share of the Latin words
 _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="languages")
 _lock = threading.Lock()
 _pending: Future | None = None
+_resolved: tuple[str, ...] | None = None
+_waited_logged: bool = False
 
 
 def begin(find: Callable[[], tuple[str, ...]]) -> Future:
     """Start finding the languages (`find`, e.g. `detect_languages` on this comparison's pictures) beside the
     comparison; every reading asked for in "auto" waits for it (`resolve`). Ended by `end`."""
-    global _pending
+    global _pending, _resolved, _waited_logged
 
     def timed() -> tuple[str, ...]:
         started = time.monotonic()
@@ -103,15 +105,19 @@ def begin(find: Callable[[], tuple[str, ...]]) -> Future:
     future = _pool.submit(timed)
     with _lock:
         _pending = future
+        _resolved = None
+        _waited_logged = False
     return future
 
 
 def adopt(future: Future | None) -> None:
     """Make `future` (a comparison's own finding, from `begin`) the one "auto" waits for again: for what is read of
     that comparison after it returned (Automatic's word comparison, sent after its pixel findings)."""
-    global _pending
+    global _pending, _resolved, _waited_logged
     with _lock:
         _pending = future
+        _resolved = None
+        _waited_logged = False
 
 
 def note(future: Future | None) -> str | None:
@@ -129,14 +135,19 @@ def note(future: Future | None) -> str | None:
 
 def end() -> None:
     """The comparison is over: "auto" means English again until the next one `begin`s."""
-    global _pending
+    global _pending, _resolved, _waited_logged
     with _lock:
         _pending = None
+        _resolved = None
+        _waited_logged = False
 
 
 def found() -> tuple[str, ...] | None:
     """The languages found for the comparison running (waiting for them if need be); None if none is being found."""
+    global _waited_logged, _resolved
     with _lock:
+        if _resolved is not None:
+            return _resolved
         pending = _pending
     if pending is None:
         return None
@@ -144,11 +155,19 @@ def found() -> tuple[str, ...] | None:
         if not pending.done():
             started = time.monotonic()
             languages = pending.result()
-            logger.info("reading waited for the languages", extra={"seconds": round(time.monotonic() - started, 2)})
-            return languages
-        return pending.result()
+            with _lock:
+                if not _waited_logged:
+                    _waited_logged = True
+                    logger.info("reading waited for the languages", extra={"seconds": round(time.monotonic() - started, 2)})
+        else:
+            languages = pending.result()
+        with _lock:
+            _resolved = languages
+        return languages
     except Exception:  # noqa: BLE001 -- finding them failed: the reader's own default, as without it
         logger.exception("language detection failed")
+        with _lock:
+            _resolved = DEFAULT_LANGUAGES
         return DEFAULT_LANGUAGES
 
 
