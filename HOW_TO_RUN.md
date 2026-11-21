@@ -17,7 +17,11 @@ Before running the application, make sure you have:
 
 ### B. Tesseract OCR (Required for text/number comparisons)
 The app uses local Tesseract OCR to read and compare text without network calls.
-* **Windows Installer:** Download and install the latest 64-bit installer from [UB-Mannheim Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki).
+* **Install via Windows Package Manager (Fastest):**
+  ```powershell
+  winget install --id UB-Mannheim.TesseractOCR --source winget
+  ```
+* **Or Manual Installer:** Download and install the latest 64-bit installer from [UB-Mannheim Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki).
 * Install to the standard directory: `C:\Program Files\Tesseract-OCR`.
 * The app automatically detects Tesseract in this location, on your `PATH`, or from the `TESSERACT_CMD` environment variable.
 

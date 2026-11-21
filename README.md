@@ -25,7 +25,11 @@ python -m app.main
 ```
 
 **Tesseract OCR** (used for text/number comparison) is a separate native program that
-pip cannot install. Install it (Windows: the [UB-Mannheim installer](https://github.com/UB-Mannheim/tesseract/wiki)) and the application
+pip cannot install. Install it via Windows Package Manager (PowerShell / Command Prompt):
+```powershell
+winget install --id UB-Mannheim.TesseractOCR --source winget
+```
+Alternatively, download the installer directly from [UB-Mannheim Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki). The application
 finds it by itself -- in `TESSERACT_CMD`, next to the application, on `PATH`, or in the
 usual `C:\Program Files\Tesseract-OCR` folder. Without it everything else still works,
 and the results page says plainly that text could not be compared.
